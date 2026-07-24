@@ -4,6 +4,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.run import (
+    _PREFLIGHT_COMPRESSION_CHAT_STATUS,
     _prepare_gateway_status_message,
     _sanitize_gateway_final_response,
 )
@@ -29,13 +30,25 @@ CHAT_PLATFORMS = [
 ]
 
 NOISY_STATUS_MESSAGES = [
-    "🗜️ Preflight compression check before sending...",
     "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
     "⚠️  Session compressed 12 times — accuracy may degrade. Consider /new to start fresh.",
     "⚠ Compression summary failed: upstream error. Inserted a fallback context marker.",
     "⏱️ Rate limited. Waiting 30.0s (attempt 2/3)...",
     "⏳ Retrying in 4.2s (attempt 1/3)...",
 ]
+
+
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+def test_chat_gateways_surface_safe_preflight_compression_status(platform):
+    raw = (
+        "📦 Preflight compression: ~238,859 tokens >= 231,200 threshold. "
+        "This may take a moment."
+    )
+
+    assert (
+        _prepare_gateway_status_message(platform, "lifecycle", raw)
+        == _PREFLIGHT_COMPRESSION_CHAT_STATUS
+    )
 
 
 def test_telegram_status_suppresses_auxiliary_and_retry_noise():

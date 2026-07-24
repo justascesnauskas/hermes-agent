@@ -90,6 +90,15 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r")",
     re.IGNORECASE | re.DOTALL,
 )
+_PREFLIGHT_COMPRESSION_STATUS_RE = re.compile(
+    r"\bpreflight\s+compression\b",
+    re.IGNORECASE,
+)
+_PREFLIGHT_COMPRESSION_CHAT_STATUS = (
+    "🗜️ Preparing this long conversation — compacting earlier context before "
+    "continuing with your latest request. Your message is saved; this can take "
+    "a few minutes."
+)
 
 # Surfaces that consume gateway text programmatically (CLI/TUI "local"
 # diagnostics, API JSON, webhook payloads) and therefore must keep RAW
@@ -479,6 +488,8 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
+    if _PREFLIGHT_COMPRESSION_STATUS_RE.search(text):
+        return _PREFLIGHT_COMPRESSION_CHAT_STATUS
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
         return None
     if _looks_like_gateway_provider_error(text):

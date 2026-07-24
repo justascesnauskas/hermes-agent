@@ -633,6 +633,9 @@ def build_turn_context(
             )
         elif _compressor.should_compress(_preflight_tokens):
             _preflight_compressed = True
+            _touch_activity = getattr(agent, "_touch_activity", None)
+            if callable(_touch_activity):
+                _touch_activity("compacting earlier conversation before continuing")
             logger.info(
                 "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
                 f"{_preflight_tokens:,}",

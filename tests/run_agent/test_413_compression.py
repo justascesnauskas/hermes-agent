@@ -754,6 +754,9 @@ class TestPreflightCompression:
 
         with (
             patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(
+                agent, "_touch_activity", wraps=agent._touch_activity
+            ) as touch_activity,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -782,6 +785,9 @@ class TestPreflightCompression:
         assert any(
             ev == "lifecycle" and "Preflight compression" in msg
             for ev, msg in status_messages
+        )
+        touch_activity.assert_any_call(
+            "compacting earlier conversation before continuing"
         )
 
     def test_preflight_defers_when_recent_real_usage_fit(self, agent):
