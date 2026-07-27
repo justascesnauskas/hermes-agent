@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from typing import Any
@@ -1172,6 +1173,7 @@ class _PreviewClient:
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.review_calls: list[dict[str, Any]] = []
 
     def get_preview_page(
         self,
@@ -1189,23 +1191,51 @@ class _PreviewClient:
                 "limit": limit,
             }
         )
+        tasks = [
+            {"stableTaskId": f"task-{index}"}
+            for index in range(offset, offset + limit)
+        ]
+        preview_hash = "sha256:" + "a" * 64
+        page_document = {
+            "schemaVersion": "planning.preview-page.v1",
+            "threadId": thread_id,
+            "previewResultId": preview_result_id,
+            "previewResultHash": preview_hash,
+            "taskCount": 137,
+            "offset": offset,
+            "count": len(tasks),
+            "tasks": tasks,
+        }
+        page_digest = "sha256:" + hashlib.sha256(
+            json.dumps(
+                page_document,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         return PlanningV2Response(
             200,
             {
                 "threadId": thread_id,
                 "runId": "run-1",
                 "previewResultId": preview_result_id,
-                "previewResultHash": "sha256:preview-1",
-                "planHash": "sha256:plan-1",
+                "previewResultHash": preview_hash,
+                "planHash": "1" * 64,
                 "basisInputSequence": 4,
                 "taskCount": 137,
                 "offset": offset,
                 "limit": limit,
                 "returned": limit,
-                "tasks": [
-                    {"stableTaskId": f"task-{index}"}
-                    for index in range(offset, offset + limit)
-                ],
+                "tasks": tasks,
+                "pageDigest": page_digest,
+                "reviewStatus": {
+                    "taskCount": 137,
+                    "coveredTaskCount": 0,
+                    "coveredRanges": [],
+                    "missingRanges": [{"offset": 0, "count": 137}],
+                    "complete": False,
+                },
                 "hasMore": True,
                 "nextOffset": offset + limit,
                 "title": "Planning V2 delivery",
@@ -1214,7 +1244,47 @@ class _PreviewClient:
                 "decisions": [{"code": "ready_for_approval"}],
                 "coverage": {"ready": True, "findings": []},
                 "acceptedAt": "2026-07-27T12:30:00Z",
-                "approvalEligible": True,
+                "approvalEligible": False,
+            },
+        )
+
+    def acknowledge_preview_page(
+        self,
+        thread_id: str,
+        preview_result_id: str,
+        **kwargs: Any,
+    ) -> PlanningV2Response[dict[str, Any]]:
+        self.review_calls.append(
+            {
+                "threadId": thread_id,
+                "previewResultId": preview_result_id,
+                **kwargs,
+            }
+        )
+        return PlanningV2Response(
+            201,
+            {
+                "ok": True,
+                "replayed": False,
+                "receipt": {
+                    "reviewReceiptId": "review-receipt-1",
+                    "threadId": thread_id,
+                    "previewResultId": preview_result_id,
+                    "previewResultHash": kwargs[
+                        "expected_preview_hash"
+                    ],
+                    "offset": kwargs["offset"],
+                    "count": kwargs["count"],
+                    "pageDigest": kwargs["page_digest"],
+                },
+                "reviewStatus": {
+                    "taskCount": 137,
+                    "coveredTaskCount": 50,
+                    "coveredRanges": [{"offset": 0, "count": 50}],
+                    "missingRanges": [{"offset": 50, "count": 87}],
+                    "complete": False,
+                },
+                "approvalEligible": False,
             },
         )
 
@@ -1250,10 +1320,15 @@ def test_preview_returns_exact_hashes_page_and_next_action_without_origin(
             "limit": 50,
         }
     ]
-    assert result["previewResultHash"] == "sha256:preview-1"
-    assert result["planHash"] == "sha256:plan-1"
+    assert result["previewResultHash"] == "sha256:" + "a" * 64
+    assert result["planHash"] == "1" * 64
     assert result["taskCount"] == 137
     assert len(result["tasks"]) == 50
+    assert result["pageReviewed"] is True
+    assert result["reviewStatus"]["coveredTaskCount"] == 50
+    assert result["approvalEligible"] is False
+    assert len(fake.review_calls) == 1
+    assert fake.review_calls[0]["page_digest"] == result["pageDigest"]
     assert result["nextAction"] == {
         "tool": planning_tool.PLANNING_V2_TOOL_NAME,
         "arguments": {
@@ -1264,6 +1339,69 @@ def test_preview_returns_exact_hashes_page_and_next_action_without_origin(
             "limit": 50,
         },
     }
+
+
+def test_lost_preview_receipt_response_replays_exact_page_before_progressing(
+    monkeypatch,
+) -> None:
+    class _LostReceiptClient(_PreviewClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.receipt_keys: list[str] = []
+            self.lose_first_response = True
+
+        def acknowledge_preview_page(
+            self,
+            thread_id: str,
+            preview_result_id: str,
+            **kwargs: Any,
+        ) -> PlanningV2Response[dict[str, Any]]:
+            self.receipt_keys.append(kwargs["idempotency_key"])
+            if self.lose_first_response:
+                self.lose_first_response = False
+                raise PlanningV2TransportError(
+                    "planning.hub_timeout",
+                    detail="review receipt response lost after commit",
+                    retryable=True,
+                    ambiguous=True,
+                    attempts=2,
+                )
+            return super().acknowledge_preview_page(
+                thread_id,
+                preview_result_id,
+                **kwargs,
+            )
+
+    fake = _LostReceiptClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+    arguments = {
+        "action": "preview",
+        "thread_id": "planning-thread-1",
+        "preview_result_id": "preview-1",
+        "offset": 0,
+        "limit": 50,
+    }
+
+    failure = json.loads(planning_tool._handle_planning_v2(arguments))
+    assert failure["outcomeAmbiguous"] is True
+    assert failure["recovery"]["pageFetched"] is True
+    recovery = failure["recovery"]["nextAction"]["arguments"]
+    assert recovery == arguments
+
+    recovered = json.loads(
+        planning_tool._handle_planning_v2(recovery)
+    )
+    assert recovered["pageReviewed"] is True
+    assert recovered["approvalEligible"] is False
+    assert fake.receipt_keys[0] == fake.receipt_keys[1]
+    assert fake.receipt_keys[0].startswith(
+        "hermes-planning-preview-review-v1:"
+    )
 
 
 def test_preview_tool_schema_requires_review_before_approval() -> None:

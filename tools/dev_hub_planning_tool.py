@@ -27,6 +27,7 @@ from hermes_cli.dev_hub_planning_v2 import (
     derive_approval_idempotency_key,
     derive_artifact_idempotency_key,
     derive_artifact_input_origin,
+    derive_preview_review_idempotency_key,
     derive_run_idempotency_key,
 )
 from hermes_cli.turn_origin import (
@@ -1229,23 +1230,67 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                 "decisions": preview["decisions"],
                 "coverage": preview["coverage"],
                 "acceptedAt": preview["acceptedAt"],
-                "approvalEligible": preview["approvalEligible"],
+                "approvalEligible": False,
                 "offset": preview["offset"],
                 "limit": preview["limit"],
                 "returned": preview["returned"],
                 "tasks": preview["tasks"],
+                "pageDigest": preview["pageDigest"],
                 "hasMore": preview["hasMore"],
                 "nextOffset": preview["nextOffset"],
             }
-            if preview["hasMore"]:
+            # Freeze the exact validated page representation before recording
+            # a receipt. The acknowledgment can therefore never cover tasks
+            # other than those this tool result is about to expose.
+            result = json.loads(tool_result(result))
+            receipt_key = derive_preview_review_idempotency_key(
+                runner_id=client.runner_id,
+                thread_id=thread_id,
+                preview_result_id=preview_result_id,
+                preview_result_hash=preview["previewResultHash"],
+                offset=preview["offset"],
+                count=preview["returned"],
+                page_digest=preview["pageDigest"],
+            )
+            partial = {
+                "threadId": thread_id,
+                "previewResultId": preview_result_id,
+                "pageFetched": True,
+                "_recoveryArguments": {
+                    "action": "preview",
+                    "thread_id": thread_id,
+                    "preview_result_id": preview_result_id,
+                    "offset": preview["offset"],
+                    "limit": preview["limit"],
+                },
+            }
+            review_response = client.acknowledge_preview_page(
+                thread_id,
+                preview_result_id,
+                idempotency_key=receipt_key,
+                expected_preview_hash=preview["previewResultHash"],
+                offset=preview["offset"],
+                count=preview["returned"],
+                page_digest=preview["pageDigest"],
+            )
+            review = review_response.payload
+            result["pageReviewed"] = True
+            result["reviewReceipt"] = review["receipt"]
+            result["reviewStatus"] = review["reviewStatus"]
+            result["approvalEligible"] = review["approvalEligible"]
+            if not review["reviewStatus"]["complete"]:
+                first_missing = review["reviewStatus"]["missingRanges"][0]
                 result["nextAction"] = {
                     "tool": PLANNING_V2_TOOL_NAME,
                     "arguments": {
                         "action": "preview",
                         "thread_id": thread_id,
                         "preview_result_id": preview_result_id,
-                        "offset": preview["nextOffset"],
-                        "limit": preview["limit"],
+                        "offset": first_missing["offset"],
+                        "limit": min(
+                            preview["limit"],
+                            first_missing["count"],
+                        ),
                     },
                 }
             return tool_result(result)

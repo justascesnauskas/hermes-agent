@@ -166,12 +166,13 @@ def _preview_page(
     limit: int = 60,
     next_offset: int | None,
 ) -> dict[str, Any]:
-    return {
+    preview_hash = "sha256:" + "a" * 64
+    payload = {
         "threadId": "thread-1",
         "runId": "run-1",
         "previewResultId": "preview-1",
-        "previewResultHash": "sha256:preview-1",
-        "planHash": "sha256:plan-1",
+        "previewResultHash": preview_hash,
+        "planHash": "1" * 64,
         "basisInputSequence": 4,
         "taskCount": task_count,
         "offset": offset,
@@ -190,6 +191,62 @@ def _preview_page(
             "findings": [],
         },
         "acceptedAt": "2026-07-27T12:30:00Z",
+        "approvalEligible": False,
+        "reviewStatus": {
+            "taskCount": task_count,
+            "coveredTaskCount": 0,
+            "coveredRanges": [],
+            "missingRanges": [{"offset": 0, "count": task_count}],
+            "complete": False,
+        },
+    }
+    page_document = {
+        "schemaVersion": "planning.preview-page.v1",
+        "threadId": payload["threadId"],
+        "previewResultId": payload["previewResultId"],
+        "previewResultHash": preview_hash,
+        "taskCount": task_count,
+        "offset": offset,
+        "count": len(tasks),
+        "tasks": tasks,
+    }
+    payload["pageDigest"] = "sha256:" + hashlib.sha256(
+        json.dumps(
+            page_document,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return payload
+
+
+def _preview_review_receipt(
+    page: dict[str, Any],
+    *,
+    replayed: bool,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "replayed": replayed,
+        "receipt": {
+            "reviewReceiptId": "preview-review-receipt-1",
+            "threadId": page["threadId"],
+            "previewResultId": page["previewResultId"],
+            "previewResultHash": page["previewResultHash"],
+            "offset": page["offset"],
+            "count": page["returned"],
+            "pageDigest": page["pageDigest"],
+        },
+        "reviewStatus": {
+            "taskCount": page["taskCount"],
+            "coveredTaskCount": page["taskCount"],
+            "coveredRanges": [
+                {"offset": 0, "count": page["taskCount"]}
+            ],
+            "missingRanges": [],
+            "complete": True,
+        },
         "approvalEligible": True,
     }
 
@@ -519,7 +576,7 @@ def test_preview_read_wire_needs_runner_auth_but_no_turn_origin() -> None:
         limit=10,
     )
 
-    assert response.payload["previewResultHash"] == "sha256:preview-1"
+    assert response.payload["previewResultHash"] == "sha256:" + "a" * 64
     call = transport.calls[0]
     assert call["method"] == "GET"
     assert call["url"] == (
@@ -528,6 +585,49 @@ def test_preview_read_wire_needs_runner_auth_but_no_turn_origin() -> None:
     )
     assert call["headers"]["authorization"] == "Bearer runner-token"
     assert call["body"] is None
+
+
+def test_preview_review_receipt_wire_replays_exact_page_after_lost_response(
+) -> None:
+    page = _preview_page(
+        offset=0,
+        tasks=[{"stableTaskId": "task-1"}],
+        task_count=1,
+        limit=50,
+        next_offset=None,
+    )
+    replayed = _preview_review_receipt(page, replayed=True)
+    transport = _ScriptedTransport(
+        TimeoutError("review receipt response lost after commit"),
+        _Response(200, replayed),
+    )
+    client = _client(transport)
+    key = "hermes-planning-preview-review-v1:" + "b" * 64
+
+    response = client.acknowledge_preview_page(
+        "thread-1",
+        "preview-1",
+        idempotency_key=key,
+        expected_preview_hash=page["previewResultHash"],
+        offset=page["offset"],
+        count=page["returned"],
+        page_digest=page["pageDigest"],
+    )
+
+    assert response.payload["replayed"] is True
+    assert response.payload["approvalEligible"] is True
+    assert len(transport.calls) == 2
+    assert transport.calls[0]["body"] == transport.calls[1]["body"]
+    assert transport.calls[0]["headers"]["idempotency-key"] == key
+    assert transport.calls[0]["url"].endswith(
+        "/threads/thread-1/previews/preview-1/review-receipts"
+    )
+    assert json.loads(transport.calls[0]["body"]) == {
+        "expectedPreviewHash": page["previewResultHash"],
+        "offset": 0,
+        "count": 1,
+        "pageDigest": page["pageDigest"],
+    }
 
 
 def test_preview_iterator_reads_all_137_tasks_without_total_cap() -> None:
@@ -601,6 +701,39 @@ def test_preview_schema_rejects_nullable_or_stalled_page_fields() -> None:
 
     assert captured.value.code == "planning.hub_response_invalid"
     assert "summary" in str(captured.value.detail)
+
+
+def test_preview_schema_rejects_early_review_completion_or_wrong_page_digest(
+) -> None:
+    early = _preview_page(
+        offset=0,
+        tasks=[{"stableTaskId": "task-1"}],
+        task_count=1,
+        limit=50,
+        next_offset=None,
+    )
+    early["approvalEligible"] = True
+    wrong_digest = {
+        **_preview_page(
+            offset=0,
+            tasks=[{"stableTaskId": "task-1"}],
+            task_count=1,
+            limit=50,
+            next_offset=None,
+        ),
+        "pageDigest": "sha256:" + "f" * 64,
+    }
+
+    for payload, detail in (
+        (early, "approvalEligible"),
+        (wrong_digest, "pageDigest"),
+    ):
+        with pytest.raises(PlanningV2ProtocolError) as captured:
+            _client(_ScriptedTransport(_Response(200, payload))).get_preview_page(
+                "thread-1",
+                "preview-1",
+            )
+        assert detail in str(captured.value.detail)
 
 
 def test_artifact_upload_streams_raw_file_and_replays_lost_response(

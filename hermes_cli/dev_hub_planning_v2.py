@@ -305,6 +305,8 @@ class PlanningPreviewPage(TypedDict):
     limit: int
     returned: int
     tasks: list[dict[str, Any]]
+    pageDigest: str
+    reviewStatus: dict[str, Any]
     hasMore: bool
     nextOffset: Optional[int]
     title: str
@@ -313,6 +315,24 @@ class PlanningPreviewPage(TypedDict):
     decisions: list[dict[str, Any]]
     coverage: dict[str, Any]
     acceptedAt: str
+    approvalEligible: bool
+
+
+class PlanningPreviewReviewReceiptDTO(TypedDict):
+    reviewReceiptId: str
+    threadId: str
+    previewResultId: str
+    previewResultHash: str
+    offset: int
+    count: int
+    pageDigest: str
+
+
+class PlanningPreviewReviewMutation(TypedDict):
+    ok: bool
+    replayed: bool
+    receipt: PlanningPreviewReviewReceiptDTO
+    reviewStatus: dict[str, Any]
     approvalEligible: bool
 
 
@@ -688,6 +708,61 @@ def derive_approval_idempotency_key(
         )
     digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
     return f"hermes-planning-approval-v1:{digest}"
+
+
+def derive_preview_review_idempotency_key(
+    *,
+    runner_id: str,
+    thread_id: str,
+    preview_result_id: str,
+    preview_result_hash: str,
+    offset: int,
+    count: int,
+    page_digest: str,
+) -> str:
+    """Derive an exact replay key for one validated preview page."""
+
+    if isinstance(offset, bool) or isinstance(count, bool):
+        raise PlanningV2OriginError(
+            "planning.preview_review_identity_incomplete"
+        )
+    try:
+        page_offset = int(offset)
+        page_count = int(count)
+    except (TypeError, ValueError) as exc:
+        raise PlanningV2OriginError(
+            "planning.preview_review_identity_incomplete"
+        ) from exc
+    identity = {
+        "schemaVersion": PLANNING_V2_ORIGIN_SCHEMA_VERSION,
+        "runnerId": _text(runner_id),
+        "threadId": _text(thread_id),
+        "previewResultId": _text(preview_result_id),
+        "previewResultHash": _text(preview_result_hash),
+        "offset": page_offset,
+        "count": page_count,
+        "pageDigest": _text(page_digest),
+    }
+    if (
+        not identity["runnerId"]
+        or not identity["threadId"]
+        or not identity["previewResultId"]
+        or not _SHA256_RE.fullmatch(identity["previewResultHash"])
+        or page_offset < 0
+        or page_count < 1
+        or not _SHA256_RE.fullmatch(identity["pageDigest"])
+    ):
+        raise PlanningV2OriginError(
+            "planning.preview_review_identity_incomplete",
+            detail=(
+                "runner, thread, exact preview hash, positive page range, and "
+                "page digest are required."
+            ),
+        )
+    digest = hashlib.sha256(
+        _canonical_json(identity).encode("utf-8")
+    ).hexdigest()
+    return f"hermes-planning-preview-review-v1:{digest}"
 
 
 def _artifact_event_identity(
@@ -1354,6 +1429,116 @@ class PlanningV2Client:
         return response
 
     @classmethod
+    def _validate_review_status(
+        cls,
+        response: PlanningV2Response[Any],
+        value: Any,
+        *,
+        task_count: int,
+        context: str,
+    ) -> Mapping[str, Any]:
+        if not isinstance(value, Mapping):
+            cls._shape_error(
+                response,
+                context=context,
+                detail="reviewStatus must be an object",
+            )
+        fields = {
+            "taskCount": int,
+            "coveredTaskCount": int,
+            "coveredRanges": list,
+            "missingRanges": list,
+            "complete": bool,
+        }
+        for name, expected in fields.items():
+            field_value = value.get(name)
+            valid = isinstance(field_value, expected)
+            if expected is int and isinstance(field_value, bool):
+                valid = False
+            if not valid:
+                cls._shape_error(
+                    response,
+                    context=context,
+                    detail=f"reviewStatus.{name} has an invalid type",
+                )
+        if value["taskCount"] != task_count or task_count < 1:
+            cls._shape_error(
+                response,
+                context=context,
+                detail="reviewStatus.taskCount does not match the preview",
+            )
+
+        def _ranges(name: str) -> list[tuple[int, int]]:
+            parsed: list[tuple[int, int]] = []
+            cursor = 0
+            for item in value[name]:
+                if not isinstance(item, Mapping):
+                    cls._shape_error(
+                        response,
+                        context=context,
+                        detail=f"reviewStatus.{name} entries must be objects",
+                    )
+                offset = item.get("offset")
+                count = item.get("count")
+                if (
+                    not isinstance(offset, int)
+                    or isinstance(offset, bool)
+                    or not isinstance(count, int)
+                    or isinstance(count, bool)
+                    or offset < cursor
+                    or count < 1
+                    or offset + count > task_count
+                ):
+                    cls._shape_error(
+                        response,
+                        context=context,
+                        detail=f"reviewStatus.{name} is not canonical",
+                    )
+                parsed.append((offset, offset + count))
+                cursor = offset + count
+            return parsed
+
+        covered = _ranges("coveredRanges")
+        missing = _ranges("missingRanges")
+        if value["coveredTaskCount"] != sum(
+            end - start for start, end in covered
+        ):
+            cls._shape_error(
+                response,
+                context=context,
+                detail="reviewStatus.coveredTaskCount is inconsistent",
+            )
+        partition = sorted(
+            [(start, end, "covered") for start, end in covered]
+            + [(start, end, "missing") for start, end in missing]
+        )
+        cursor = 0
+        for start, end, _kind in partition:
+            if start != cursor:
+                cls._shape_error(
+                    response,
+                    context=context,
+                    detail="reviewStatus ranges do not partition every task",
+                )
+            cursor = end
+        if cursor != task_count:
+            cls._shape_error(
+                response,
+                context=context,
+                detail="reviewStatus ranges do not cover the task domain",
+            )
+        complete = (
+            value["coveredTaskCount"] == task_count and not missing
+        )
+        if value["complete"] is not complete:
+            cls._shape_error(
+                response,
+                context=context,
+                detail="reviewStatus.complete is inconsistent",
+            )
+        return value
+
+    @classmethod
     def _validate_preview_page(
         cls,
         response: PlanningV2Response[Any],
@@ -1377,6 +1562,8 @@ class PlanningV2Client:
                 "limit": int,
                 "returned": int,
                 "tasks": list,
+                "pageDigest": str,
+                "reviewStatus": dict,
                 "hasMore": bool,
                 "title": str,
                 "objective": str,
@@ -1408,6 +1595,7 @@ class PlanningV2Client:
             "runId",
             "previewResultId",
             "previewResultHash",
+            "pageDigest",
             "planHash",
             "title",
             "acceptedAt",
@@ -1420,15 +1608,15 @@ class PlanningV2Client:
                 )
         if (
             payload["basisInputSequence"] < 0
-            or payload["taskCount"] < 0
+            or payload["taskCount"] < 1
             or payload["returned"] < 0
         ):
             cls._shape_error(
                 response,
                 context="planning preview page",
                 detail=(
-                    "basisInputSequence, taskCount, and returned must be "
-                    "non-negative"
+                    "basisInputSequence and returned must be non-negative; "
+                    "taskCount must be positive"
                 ),
             )
         if payload["offset"] < 0 or payload["limit"] < 1:
@@ -1458,6 +1646,53 @@ class PlanningV2Client:
                 context="planning preview page",
                 detail="returned must equal the number of tasks",
             )
+        if (
+            payload["returned"] > payload["limit"]
+            or payload["offset"] + payload["returned"]
+            > payload["taskCount"]
+        ):
+            cls._shape_error(
+                response,
+                context="planning preview page",
+                detail="the task page exceeds its declared bounds",
+            )
+        if not _SHA256_RE.fullmatch(payload["previewResultHash"]):
+            cls._shape_error(
+                response,
+                context="planning preview page",
+                detail="previewResultHash must be a canonical sha256 digest",
+            )
+        page_document = {
+            "schemaVersion": "planning.preview-page.v1",
+            "threadId": payload["threadId"],
+            "previewResultId": payload["previewResultId"],
+            "previewResultHash": payload["previewResultHash"],
+            "taskCount": payload["taskCount"],
+            "offset": payload["offset"],
+            "count": payload["returned"],
+            "tasks": payload["tasks"],
+        }
+        expected_page_digest = "sha256:" + hashlib.sha256(
+            _canonical_json(page_document).encode("utf-8")
+        ).hexdigest()
+        if payload["pageDigest"] != expected_page_digest:
+            cls._shape_error(
+                response,
+                context="planning preview page",
+                detail="pageDigest does not bind the exact returned tasks",
+            )
+        review_status = cls._validate_review_status(
+            response,
+            payload["reviewStatus"],
+            task_count=payload["taskCount"],
+            context="planning preview page",
+        )
+        if payload["approvalEligible"] is not review_status["complete"]:
+            cls._shape_error(
+                response,
+                context="planning preview page",
+                detail="approvalEligible claims review completion early",
+            )
         next_offset = payload.get("nextOffset")
         if "nextOffset" not in payload or (
             next_offset is not None
@@ -1472,17 +1707,90 @@ class PlanningV2Client:
                 detail="nextOffset must be an integer or null",
             )
         if payload["hasMore"]:
-            if next_offset is None or next_offset <= payload["offset"]:
+            if (
+                next_offset is None
+                or next_offset
+                != payload["offset"] + payload["returned"]
+            ):
                 cls._shape_error(
                     response,
                     context="planning preview page",
-                    detail="nextOffset must advance while hasMore is true",
+                    detail=(
+                        "nextOffset must equal offset + returned while "
+                        "hasMore is true"
+                    ),
                 )
-        elif next_offset is not None:
+        elif (
+            next_offset is not None
+            or payload["offset"] + payload["returned"]
+            != payload["taskCount"]
+        ):
             cls._shape_error(
                 response,
                 context="planning preview page",
-                detail="nextOffset must be null on the final page",
+                detail=(
+                    "the final page must end at taskCount with a null "
+                    "nextOffset"
+                ),
+            )
+        return response
+
+    @classmethod
+    def _validate_preview_review_mutation(
+        cls,
+        response: PlanningV2Response[Any],
+        *,
+        thread_id: str,
+        preview_result_id: str,
+        preview_result_hash: str,
+        offset: int,
+        count: int,
+        page_digest: str,
+    ) -> PlanningV2Response[Any]:
+        payload = cls._require_fields(
+            response,
+            context="planning preview review receipt",
+            fields={
+                "ok": bool,
+                "replayed": bool,
+                "receipt": dict,
+                "reviewStatus": dict,
+                "approvalEligible": bool,
+            },
+        )
+        receipt = payload["receipt"]
+        expected = {
+            "threadId": _text(thread_id),
+            "previewResultId": _text(preview_result_id),
+            "previewResultHash": _text(preview_result_hash),
+            "offset": int(offset),
+            "count": int(count),
+            "pageDigest": _text(page_digest),
+        }
+        if (
+            not isinstance(receipt.get("reviewReceiptId"), str)
+            or not _text(receipt.get("reviewReceiptId"))
+            or any(receipt.get(name) != value for name, value in expected.items())
+        ):
+            cls._shape_error(
+                response,
+                context="planning preview review receipt",
+                detail="receipt identity does not match the acknowledged page",
+            )
+        review_status = cls._validate_review_status(
+            response,
+            payload["reviewStatus"],
+            task_count=int(payload["reviewStatus"].get("taskCount", 0)),
+            context="planning preview review receipt",
+        )
+        if (
+            payload["ok"] is not True
+            or payload["approvalEligible"] is not review_status["complete"]
+        ):
+            cls._shape_error(
+                response,
+                context="planning preview review receipt",
+                detail="receipt completion state is inconsistent",
             )
         return response
 
@@ -2188,6 +2496,75 @@ class PlanningV2Client:
             ),
         )
 
+    def acknowledge_preview_page(
+        self,
+        thread_id: str,
+        preview_result_id: str,
+        *,
+        idempotency_key: str,
+        expected_preview_hash: str,
+        offset: int,
+        count: int,
+        page_digest: str,
+    ) -> PlanningV2Response[PlanningPreviewReviewMutation]:
+        if isinstance(offset, bool) or isinstance(count, bool):
+            raise PlanningV2ConfigError(
+                "planning.preview_review_request_invalid"
+            )
+        try:
+            page_offset = int(offset)
+            page_count = int(count)
+        except (TypeError, ValueError) as exc:
+            raise PlanningV2ConfigError(
+                "planning.preview_review_request_invalid"
+            ) from exc
+        preview_hash = _text(expected_preview_hash)
+        digest = _text(page_digest)
+        if (
+            page_offset < 0
+            or page_count < 1
+            or page_count > MAX_PREVIEW_PAGE_SIZE
+            or not _SHA256_RE.fullmatch(preview_hash)
+            or not _SHA256_RE.fullmatch(digest)
+        ):
+            raise PlanningV2ConfigError(
+                "planning.preview_review_request_invalid",
+                detail=(
+                    "An exact preview hash, canonical page digest, "
+                    "non-negative offset and valid positive count are "
+                    "required."
+                ),
+            )
+        response = self._request(
+            "POST",
+            (
+                f"{PLANNING_V2_PREFIX}/threads/"
+                f"{self._quoted(thread_id)}/previews/"
+                f"{self._quoted(preview_result_id)}/review-receipts"
+            ),
+            body={
+                "expectedPreviewHash": preview_hash,
+                "offset": page_offset,
+                "count": page_count,
+                "pageDigest": digest,
+            },
+            expected_statuses=frozenset({200, 201}),
+            idempotency_key=idempotency_key,
+            retry_safe=True,
+        )
+        return cast(
+            PlanningV2Response[PlanningPreviewReviewMutation],
+            self._validate_preview_review_mutation(
+                response,
+                thread_id=thread_id,
+                preview_result_id=preview_result_id,
+                preview_result_hash=preview_hash,
+                offset=page_offset,
+                count=page_count,
+                page_digest=digest,
+            ),
+        )
+
     def iter_preview_tasks(
         self,
         thread_id: str,
@@ -2608,6 +2985,8 @@ __all__ = [
     "PlanningOriginPayload",
     "PlanningApplyDTO",
     "PlanningPreviewPage",
+    "PlanningPreviewReviewMutation",
+    "PlanningPreviewReviewReceiptDTO",
     "PlanningRunDTO",
     "PlanningThreadMutation",
     "PlanningThreadProjection",
@@ -2627,6 +3006,7 @@ __all__ = [
     "derive_approval_idempotency_key",
     "derive_artifact_idempotency_key",
     "derive_artifact_input_origin",
+    "derive_preview_review_idempotency_key",
     "derive_run_idempotency_key",
     "planning_origin_from_current_turn",
     "planning_origin_from_turn",
