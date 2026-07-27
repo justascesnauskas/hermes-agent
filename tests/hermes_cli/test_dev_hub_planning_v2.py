@@ -1901,6 +1901,46 @@ def test_typed_hub_failure_preserves_service_code_status_and_detail() -> None:
     assert response_body.closed is True
 
 
+@pytest.mark.parametrize(
+    ("status", "declared", "expected"),
+    [
+        (409, True, True),
+        (503, False, False),
+        (503, None, True),
+    ],
+)
+def test_typed_hub_failure_preserves_declared_retryability(
+    status: int,
+    declared: bool | None,
+    expected: bool,
+) -> None:
+    payload: dict[str, Any] = {
+        "ok": False,
+        "code": "planning.artifact_upload.offset_conflict",
+        "detail": "Resume from the authoritative server offset.",
+    }
+    if declared is not None:
+        payload["retryable"] = declared
+    transport = _ScriptedTransport(
+        error.HTTPError(
+            "https://hub.example.test",
+            status,
+            "Typed failure",
+            {},
+            BytesIO(json.dumps(payload).encode("utf-8")),
+        )
+    )
+
+    with pytest.raises(PlanningV2HTTPError) as captured:
+        _client(transport).create_run(
+            "thread-2",
+            idempotency_key="typed-retryability",
+        )
+
+    assert captured.value.retryable is expected
+    assert captured.value.compact().get("retryable", False) is expected
+
+
 def test_malformed_success_is_a_typed_protocol_failure() -> None:
     transport = _ScriptedTransport(
         _Response(

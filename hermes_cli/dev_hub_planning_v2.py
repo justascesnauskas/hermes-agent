@@ -1113,12 +1113,17 @@ class PlanningV2Client:
             else f"planning.http_{status}"
         )
         detail = body.get("detail", code)
+        declared_retryable = body.get("retryable")
         raise PlanningV2HTTPError(
             code,
             status=status,
             detail=detail,
             payload=body,
-            retryable=status in {429, 502, 503, 504},
+            retryable=(
+                declared_retryable
+                if isinstance(declared_retryable, bool)
+                else status in {429, 502, 503, 504}
+            ),
         )
 
     def _request(
