@@ -17,7 +17,7 @@ import hashlib
 import json
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, ClassVar, Iterator, Mapping, MutableMapping, Optional
 
@@ -129,13 +129,21 @@ def turn_attachment_path_fingerprint(value: Any) -> Optional[str]:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TurnAttachmentOriginV1:
-    """Opaque identity for one attachment in provider ingress order."""
+    """Opaque identity plus process-private source for one ingress attachment."""
 
     SCHEMA_VERSION: ClassVar[str] = TURN_ATTACHMENT_SCHEMA_VERSION
 
     attachment_id: str
     ingress_ordinal: int
     path_fingerprint: str
+    # The cached path is runtime capability state, never origin wire data. It
+    # lets a trusted facade durably spool every attachment without putting a
+    # filesystem path in model arguments, hook payloads, logs, or Hub identity.
+    local_path: Optional[str] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         attachment_id = _optional_text(self.attachment_id)
@@ -150,6 +158,16 @@ class TurnAttachmentOriginV1:
         object.__setattr__(self, "attachment_id", attachment_id)
         object.__setattr__(self, "ingress_ordinal", ordinal)
         object.__setattr__(self, "path_fingerprint", path_fingerprint)
+        local_path = _optional_text(self.local_path)
+        if (
+            local_path is not None
+            and turn_attachment_path_fingerprint(local_path)
+            != path_fingerprint
+        ):
+            raise ValueError(
+                "attachment local path does not match its path fingerprint"
+            )
+        object.__setattr__(self, "local_path", local_path)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "TurnAttachmentOriginV1":
@@ -232,6 +250,7 @@ def derive_turn_attachment_origins(
                 attachment_id=f"att_v1_{digest[:32]}",
                 ingress_ordinal=index,
                 path_fingerprint=path_fingerprint,
+                local_path=str(raw_path),
             )
         )
     return tuple(attachments)

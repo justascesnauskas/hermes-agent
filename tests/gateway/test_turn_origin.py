@@ -268,9 +268,10 @@ def test_gateway_origin_adds_opaque_attachment_ingress_identity() -> None:
     ]
     event.metadata["attachment_ids"] = ["provider-file-7", "provider-file-8"]
 
-    payload = event.ensure_turn_origin(
+    origin = event.ensure_turn_origin(
         gateway_account_id="account-primary"
-    ).to_dict()
+    )
+    payload = origin.to_dict()
 
     assert [item["ingress_ordinal"] for item in payload["attachments"]] == [1, 2]
     assert all(
@@ -280,3 +281,30 @@ def test_gateway_origin_adds_opaque_attachment_ingress_identity() -> None:
     rendered = str(payload)
     assert "provider-file-7" not in rendered
     assert "/gateway/private/cache" not in rendered
+    assert [item.local_path for item in origin.attachments] == event.media_urls
+    assert all("local_path" not in item for item in payload["attachments"])
+
+    # Crossing the JSON-shaped origin boundary intentionally drops the private
+    # filesystem capability while preserving immutable attachment identity.
+    reconstructed = TurnOriginV1.from_mapping(payload)
+    assert [item.local_path for item in reconstructed.attachments] == [None, None]
+
+
+def test_attachment_private_path_must_match_its_opaque_fingerprint() -> None:
+    from hermes_cli.turn_origin import (
+        TurnAttachmentOriginV1,
+        turn_attachment_path_fingerprint,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="does not match its path fingerprint",
+    ):
+        TurnAttachmentOriginV1(
+            attachment_id="att_v1_test",
+            ingress_ordinal=1,
+            path_fingerprint=turn_attachment_path_fingerprint(
+                "/gateway/cache/original.pdf"
+            ),
+            local_path="/gateway/cache/replaced.pdf",
+        )
