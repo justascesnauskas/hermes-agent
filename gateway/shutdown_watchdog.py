@@ -249,6 +249,7 @@ async def loop_heartbeat_forever(
     start_time: Optional[float] = None,
     home: Optional[Path] = None,
     should_continue: Optional[Callable[[], bool]] = None,
+    extra_fn: Optional[Callable[[], Dict[str, Any]]] = None,
 ) -> None:
     """Rewrite the loop heartbeat file on a cadence until cancelled / gated off.
 
@@ -262,11 +263,29 @@ async def loop_heartbeat_forever(
 
     # Immediate first write so monitors see a fresh file as soon as the
     # gateway is running, not after the first interval.
-    write_loop_heartbeat(start_time=start_time, home=home)
+    def current_extra() -> Optional[Dict[str, Any]]:
+        if extra_fn is None:
+            return None
+        try:
+            value = extra_fn()
+        except Exception:
+            logger.debug("Failed to collect gateway heartbeat metadata", exc_info=True)
+            return None
+        return value if isinstance(value, dict) else None
+
+    write_loop_heartbeat(
+        start_time=start_time,
+        home=home,
+        extra=current_extra(),
+    )
     while True:
         if should_continue is not None and not should_continue():
             return
         await asyncio.sleep(interval)
         if should_continue is not None and not should_continue():
             return
-        write_loop_heartbeat(start_time=start_time, home=home)
+        write_loop_heartbeat(
+            start_time=start_time,
+            home=home,
+            extra=current_extra(),
+        )
