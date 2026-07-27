@@ -20,6 +20,8 @@ from hermes_cli.dev_hub_planning_v2 import (
     PlanningV2ClientError,
     PlanningV2ConfigError,
     derive_approval_idempotency_key,
+    derive_artifact_idempotency_key,
+    derive_artifact_input_origin,
     derive_run_idempotency_key,
 )
 from hermes_cli.turn_origin import get_current_turn_origin
@@ -407,6 +409,57 @@ def _approval_key(
     )
 
 
+def _artifact_key(
+    args: Mapping[str, Any],
+    *,
+    client: PlanningV2Client,
+    thread_id: str,
+    origin: PlanningOriginPayload,
+    role: str,
+    position: int,
+) -> str:
+    derived = derive_artifact_idempotency_key(
+        runner_id=client.runner_id,
+        thread_id=thread_id,
+        provider=origin["provider"],
+        gateway_account_id=origin["gatewayAccountId"],
+        provider_event_id=origin["providerEventId"],
+        role=role,
+        position=position,
+    )
+    explicit = str(args.get("idempotency_key") or "").strip()
+    if explicit and explicit != derived:
+        raise PlanningV2ConfigError(
+            "planning.artifact_idempotency_key_mismatch",
+            detail=(
+                "Artifact replay key does not match the current scoped turn, "
+                "thread, role, and position."
+            ),
+        )
+    return derived
+
+
+def _artifact_position(args: Mapping[str, Any]) -> int:
+    value = args.get("position")
+    if isinstance(value, bool):
+        raise PlanningV2ConfigError(
+            "planning.artifact_position_invalid"
+        )
+    try:
+        position = int(value)
+    except (TypeError, ValueError) as exc:
+        raise PlanningV2ConfigError(
+            "planning.artifact_position_invalid",
+            detail="position is required and must be a positive integer.",
+        ) from exc
+    if position < 1:
+        raise PlanningV2ConfigError(
+            "planning.artifact_position_invalid",
+            detail="position is required and must be a positive integer.",
+        )
+    return position
+
+
 def _start_run(
     client: PlanningV2Client,
     args: Mapping[str, Any],
@@ -451,13 +504,14 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
         "status",
         "events",
         "start_run",
+        "upload_artifact",
         "approve_apply",
         "preview",
     }:
         return tool_error(
             (
                 "action must be create, continue, status, events, start_run, "
-                "preview, or approve_apply"
+                "upload_artifact, preview, or approve_apply"
             ),
             code="planning.action_invalid",
         )
@@ -588,6 +642,149 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                         input_response.payload.get("previewInvalidated")
                     ),
                 )
+            )
+
+        if action == "upload_artifact":
+            thread_id = _required_id(args, "thread_id")
+            local_path = _required_id(args, "local_path")
+            role = _required_id(args, "role")
+            position = _artifact_position(args)
+            origin = client.current_origin()
+            idempotency_key = _artifact_key(
+                args,
+                client=client,
+                thread_id=thread_id,
+                origin=origin,
+                role=role,
+                position=position,
+            )
+            raw_required = args.get("required")
+            if raw_required is not None and not isinstance(
+                raw_required, bool
+            ):
+                raise PlanningV2ConfigError(
+                    "planning.tool_argument_invalid",
+                    detail="required must be a boolean.",
+                )
+            required = True if raw_required is None else raw_required
+            content_type = (
+                str(args["content_type"])
+                if args.get("content_type") is not None
+                else None
+            )
+            retain_until = (
+                str(args["retain_until"])
+                if args.get("retain_until") is not None
+                else None
+            )
+            recovery_arguments: dict[str, Any] = {
+                "action": "upload_artifact",
+                "thread_id": thread_id,
+                "local_path": local_path,
+                "role": role,
+                "position": position,
+                "required": required,
+                "idempotency_key": idempotency_key,
+            }
+            if content_type is not None:
+                recovery_arguments["content_type"] = content_type
+            if retain_until is not None:
+                recovery_arguments["retain_until"] = retain_until
+            partial = {
+                "threadId": thread_id,
+                "artifactUploadStarted": True,
+                "artifactIdempotencyKey": idempotency_key,
+                "_recoveryArguments": recovery_arguments,
+            }
+            upload_response = client.upload_artifact(
+                thread_id,
+                local_path,
+                role=role,
+                position=position,
+                idempotency_key=idempotency_key,
+                content_type=content_type,
+                retain_until=retain_until,
+            )
+            upload = upload_response.payload
+            artifact = upload["artifact"]
+            reference = upload["reference"]
+            partial.update(
+                {
+                    "artifactUploaded": True,
+                    "artifactId": artifact["blobId"],
+                    "artifactRef": artifact["artifactRef"],
+                    "uploadDisposition": upload["disposition"],
+                }
+            )
+            descriptor: dict[str, Any] = {
+                "schemaVersion": "1.0",
+                "artifactId": artifact["blobId"],
+                "artifactRef": artifact["artifactRef"],
+                "sourceReference": artifact["artifactRef"],
+                "referenceId": reference["referenceId"],
+                "checksum": artifact["checksum"],
+                "sizeBytes": artifact["sizeBytes"],
+                "contentType": artifact["contentType"],
+                "role": reference["role"],
+                "position": reference["position"],
+                "required": required,
+            }
+            provenance = reference.get("provenance")
+            filename = (
+                provenance.get("filename")
+                if isinstance(provenance, Mapping)
+                else None
+            )
+            if isinstance(filename, str) and filename.strip():
+                descriptor["filename"] = filename
+            artifact_origin = derive_artifact_input_origin(
+                origin,
+                runner_id=client.runner_id,
+                thread_id=thread_id,
+                role=role,
+                position=position,
+            )
+            input_response = client.append_thread_input(
+                thread_id,
+                origin=artifact_origin,
+                payload=descriptor,
+                input_kind="artifact",
+            )
+            partial["inputStored"] = True
+            partial["inputReplayed"] = bool(
+                input_response.payload.get("duplicate")
+            )
+            return tool_result(
+                {
+                    "ok": True,
+                    "action": action,
+                    "threadId": thread_id,
+                    "artifact": descriptor,
+                    "storageMode": upload["storage"].get("mode"),
+                    "uploadDisposition": upload["disposition"],
+                    "uploadReplayed": (
+                        upload["disposition"] == "replayed"
+                    ),
+                    "inputStored": True,
+                    "inputReplayed": bool(
+                        input_response.payload.get("duplicate")
+                    ),
+                    "previewInvalidated": bool(
+                        input_response.payload.get("previewInvalidated")
+                    ),
+                    "nextStep": (
+                        "Upload every remaining attachment with its own role "
+                        "and 1-based position. After all artifacts are stored "
+                        "as immutable inputs, start the run."
+                    ),
+                    "startRunAction": {
+                        "tool": PLANNING_V2_TOOL_NAME,
+                        "arguments": {
+                            "action": "start_run",
+                            "thread_id": thread_id,
+                        },
+                    },
+                }
             )
 
         if action == "events":
@@ -853,6 +1050,12 @@ PLANNING_V2_SCHEMA = {
         "answers, the existing Kanban/tasking flow, or shadow traffic. "
         "Cross-provider continuation requires the explicit thread_id returned "
         "by an earlier call; never infer a planning thread from chat text. "
+        "For gateway-cached attachments, create the thread with "
+        "start_run=false, call upload_artifact once for every attachment "
+        "(there is no total artifact-count cap), then call start_run only "
+        "after every upload reports inputStored=true. upload_artifact streams "
+        "the exact local file to Dev Hub; never put file bytes or base64 in "
+        "message/payload. "
         "approve_apply is exceptional: call it only after Dev Hub returned "
         "the exact preview id/hash and plan hash, and the user explicitly "
         "approved that exact preview in a later conversation turn. Never "
@@ -873,6 +1076,7 @@ PLANNING_V2_SCHEMA = {
                     "status",
                     "events",
                     "start_run",
+                    "upload_artifact",
                     "preview",
                     "approve_apply",
                 ],
@@ -954,6 +1158,50 @@ PLANNING_V2_SCHEMA = {
                     "as event or thread identity."
                 ),
             },
+            "local_path": {
+                "type": "string",
+                "description": (
+                    "Exact absolute gateway-cached attachment path. Required "
+                    "only for upload_artifact. Bytes are streamed from this "
+                    "path and are never embedded in model JSON."
+                ),
+            },
+            "role": {
+                "type": "string",
+                "description": (
+                    "Stable lowercase semantic role for upload_artifact, such "
+                    "as design_reference, database_schema, or requirements."
+                ),
+            },
+            "position": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Positive 1-based position within the artifact role. "
+                    "Every attachment needs a distinct role/position pair; "
+                    "there is no maximum total artifact count."
+                ),
+            },
+            "required": {
+                "type": "boolean",
+                "description": (
+                    "Whether the planning run must treat this artifact as "
+                    "required evidence. Defaults to true."
+                ),
+            },
+            "content_type": {
+                "type": "string",
+                "description": (
+                    "Optional exact media type for upload_artifact; otherwise "
+                    "Hermes infers it from the gateway-cached filename."
+                ),
+            },
+            "retain_until": {
+                "type": "string",
+                "description": (
+                    "Optional Dev Hub retention timestamp for the artifact."
+                ),
+            },
             "payload": {
                 "type": "object",
                 "description": (
@@ -1001,7 +1249,9 @@ PLANNING_V2_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Optional exact replay key for run or approve_apply "
-                    "recovery. When omitted, Hermes derives an "
+                    "recovery. upload_artifact accepts only its Hermes-derived "
+                    "recovery key for the current scoped turn. When omitted, "
+                    "Hermes derives an "
                     "operation-specific key from runner + planning thread + "
                     "the scoped provider/account/event namespace (plus exact "
                     "preview for approval), never message text."
@@ -1011,7 +1261,9 @@ PLANNING_V2_SCHEMA = {
                 "type": "boolean",
                 "description": (
                     "For create/continue, start a run in the same explicit "
-                    "action. Defaults to true."
+                    "action. Defaults to true. Set false whenever the current "
+                    "planning request has attachments; upload all of them "
+                    "before calling start_run."
                 ),
             },
             "after_sequence": {

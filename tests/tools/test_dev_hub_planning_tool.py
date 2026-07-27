@@ -237,6 +237,281 @@ def test_missing_gateway_account_id_fails_closed_before_hub_write(
     assert fake.create_origins == []
 
 
+class _ArtifactClient:
+    runner_id = "runner-1"
+
+    def __init__(self) -> None:
+        self.upload_calls: list[dict[str, Any]] = []
+        self.append_calls: list[dict[str, Any]] = []
+
+    def current_origin(self) -> dict[str, Any]:
+        return planning_origin_from_current_turn(runner_id=self.runner_id)
+
+    def upload_artifact(
+        self,
+        thread_id: str,
+        path: str,
+        **kwargs: Any,
+    ) -> PlanningV2Response[dict[str, Any]]:
+        call = {"threadId": thread_id, "path": path, **kwargs}
+        self.upload_calls.append(call)
+        position = int(kwargs["position"])
+        blob_id = f"blob-{position}"
+        artifact_ref = f"planning-artifact-v1:{blob_id}"
+        return PlanningV2Response(
+            201,
+            {
+                "ok": True,
+                "storage": {"mode": "local", "reason": "local_fallback"},
+                "disposition": "committed",
+                "artifact": {
+                    "blobId": blob_id,
+                    "artifactRef": artifact_ref,
+                    "checksum": "sha256:" + "a" * 64,
+                    "sizeBytes": 2048 + position,
+                    "contentType": kwargs.get("content_type") or "image/png",
+                    "retentionPolicy": "reference_bound",
+                    "retainUntil": kwargs.get("retain_until"),
+                    "createdAt": "2026-07-27T12:30:00Z",
+                },
+                "reference": {
+                    "referenceId": f"reference-{position}",
+                    "blobId": blob_id,
+                    "artifactRef": artifact_ref,
+                    "role": kwargs["role"],
+                    "position": position,
+                    "provenance": {
+                        "filename": path.rsplit("/", 1)[-1],
+                    },
+                    "createdAt": "2026-07-27T12:30:00Z",
+                    "releasedAt": None,
+                },
+            },
+        )
+
+    def append_thread_input(
+        self,
+        thread_id: str,
+        *,
+        origin: dict[str, Any],
+        payload: dict[str, Any],
+        input_kind: str,
+    ) -> PlanningV2Response[dict[str, Any]]:
+        self.append_calls.append(
+            {
+                "threadId": thread_id,
+                "origin": origin,
+                "payload": payload,
+                "inputKind": input_kind,
+            }
+        )
+        return PlanningV2Response(
+            201,
+            {
+                **_thread_projection(
+                    providers=(origin["provider"],),
+                    input_count=len(self.append_calls) + 1,
+                ),
+                "previewInvalidated": False,
+            },
+        )
+
+
+def test_artifact_upload_uses_current_origin_and_appends_opaque_input(
+    monkeypatch,
+) -> None:
+    fake = _ArtifactClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+    origin = _turn_origin("discord", event_id="attachment-event")
+
+    with scoped_turn_origin(origin):
+        result = json.loads(
+            planning_tool._handle_planning_v2(
+                {
+                    "action": "upload_artifact",
+                    "thread_id": "planning-thread-1",
+                    "local_path": "/gateway/cache/dashboard.png",
+                    "role": "design_reference",
+                    "position": 1,
+                    "required": True,
+                }
+            )
+        )
+
+    upload = fake.upload_calls[0]
+    appended = fake.append_calls[0]
+    descriptor = appended["payload"]
+    assert upload["path"] == "/gateway/cache/dashboard.png"
+    assert upload["idempotency_key"].startswith(
+        "hermes-planning-artifact-v1:"
+    )
+    assert "/gateway/cache/dashboard.png" not in upload["idempotency_key"]
+    assert appended["inputKind"] == "artifact"
+    assert appended["origin"]["providerEventId"].startswith(
+        "hermes-planning-artifact-input-v1:"
+    )
+    assert appended["origin"]["messageId"] == "discord-message"
+    assert appended["origin"]["senderId"] == "discord-user"
+    assert descriptor == {
+        "schemaVersion": "1.0",
+        "artifactId": "blob-1",
+        "artifactRef": "planning-artifact-v1:blob-1",
+        "sourceReference": "planning-artifact-v1:blob-1",
+        "referenceId": "reference-1",
+        "checksum": "sha256:" + "a" * 64,
+        "sizeBytes": 2049,
+        "contentType": "image/png",
+        "role": "design_reference",
+        "position": 1,
+        "required": True,
+        "filename": "dashboard.png",
+    }
+    assert "local_path" not in descriptor
+    assert result["artifact"] == descriptor
+    assert result["inputStored"] is True
+    assert result["startRunAction"] == {
+        "tool": planning_tool.PLANNING_V2_TOOL_NAME,
+        "arguments": {
+            "action": "start_run",
+            "thread_id": "planning-thread-1",
+        },
+    }
+
+
+def test_artifact_upload_has_exact_recovery_after_lost_response(
+    monkeypatch,
+) -> None:
+    class _LostArtifactClient(_ArtifactClient):
+        def upload_artifact(
+            self,
+            thread_id: str,
+            path: str,
+            **kwargs: Any,
+        ) -> PlanningV2Response[dict[str, Any]]:
+            self.upload_calls.append(
+                {"threadId": thread_id, "path": path, **kwargs}
+            )
+            raise PlanningV2TransportError(
+                "planning.hub_timeout",
+                detail="upload response lost after commit",
+                retryable=True,
+                ambiguous=True,
+                attempts=2,
+            )
+
+    fake = _LostArtifactClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+
+    with scoped_turn_origin(
+        _turn_origin("slack", event_id="lost-attachment-event")
+    ):
+        failure = json.loads(
+            planning_tool._handle_planning_v2(
+                {
+                    "action": "upload_artifact",
+                    "thread_id": "planning-thread-1",
+                    "local_path": "/gateway/cache/schema.pdf",
+                    "role": "database_schema",
+                    "position": 2,
+                    "content_type": "application/pdf",
+                    "retain_until": "2027-07-27T00:00:00Z",
+                }
+            )
+        )
+
+    recovery = failure["recovery"]["nextAction"]["arguments"]
+    assert failure["outcomeAmbiguous"] is True
+    assert failure["recovery"]["artifactUploadStarted"] is True
+    assert recovery == {
+        "action": "upload_artifact",
+        "thread_id": "planning-thread-1",
+        "local_path": "/gateway/cache/schema.pdf",
+        "role": "database_schema",
+        "position": 2,
+        "required": True,
+        "idempotency_key": fake.upload_calls[0]["idempotency_key"],
+        "content_type": "application/pdf",
+        "retain_until": "2027-07-27T00:00:00Z",
+    }
+
+
+def test_artifact_upload_requires_current_scoped_origin(monkeypatch) -> None:
+    fake = _ArtifactClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+
+    result = json.loads(
+        planning_tool._handle_planning_v2(
+            {
+                "action": "upload_artifact",
+                "thread_id": "planning-thread-1",
+                "local_path": "/gateway/cache/schema.pdf",
+                "role": "database_schema",
+                "position": 1,
+            }
+        )
+    )
+
+    assert result["code"] == "planning.origin_missing"
+    assert fake.upload_calls == []
+    assert fake.append_calls == []
+
+
+def test_artifact_flow_has_no_total_count_cap(monkeypatch) -> None:
+    fake = _ArtifactClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+
+    with scoped_turn_origin(
+        _turn_origin("discord", event_id="many-attachments-event")
+    ):
+        for position in range(1, 138):
+            result = json.loads(
+                planning_tool._handle_planning_v2(
+                    {
+                        "action": "upload_artifact",
+                        "thread_id": "planning-thread-1",
+                        "local_path": (
+                            f"/gateway/cache/reference-{position}.png"
+                        ),
+                        "role": "design_reference",
+                        "position": position,
+                    }
+                )
+            )
+            assert result["ok"] is True
+
+    assert len(fake.upload_calls) == 137
+    assert len(fake.append_calls) == 137
+    assert len(
+        {call["idempotency_key"] for call in fake.upload_calls}
+    ) == 137
+    assert len(
+        {
+            call["origin"]["providerEventId"]
+            for call in fake.append_calls
+        }
+    ) == 137
+
+
 class _StatusClient:
     runner_id = "runner-1"
 
@@ -728,6 +1003,22 @@ def test_preview_tool_schema_requires_review_before_approval() -> None:
     assert "show/review every page in order" in description
     assert "Never approve tasks the user has not seen" in description
     assert "approvalEligible=false" in description
+
+
+def test_artifact_tool_schema_enforces_upload_before_run_workflow() -> None:
+    schema = planning_tool.PLANNING_V2_SCHEMA
+    properties = schema["parameters"]["properties"]
+    description = schema["description"]
+
+    assert "upload_artifact" in properties["action"]["enum"]
+    assert properties["position"]["minimum"] == 1
+    assert "maximum" not in properties["position"]
+    assert "create the thread with start_run=false" in description
+    assert "there is no total artifact-count cap" in description
+    assert "never put file bytes or base64" in description
+    assert "upload all of them before calling start_run" in (
+        properties["start_run"]["description"]
+    )
 
 
 def test_approval_uses_exact_current_turn_and_cross_provider_origin(

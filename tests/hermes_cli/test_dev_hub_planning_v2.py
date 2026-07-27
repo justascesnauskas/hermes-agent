@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from io import BytesIO
 import json
 from typing import Any
@@ -17,6 +18,8 @@ from hermes_cli.dev_hub_planning_v2 import (
     PlanningV2ProtocolError,
     PlanningV2TransportError,
     derive_approval_idempotency_key,
+    derive_artifact_idempotency_key,
+    derive_artifact_input_origin,
 )
 
 
@@ -59,6 +62,8 @@ class _ScriptedTransport:
         self.calls: list[dict[str, Any]] = []
 
     def __call__(self, req, *, timeout: float):
+        body_is_stream = hasattr(req.data, "read")
+        body = req.data.read() if body_is_stream else req.data
         self.calls.append(
             {
                 "method": req.get_method(),
@@ -67,7 +72,8 @@ class _ScriptedTransport:
                     key.lower(): value
                     for key, value in req.header_items()
                 },
-                "body": req.data,
+                "body": body,
+                "bodyIsStream": body_is_stream,
                 "timeout": timeout,
             }
         )
@@ -183,6 +189,47 @@ def _preview_page(
         },
         "acceptedAt": "2026-07-27T12:30:00Z",
         "approvalEligible": True,
+    }
+
+
+def _artifact_upload_projection(
+    content: bytes,
+    *,
+    disposition: str = "committed",
+    role: str = "design_reference",
+    position: int = 1,
+) -> dict[str, Any]:
+    checksum = f"sha256:{hashlib.sha256(content).hexdigest()}"
+    blob_id = "ablob_0123456789abcdef"
+    artifact_ref = f"planning-artifact-v1:{blob_id}"
+    return {
+        "ok": True,
+        "storage": {"mode": "local", "reason": "local_fallback"},
+        "disposition": disposition,
+        "artifact": {
+            "blobId": blob_id,
+            "artifactRef": artifact_ref,
+            "checksum": checksum,
+            "sizeBytes": len(content),
+            "contentType": "image/png",
+            "retentionPolicy": "reference_bound",
+            "retainUntil": None,
+            "createdAt": "2026-07-27T12:30:00Z",
+        },
+        "reference": {
+            "referenceId": "aref_0123456789abcdef",
+            "blobId": blob_id,
+            "artifactRef": artifact_ref,
+            "role": role,
+            "position": position,
+            "provenance": {
+                "schemaVersion": "1.0",
+                "source": "planning_v2_runner_upload",
+                "filename": "dashboard.png",
+            },
+            "createdAt": "2026-07-27T12:30:00Z",
+            "releasedAt": None,
+        },
     }
 
 
@@ -543,6 +590,147 @@ def test_preview_schema_rejects_nullable_or_stalled_page_fields() -> None:
 
     assert captured.value.code == "planning.hub_response_invalid"
     assert "summary" in str(captured.value.detail)
+
+
+def test_artifact_upload_streams_raw_file_and_replays_lost_response(
+    tmp_path,
+) -> None:
+    content = b"\x89PNG\r\n\x1a\nraw-binary-evidence\x00\xff"
+    source = tmp_path / "dashboard.png"
+    source.write_bytes(content)
+    projection = _artifact_upload_projection(
+        content,
+        disposition="replayed",
+    )
+    transport = _ScriptedTransport(
+        TimeoutError("upload response lost after commit"),
+        _Response(201, projection),
+    )
+    origin = _origin()
+    key = derive_artifact_idempotency_key(
+        runner_id="runner-1",
+        thread_id="thread-1",
+        provider=origin["provider"],
+        gateway_account_id=origin["gatewayAccountId"],
+        provider_event_id=origin["providerEventId"],
+        role="design_reference",
+        position=1,
+    )
+
+    response = _client(transport).upload_artifact(
+        "thread-1",
+        str(source),
+        role="design_reference",
+        position=1,
+        idempotency_key=key,
+    )
+
+    assert response.payload == projection
+    assert response.transport_attempts == 2
+    assert [call["body"] for call in transport.calls] == [content, content]
+    assert all(call["bodyIsStream"] for call in transport.calls)
+    assert transport.calls[0]["url"] == (
+        f"https://hub.example.test{PLANNING_V2_PREFIX}/threads/thread-1"
+        "/artifacts?role=design_reference&position=1"
+    )
+    assert all(
+        call["headers"]["idempotency-key"] == key
+        for call in transport.calls
+    )
+    assert all(
+        call["headers"]["content-type"] == "image/png"
+        for call in transport.calls
+    )
+    assert all(
+        call["headers"]["content-length"] == str(len(content))
+        for call in transport.calls
+    )
+    assert all(
+        call["headers"]["x-artifact-filename"] == "dashboard.png"
+        for call in transport.calls
+    )
+    assert b"base64" not in transport.calls[0]["body"]
+
+
+def test_artifact_upload_rejects_mismatched_success_identity(
+    tmp_path,
+) -> None:
+    content = b"exact evidence"
+    source = tmp_path / "dashboard.png"
+    source.write_bytes(content)
+    malformed = _artifact_upload_projection(content)
+    malformed["reference"]["position"] = 2
+    transport = _ScriptedTransport(_Response(201, malformed))
+
+    with pytest.raises(PlanningV2ProtocolError) as captured:
+        _client(transport).upload_artifact(
+            "thread-1",
+            str(source),
+            role="design_reference",
+            position=1,
+            idempotency_key="hermes-planning-artifact-v1:stable",
+        )
+
+    assert captured.value.code == "planning.hub_response_invalid"
+    assert "identity mismatch" in str(captured.value.detail)
+
+
+def test_artifact_identity_is_stable_scoped_and_preserves_turn_origin() -> None:
+    origin = _origin()
+    first = derive_artifact_idempotency_key(
+        runner_id="runner-1",
+        thread_id="thread-1",
+        provider=origin["provider"],
+        gateway_account_id=origin["gatewayAccountId"],
+        provider_event_id=origin["providerEventId"],
+        role="database_schema",
+        position=137,
+    )
+    repeated = derive_artifact_idempotency_key(
+        runner_id="runner-1",
+        thread_id="thread-1",
+        provider=origin["provider"],
+        gateway_account_id=origin["gatewayAccountId"],
+        provider_event_id=origin["providerEventId"],
+        role="database_schema",
+        position=137,
+    )
+    another_position = derive_artifact_idempotency_key(
+        runner_id="runner-1",
+        thread_id="thread-1",
+        provider=origin["provider"],
+        gateway_account_id=origin["gatewayAccountId"],
+        provider_event_id=origin["providerEventId"],
+        role="database_schema",
+        position=138,
+    )
+    derived_origin = derive_artifact_input_origin(
+        origin,
+        runner_id="runner-1",
+        thread_id="thread-1",
+        role="database_schema",
+        position=137,
+    )
+
+    assert first == repeated
+    assert first.startswith("hermes-planning-artifact-v1:")
+    assert first != another_position
+    assert derived_origin["providerEventId"].startswith(
+        "hermes-planning-artifact-input-v1:"
+    )
+    assert {
+        name: derived_origin[name]
+        for name in origin
+        if name != "providerEventId"
+    } == {
+        name: origin[name]
+        for name in origin
+        if name != "providerEventId"
+    }
+    assert derived_origin["messageId"] == origin["messageId"]
+    assert derived_origin["senderId"] == origin["senderId"]
+    assert "dashboard.png" not in first
+    assert "exact evidence" not in first
 
 
 def test_approval_key_is_stable_and_scoped_without_message_content() -> None:

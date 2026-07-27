@@ -20,7 +20,10 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
+import mimetypes
 import os
+from pathlib import Path
+import re
 import time
 from typing import (
     Any,
@@ -51,6 +54,8 @@ DEFAULT_TIMEOUT_SECONDS = 20.0
 DEFAULT_TRANSPORT_RETRIES = 1
 DEFAULT_LEASE_SECONDS = 300
 MAX_PREVIEW_PAGE_SIZE = 200
+_ARTIFACT_ROLE_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,119}$")
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class PlanningOriginPayload(TypedDict):
@@ -303,6 +308,36 @@ class PlanningPreviewPage(TypedDict):
     coverage: dict[str, Any]
     acceptedAt: str
     approvalEligible: bool
+
+
+class PlanningArtifactDTO(TypedDict):
+    blobId: str
+    artifactRef: str
+    checksum: str
+    sizeBytes: int
+    contentType: str
+    retentionPolicy: str
+    retainUntil: Optional[str]
+    createdAt: str
+
+
+class PlanningArtifactReferenceDTO(TypedDict):
+    referenceId: str
+    blobId: str
+    artifactRef: str
+    role: str
+    position: int
+    provenance: dict[str, Any]
+    createdAt: str
+    releasedAt: Optional[str]
+
+
+class PlanningArtifactUploadDTO(TypedDict):
+    ok: bool
+    storage: dict[str, Any]
+    disposition: str
+    artifact: PlanningArtifactDTO
+    reference: PlanningArtifactReferenceDTO
 
 
 class PlanningClaimProjection(TypedDict):
@@ -612,6 +647,111 @@ def derive_approval_idempotency_key(
     return f"hermes-planning-approval-v1:{digest}"
 
 
+def _artifact_event_identity(
+    *,
+    runner_id: str,
+    thread_id: str,
+    provider: str,
+    gateway_account_id: str,
+    provider_event_id: str,
+    role: str,
+    position: int,
+) -> dict[str, Any]:
+    artifact_role = _text(role)
+    if isinstance(position, bool):
+        raise PlanningV2OriginError(
+            "planning.artifact_identity_incomplete",
+            detail="Artifact position must be a positive integer.",
+        )
+    try:
+        artifact_position = int(position)
+    except (TypeError, ValueError) as exc:
+        raise PlanningV2OriginError(
+            "planning.artifact_identity_incomplete",
+            detail="Artifact position must be a positive integer.",
+        ) from exc
+    identity = {
+        "schemaVersion": PLANNING_V2_ORIGIN_SCHEMA_VERSION,
+        "runnerId": _text(runner_id),
+        "threadId": _text(thread_id),
+        "provider": _text(provider),
+        "gatewayAccountId": _text(gateway_account_id),
+        "providerEventId": _text(provider_event_id),
+        "role": artifact_role,
+        "position": artifact_position,
+    }
+    if (
+        not all(value for name, value in identity.items() if name != "position")
+        or artifact_position < 1
+        or not _ARTIFACT_ROLE_RE.fullmatch(artifact_role)
+    ):
+        raise PlanningV2OriginError(
+            "planning.artifact_identity_incomplete",
+            detail=(
+                "runner, planning thread, provider account, provider event, "
+                "valid artifact role, and positive position are required."
+            ),
+        )
+    return identity
+
+
+def derive_artifact_idempotency_key(
+    *,
+    runner_id: str,
+    thread_id: str,
+    provider: str,
+    gateway_account_id: str,
+    provider_event_id: str,
+    role: str,
+    position: int,
+) -> str:
+    """Derive one upload replay key without file path, bytes, or message text."""
+
+    identity = _artifact_event_identity(
+        runner_id=runner_id,
+        thread_id=thread_id,
+        provider=provider,
+        gateway_account_id=gateway_account_id,
+        provider_event_id=provider_event_id,
+        role=role,
+        position=position,
+    )
+    digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
+    return f"hermes-planning-artifact-v1:{digest}"
+
+
+def derive_artifact_input_origin(
+    origin: PlanningOriginPayload,
+    *,
+    runner_id: str,
+    thread_id: str,
+    role: str,
+    position: int,
+) -> PlanningOriginPayload:
+    """Create one deterministic artifact sub-event from the current turn.
+
+    The delivery address, source message, sender, and timestamp remain exactly
+    those of the gateway turn. Only ``providerEventId`` is namespaced so every
+    attachment can become an independent immutable planning input.
+    """
+
+    identity = _artifact_event_identity(
+        runner_id=runner_id,
+        thread_id=thread_id,
+        provider=origin["provider"],
+        gateway_account_id=origin["gatewayAccountId"],
+        provider_event_id=origin["providerEventId"],
+        role=role,
+        position=position,
+    )
+    digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
+    derived = dict(origin)
+    derived["providerEventId"] = (
+        f"hermes-planning-artifact-input-v1:{digest}"
+    )
+    return cast(PlanningOriginPayload, derived)
+
+
 def _is_timeout(exc: BaseException) -> bool:
     reason = getattr(exc, "reason", None)
     return (
@@ -814,6 +954,165 @@ class PlanningV2Client:
                     ),
                     retryable=retry_safe,
                     ambiguous=method != "GET",
+                    attempts=attempts,
+                ) from exc
+            finally:
+                if response is not None:
+                    close = getattr(response, "close", None)
+                    if callable(close):
+                        close()
+
+            payload = self._decode_payload(raw, status=status)
+            if status not in expected_statuses:
+                self._raise_http_error(status=status, payload=payload)
+            return PlanningV2Response(
+                status=status,
+                payload=payload,
+                transport_attempts=attempts,
+            )
+
+    def _request_file(
+        self,
+        path: str,
+        *,
+        request_path: str,
+        content_type: str,
+        idempotency_key: str,
+        expected_statuses: frozenset[int],
+    ) -> PlanningV2Response[Any]:
+        """Stream one exact local file and reopen it for replay-safe retries."""
+
+        source = Path(str(path))
+        if not source.is_absolute():
+            raise PlanningV2ConfigError(
+                "planning.artifact_path_invalid",
+                detail=(
+                    "Artifact path must be the exact absolute gateway-cached "
+                    "attachment path."
+                ),
+            )
+        try:
+            initial_stat = source.stat()
+        except OSError as exc:
+            raise PlanningV2ConfigError(
+                "planning.artifact_file_unreadable",
+                detail="The gateway-cached attachment is not readable.",
+            ) from exc
+        if not source.is_file():
+            raise PlanningV2ConfigError(
+                "planning.artifact_path_invalid",
+                detail="Artifact path must identify a regular file.",
+            )
+
+        media_type = _text(content_type).lower()
+        if (
+            not media_type
+            or "/" not in media_type
+            or len(media_type) > 255
+            or "\r" in media_type
+            or "\n" in media_type
+        ):
+            raise PlanningV2ConfigError(
+                "planning.artifact_content_type_invalid"
+            )
+        key = _text(idempotency_key)
+        if not key:
+            raise PlanningV2ConfigError(
+                "planning.idempotency_key_required"
+            )
+        if "\r" in key or "\n" in key:
+            raise PlanningV2ConfigError(
+                "planning.idempotency_key_invalid",
+                detail="Idempotency-Key cannot contain a newline.",
+            )
+
+        filename: Optional[str] = source.name
+        if (
+            not filename
+            or len(filename) > 255
+            or any(ord(character) < 32 or ord(character) == 127 for character in filename)
+        ):
+            raise PlanningV2ConfigError(
+                "planning.artifact_filename_invalid"
+            )
+        try:
+            filename.encode("latin-1")
+        except UnicodeEncodeError:
+            # The current Hub wire uses a plain HTTP header rather than
+            # RFC 5987. Omit a Unicode display name instead of corrupting it;
+            # the opaque artifact identity and bytes remain exact.
+            filename = None
+
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.token}",
+            "User-Agent": (
+                f"hermes-agent/dev-hub-planning-v2-"
+                f"{PLANNING_V2_CLIENT_VERSION}"
+            ),
+            "Content-Type": media_type,
+            "Content-Length": str(initial_stat.st_size),
+            "Idempotency-Key": key,
+        }
+        if filename is not None:
+            headers["X-Artifact-Filename"] = filename
+
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                current_size = source.stat().st_size
+                if current_size != initial_stat.st_size:
+                    raise PlanningV2ConfigError(
+                        "planning.artifact_file_changed",
+                        detail=(
+                            "The gateway-cached attachment changed while its "
+                            "upload outcome was being recovered."
+                        ),
+                    )
+                stream = source.open("rb")
+            except PlanningV2ClientError:
+                raise
+            except OSError as exc:
+                raise PlanningV2ConfigError(
+                    "planning.artifact_file_unreadable",
+                    detail="The gateway-cached attachment is not readable.",
+                ) from exc
+
+            response: Any = None
+            try:
+                with stream:
+                    req = request.Request(
+                        f"{self.base_url}{request_path}",
+                        data=stream,
+                        headers=headers,
+                        method="POST",
+                    )
+                    response = self._transport(req, timeout=self.timeout)
+                    raw = response.read()
+                    status = int(response.status)
+            except error.HTTPError as exc:
+                response = exc
+                raw = exc.read()
+                status = int(exc.code)
+            except (error.URLError, TimeoutError, OSError) as exc:
+                if attempts <= self.max_transport_retries:
+                    self._sleep(min(0.5, 0.05 * (2 ** (attempts - 1))))
+                    continue
+                code = (
+                    "planning.hub_timeout"
+                    if _is_timeout(exc)
+                    else "planning.hub_unreachable"
+                )
+                raise PlanningV2TransportError(
+                    code,
+                    detail=(
+                        "Dev Hub artifact upload timed out."
+                        if code.endswith("timeout")
+                        else "Dev Hub could not be reached for artifact upload."
+                    ),
+                    retryable=True,
+                    ambiguous=True,
                     attempts=attempts,
                 ) from exc
             finally:
@@ -1096,6 +1395,171 @@ class PlanningV2Client:
         return response
 
     @classmethod
+    def _validate_artifact_upload(
+        cls,
+        response: PlanningV2Response[Any],
+        *,
+        role: str,
+        position: int,
+        size_bytes: int,
+        content_type: str,
+    ) -> PlanningV2Response[Any]:
+        payload = cls._require_fields(
+            response,
+            context="planning artifact upload response",
+            fields={
+                "ok": bool,
+                "storage": dict,
+                "disposition": str,
+                "artifact": dict,
+                "reference": dict,
+            },
+        )
+        if payload["ok"] is not True:
+            cls._shape_error(
+                response,
+                context="planning artifact upload response",
+                detail="ok must be true for a successful HTTP response",
+            )
+        if payload["disposition"] not in {"committed", "resumed", "replayed"}:
+            cls._shape_error(
+                response,
+                context="planning artifact upload response",
+                detail="disposition is invalid",
+            )
+        storage = payload["storage"]
+        if (
+            not isinstance(storage.get("mode"), str)
+            or not _text(storage.get("mode"))
+            or not isinstance(storage.get("reason"), str)
+            or not _text(storage.get("reason"))
+        ):
+            cls._shape_error(
+                response,
+                context="planning artifact upload response",
+                detail="storage mode and reason must be non-empty strings",
+            )
+
+        artifact = payload["artifact"]
+        reference = payload["reference"]
+        artifact_fields: dict[str, type] = {
+            "blobId": str,
+            "artifactRef": str,
+            "checksum": str,
+            "sizeBytes": int,
+            "contentType": str,
+            "retentionPolicy": str,
+            "createdAt": str,
+        }
+        reference_fields: dict[str, type] = {
+            "referenceId": str,
+            "blobId": str,
+            "artifactRef": str,
+            "role": str,
+            "position": int,
+            "provenance": dict,
+            "createdAt": str,
+        }
+        for context, value, fields in (
+            ("artifact", artifact, artifact_fields),
+            ("reference", reference, reference_fields),
+        ):
+            for name, expected_type in fields.items():
+                field = value.get(name)
+                valid = isinstance(field, expected_type)
+                if expected_type is int and isinstance(field, bool):
+                    valid = False
+                if not valid:
+                    cls._shape_error(
+                        response,
+                        context="planning artifact upload response",
+                        detail=f"{context}.{name} has an invalid type",
+                    )
+            nullable_name = (
+                "retainUntil" if context == "artifact" else "releasedAt"
+            )
+            if nullable_name not in value or (
+                value[nullable_name] is not None
+                and not isinstance(value[nullable_name], str)
+            ):
+                cls._shape_error(
+                    response,
+                    context="planning artifact upload response",
+                    detail=(
+                        f"{context}.{nullable_name} must be a string or null"
+                    ),
+                )
+
+        blob_id = _text(artifact["blobId"])
+        artifact_ref = _text(artifact["artifactRef"])
+        expected_ref = f"planning-artifact-v1:{blob_id}"
+        if (
+            not blob_id
+            or artifact_ref != expected_ref
+            or reference["blobId"] != blob_id
+            or reference["artifactRef"] != artifact_ref
+            or not _text(reference["referenceId"])
+        ):
+            cls._shape_error(
+                response,
+                context="planning artifact upload response",
+                detail="artifact and reference identities are inconsistent",
+            )
+        if not _SHA256_RE.fullmatch(_text(artifact["checksum"])):
+            cls._shape_error(
+                response,
+                context="planning artifact upload response",
+                detail="artifact.checksum must be a lowercase sha256 digest",
+            )
+        if artifact["sizeBytes"] < 0 or not _text(artifact["contentType"]):
+            cls._shape_error(
+                response,
+                context="planning artifact upload response",
+                detail=(
+                    "artifact.sizeBytes must be non-negative and contentType "
+                    "must be non-empty"
+                ),
+            )
+        if reference["releasedAt"] is not None:
+            cls._shape_error(
+                response,
+                context="planning artifact upload response",
+                detail="a newly attached artifact reference must be active",
+            )
+        expected = {
+            "artifact.sizeBytes": (artifact["sizeBytes"], int(size_bytes)),
+            "artifact.contentType": (
+                artifact["contentType"],
+                _text(content_type).lower(),
+            ),
+            "reference.role": (reference["role"], _text(role)),
+            "reference.position": (
+                reference["position"],
+                int(position),
+            ),
+        }
+        mismatches = {
+            name: {"actual": actual, "expected": wanted}
+            for name, (actual, wanted) in expected.items()
+            if actual != wanted
+        }
+        if mismatches:
+            cls._shape_error(
+                response,
+                context="planning artifact upload response",
+                detail=f"identity mismatch: {mismatches}",
+            )
+        if not _text(artifact["retentionPolicy"]) or not _text(
+            artifact["createdAt"]
+        ) or not _text(reference["createdAt"]):
+            cls._shape_error(
+                response,
+                context="planning artifact upload response",
+                detail="artifact timestamps and retention policy are required",
+            )
+        return response
+
+    @classmethod
     def _validate_claim_projection(
         cls,
         response: PlanningV2Response[Any],
@@ -1292,6 +1756,85 @@ class PlanningV2Client:
         return cast(
             PlanningV2Response[PlanningThreadMutation],
             self._validate_thread_projection(response, mutation=True),
+        )
+
+    def upload_artifact(
+        self,
+        thread_id: str,
+        path: str,
+        *,
+        role: str,
+        position: int,
+        idempotency_key: str,
+        content_type: Optional[str] = None,
+        retain_until: Optional[str] = None,
+    ) -> PlanningV2Response[PlanningArtifactUploadDTO]:
+        """Stream and attach one file without embedding its bytes in JSON."""
+
+        artifact_role = _text(role)
+        if not _ARTIFACT_ROLE_RE.fullmatch(artifact_role):
+            raise PlanningV2ConfigError(
+                "planning.artifact_role_invalid",
+                detail=(
+                    "Artifact role must start with a lowercase letter and use "
+                    "only lowercase letters, numbers, dot, underscore, or dash."
+                ),
+            )
+        if isinstance(position, bool):
+            raise PlanningV2ConfigError(
+                "planning.artifact_position_invalid"
+            )
+        try:
+            artifact_position = int(position)
+        except (TypeError, ValueError) as exc:
+            raise PlanningV2ConfigError(
+                "planning.artifact_position_invalid"
+            ) from exc
+        if artifact_position < 1:
+            raise PlanningV2ConfigError(
+                "planning.artifact_position_invalid",
+                detail="Artifact position must be a positive integer.",
+            )
+
+        source = Path(str(path))
+        try:
+            size_bytes = source.stat().st_size
+        except OSError as exc:
+            raise PlanningV2ConfigError(
+                "planning.artifact_file_unreadable",
+                detail="The gateway-cached attachment is not readable.",
+            ) from exc
+        media_type = (
+            _text(content_type).split(";", 1)[0].strip().lower()
+            or mimetypes.guess_type(source.name)[0]
+            or "application/octet-stream"
+        )
+        query_values: dict[str, Any] = {
+            "role": artifact_role,
+            "position": artifact_position,
+        }
+        if retain_until is not None:
+            query_values["retainUntil"] = str(retain_until)
+        query = parse.urlencode(query_values)
+        response = self._request_file(
+            str(path),
+            request_path=(
+                f"{PLANNING_V2_PREFIX}/threads/"
+                f"{self._quoted(thread_id)}/artifacts?{query}"
+            ),
+            content_type=media_type,
+            idempotency_key=idempotency_key,
+            expected_statuses=frozenset({200, 201}),
+        )
+        return cast(
+            PlanningV2Response[PlanningArtifactUploadDTO],
+            self._validate_artifact_upload(
+                response,
+                role=artifact_role,
+                position=artifact_position,
+                size_bytes=size_bytes,
+                content_type=media_type,
+            ),
         )
 
     def get_thread_inputs(
@@ -1802,6 +2345,9 @@ __all__ = [
     "PlanningClaimResultContext",
     "PlanningEventsProjection",
     "PlanningInputsPage",
+    "PlanningArtifactDTO",
+    "PlanningArtifactReferenceDTO",
+    "PlanningArtifactUploadDTO",
     "PlanningOriginPayload",
     "PlanningApplyDTO",
     "PlanningPreviewPage",
@@ -1822,6 +2368,8 @@ __all__ = [
     "PlanningWorkMutation",
     "PlanningWorkResultDTO",
     "derive_approval_idempotency_key",
+    "derive_artifact_idempotency_key",
+    "derive_artifact_input_origin",
     "derive_run_idempotency_key",
     "planning_origin_from_current_turn",
     "planning_origin_from_turn",
