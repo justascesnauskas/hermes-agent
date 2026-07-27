@@ -50,6 +50,7 @@ DEFAULT_DEV_HUB_URL = "http://127.0.0.1:4570"
 DEFAULT_TIMEOUT_SECONDS = 20.0
 DEFAULT_TRANSPORT_RETRIES = 1
 DEFAULT_LEASE_SECONDS = 300
+MAX_PREVIEW_PAGE_SIZE = 200
 
 
 class PlanningOriginPayload(TypedDict):
@@ -279,6 +280,29 @@ class PlanningInputsPage(TypedDict):
     inputs: list[dict[str, Any]]
     hasMore: bool
     nextAfterSequence: int
+
+
+class PlanningPreviewPage(TypedDict):
+    threadId: str
+    runId: str
+    previewResultId: str
+    previewResultHash: str
+    planHash: str
+    basisInputSequence: int
+    taskCount: int
+    offset: int
+    limit: int
+    returned: int
+    tasks: list[dict[str, Any]]
+    hasMore: bool
+    nextOffset: Optional[int]
+    title: str
+    objective: str
+    summary: str
+    decisions: list[dict[str, Any]]
+    coverage: dict[str, Any]
+    acceptedAt: str
+    approvalEligible: bool
 
 
 class PlanningClaimProjection(TypedDict):
@@ -939,6 +963,139 @@ class PlanningV2Client:
         return response
 
     @classmethod
+    def _validate_preview_page(
+        cls,
+        response: PlanningV2Response[Any],
+        *,
+        thread_id: str,
+        preview_result_id: str,
+        offset: int,
+    ) -> PlanningV2Response[Any]:
+        payload = cls._require_fields(
+            response,
+            context="planning preview page",
+            fields={
+                "threadId": str,
+                "runId": str,
+                "previewResultId": str,
+                "previewResultHash": str,
+                "planHash": str,
+                "basisInputSequence": int,
+                "taskCount": int,
+                "offset": int,
+                "limit": int,
+                "returned": int,
+                "tasks": list,
+                "hasMore": bool,
+                "title": str,
+                "objective": str,
+                "summary": str,
+                "decisions": list,
+                "coverage": dict,
+                "acceptedAt": str,
+                "approvalEligible": bool,
+            },
+        )
+        expected = {
+            "threadId": _text(thread_id),
+            "previewResultId": _text(preview_result_id),
+            "offset": int(offset),
+        }
+        mismatches = {
+            name: {"expected": value, "actual": payload.get(name)}
+            for name, value in expected.items()
+            if payload.get(name) != value
+        }
+        if mismatches:
+            cls._shape_error(
+                response,
+                context="planning preview page",
+                detail=f"identity mismatch: {mismatches}",
+            )
+        for name in (
+            "threadId",
+            "runId",
+            "previewResultId",
+            "previewResultHash",
+            "planHash",
+            "title",
+            "acceptedAt",
+        ):
+            if not _text(payload[name]):
+                cls._shape_error(
+                    response,
+                    context="planning preview page",
+                    detail=f"{name} must be non-empty",
+                )
+        if (
+            payload["basisInputSequence"] < 0
+            or payload["taskCount"] < 0
+            or payload["returned"] < 0
+        ):
+            cls._shape_error(
+                response,
+                context="planning preview page",
+                detail=(
+                    "basisInputSequence, taskCount, and returned must be "
+                    "non-negative"
+                ),
+            )
+        if payload["offset"] < 0 or payload["limit"] < 1:
+            cls._shape_error(
+                response,
+                context="planning preview page",
+                detail="offset must be non-negative and limit must be positive",
+            )
+        if any(not isinstance(task, Mapping) for task in payload["tasks"]):
+            cls._shape_error(
+                response,
+                context="planning preview page",
+                detail="every tasks entry must be an object",
+            )
+        if any(
+            not isinstance(decision, Mapping)
+            for decision in payload["decisions"]
+        ):
+            cls._shape_error(
+                response,
+                context="planning preview page",
+                detail="every decisions entry must be an object",
+            )
+        if payload["returned"] != len(payload["tasks"]):
+            cls._shape_error(
+                response,
+                context="planning preview page",
+                detail="returned must equal the number of tasks",
+            )
+        next_offset = payload.get("nextOffset")
+        if "nextOffset" not in payload or (
+            next_offset is not None
+            and (
+                not isinstance(next_offset, int)
+                or isinstance(next_offset, bool)
+            )
+        ):
+            cls._shape_error(
+                response,
+                context="planning preview page",
+                detail="nextOffset must be an integer or null",
+            )
+        if payload["hasMore"]:
+            if next_offset is None or next_offset <= payload["offset"]:
+                cls._shape_error(
+                    response,
+                    context="planning preview page",
+                    detail="nextOffset must advance while hasMore is true",
+                )
+        elif next_offset is not None:
+            cls._shape_error(
+                response,
+                context="planning preview page",
+                detail="nextOffset must be null on the final page",
+            )
+        return response
+
+    @classmethod
     def _validate_claim_projection(
         cls,
         response: PlanningV2Response[Any],
@@ -1238,6 +1395,110 @@ class PlanningV2Client:
             self._validate_events_projection(response),
         )
 
+    def get_preview_page(
+        self,
+        thread_id: str,
+        preview_result_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> PlanningV2Response[PlanningPreviewPage]:
+        page_offset = int(offset)
+        page_size = int(limit)
+        if page_offset < 0:
+            raise PlanningV2ConfigError(
+                "planning.preview_offset_invalid"
+            )
+        if page_size < 1 or page_size > MAX_PREVIEW_PAGE_SIZE:
+            raise PlanningV2ConfigError(
+                "planning.preview_page_size_invalid",
+                detail=(
+                    "Dev Hub preview page size must be between 1 and "
+                    f"{MAX_PREVIEW_PAGE_SIZE}."
+                ),
+            )
+        query = parse.urlencode(
+            {
+                "offset": page_offset,
+                "limit": page_size,
+            }
+        )
+        response = self._request(
+            "GET",
+            (
+                f"{PLANNING_V2_PREFIX}/threads/"
+                f"{self._quoted(thread_id)}/previews/"
+                f"{self._quoted(preview_result_id)}?{query}"
+            ),
+            retry_safe=True,
+        )
+        return cast(
+            PlanningV2Response[PlanningPreviewPage],
+            self._validate_preview_page(
+                response,
+                thread_id=thread_id,
+                preview_result_id=preview_result_id,
+                offset=page_offset,
+            ),
+        )
+
+    def iter_preview_tasks(
+        self,
+        thread_id: str,
+        preview_result_id: str,
+        *,
+        offset: int = 0,
+        page_size: int = 100,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield every preview task without a client-side task-count cap."""
+
+        cursor = int(offset)
+        identity: Optional[tuple[Any, ...]] = None
+        while True:
+            page = self.get_preview_page(
+                thread_id,
+                preview_result_id,
+                offset=cursor,
+                limit=page_size,
+            ).payload
+            page_identity = (
+                page["threadId"],
+                page["runId"],
+                page["previewResultId"],
+                page["previewResultHash"],
+                page["planHash"],
+                page["basisInputSequence"],
+                page["taskCount"],
+                page["acceptedAt"],
+            )
+            if identity is None:
+                identity = page_identity
+            elif page_identity != identity:
+                raise PlanningV2ProtocolError(
+                    "planning.preview_revision_changed",
+                    detail=(
+                        "Dev Hub preview identity changed during pagination."
+                    ),
+                )
+            yield from page["tasks"]
+            if not page["hasMore"]:
+                return
+            next_offset = page["nextOffset"]
+            if next_offset is None:
+                raise PlanningV2ProtocolError(
+                    "planning.preview_cursor_missing",
+                    detail=(
+                        "Dev Hub omitted the next preview offset while more "
+                        "tasks remain."
+                    ),
+                )
+            if next_offset <= cursor:
+                raise PlanningV2ProtocolError(
+                    "planning.preview_cursor_stalled",
+                    detail="Dev Hub preview pagination did not advance.",
+                )
+            cursor = next_offset
+
     def bind_thread(
         self,
         thread_id: str,
@@ -1534,6 +1795,7 @@ class PlanningV2Client:
 
 __all__ = [
     "DEFAULT_LEASE_SECONDS",
+    "MAX_PREVIEW_PAGE_SIZE",
     "PLANNING_V2_PREFIX",
     "PlanningClaimProjection",
     "PlanningClaimContext",
@@ -1542,6 +1804,7 @@ __all__ = [
     "PlanningInputsPage",
     "PlanningOriginPayload",
     "PlanningApplyDTO",
+    "PlanningPreviewPage",
     "PlanningRunDTO",
     "PlanningThreadMutation",
     "PlanningThreadProjection",

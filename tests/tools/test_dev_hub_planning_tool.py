@@ -618,6 +618,118 @@ class _ApprovalClient:
         )
 
 
+class _PreviewClient:
+    runner_id = "runner-1"
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def get_preview_page(
+        self,
+        thread_id: str,
+        preview_result_id: str,
+        *,
+        offset: int,
+        limit: int,
+    ) -> PlanningV2Response[dict[str, Any]]:
+        self.calls.append(
+            {
+                "threadId": thread_id,
+                "previewResultId": preview_result_id,
+                "offset": offset,
+                "limit": limit,
+            }
+        )
+        return PlanningV2Response(
+            200,
+            {
+                "threadId": thread_id,
+                "runId": "run-1",
+                "previewResultId": preview_result_id,
+                "previewResultHash": "sha256:preview-1",
+                "planHash": "sha256:plan-1",
+                "basisInputSequence": 4,
+                "taskCount": 137,
+                "offset": offset,
+                "limit": limit,
+                "returned": limit,
+                "tasks": [
+                    {"stableTaskId": f"task-{index}"}
+                    for index in range(offset, offset + limit)
+                ],
+                "hasMore": True,
+                "nextOffset": offset + limit,
+                "title": "Planning V2 delivery",
+                "objective": "Ship the accepted implementation chain",
+                "summary": "Review all tasks before approval.",
+                "decisions": [{"code": "ready_for_approval"}],
+                "coverage": {"ready": True, "findings": []},
+                "acceptedAt": "2026-07-27T12:30:00Z",
+                "approvalEligible": True,
+            },
+        )
+
+
+def test_preview_returns_exact_hashes_page_and_next_action_without_origin(
+    monkeypatch,
+) -> None:
+    fake = _PreviewClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+
+    result = json.loads(
+        planning_tool._handle_planning_v2(
+            {
+                "action": "preview",
+                "thread_id": "planning-thread-1",
+                "preview_result_id": "preview-1",
+                "offset": 0,
+                "limit": 50,
+            }
+        )
+    )
+
+    assert fake.calls == [
+        {
+            "threadId": "planning-thread-1",
+            "previewResultId": "preview-1",
+            "offset": 0,
+            "limit": 50,
+        }
+    ]
+    assert result["previewResultHash"] == "sha256:preview-1"
+    assert result["planHash"] == "sha256:plan-1"
+    assert result["taskCount"] == 137
+    assert len(result["tasks"]) == 50
+    assert result["nextAction"] == {
+        "tool": planning_tool.PLANNING_V2_TOOL_NAME,
+        "arguments": {
+            "action": "preview",
+            "thread_id": "planning-thread-1",
+            "preview_result_id": "preview-1",
+            "offset": 50,
+            "limit": 50,
+        },
+    }
+
+
+def test_preview_tool_schema_requires_review_before_approval() -> None:
+    schema = planning_tool.PLANNING_V2_SCHEMA
+    properties = schema["parameters"]["properties"]
+    description = schema["description"]
+
+    assert "preview" in properties["action"]["enum"]
+    assert properties["offset"]["minimum"] == 0
+    assert properties["limit"]["minimum"] == 1
+    assert "show/review every page in order" in description
+    assert "Never approve tasks the user has not seen" in description
+    assert "approvalEligible=false" in description
+
+
 def test_approval_uses_exact_current_turn_and_cross_provider_origin(
     monkeypatch,
 ) -> None:

@@ -452,11 +452,12 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
         "events",
         "start_run",
         "approve_apply",
+        "preview",
     }:
         return tool_error(
             (
                 "action must be create, continue, status, events, start_run, "
-                "or approve_apply"
+                "preview, or approve_apply"
             ),
             code="planning.action_invalid",
         )
@@ -464,7 +465,8 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
     partial: dict[str, Any] = {}
     try:
         client = PlanningV2Client()
-        _require_scoped_provider_opt_in()
+        if action != "preview":
+            _require_scoped_provider_opt_in()
 
         if action == "create":
             origin = client.current_origin()
@@ -607,6 +609,61 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                     "events": _event_facts(events_response.payload),
                 }
             )
+
+        if action == "preview":
+            thread_id = _required_id(args, "thread_id")
+            preview_result_id = _required_id(args, "preview_result_id")
+            try:
+                offset = int(args.get("offset") or 0)
+                limit = int(args.get("limit") or 50)
+            except (TypeError, ValueError) as exc:
+                raise PlanningV2ConfigError(
+                    "planning.tool_argument_invalid",
+                    detail="offset and limit must be integers.",
+                ) from exc
+            preview_response = client.get_preview_page(
+                thread_id,
+                preview_result_id,
+                offset=offset,
+                limit=limit,
+            )
+            preview = preview_response.payload
+            result: dict[str, Any] = {
+                "ok": True,
+                "action": action,
+                "threadId": preview["threadId"],
+                "runId": preview["runId"],
+                "previewResultId": preview["previewResultId"],
+                "previewResultHash": preview["previewResultHash"],
+                "planHash": preview["planHash"],
+                "basisInputSequence": preview["basisInputSequence"],
+                "taskCount": preview["taskCount"],
+                "title": preview["title"],
+                "objective": preview["objective"],
+                "summary": preview["summary"],
+                "decisions": preview["decisions"],
+                "coverage": preview["coverage"],
+                "acceptedAt": preview["acceptedAt"],
+                "approvalEligible": preview["approvalEligible"],
+                "offset": preview["offset"],
+                "limit": preview["limit"],
+                "returned": preview["returned"],
+                "tasks": preview["tasks"],
+                "hasMore": preview["hasMore"],
+                "nextOffset": preview["nextOffset"],
+            }
+            if preview["hasMore"]:
+                result["nextAction"] = {
+                    "tool": PLANNING_V2_TOOL_NAME,
+                    "arguments": {
+                        "action": "preview",
+                        "thread_id": thread_id,
+                        "preview_result_id": preview_result_id,
+                        "offset": preview["nextOffset"],
+                        "limit": preview["limit"],
+                    },
+                }
+            return tool_result(result)
 
         if action == "approve_apply":
             thread_id = _required_id(args, "thread_id")
@@ -800,7 +857,10 @@ PLANNING_V2_SCHEMA = {
         "the exact preview id/hash and plan hash, and the user explicitly "
         "approved that exact preview in a later conversation turn. Never "
         "infer approval from a planning request, prior context, silence, or "
-        "model judgment, and never auto-approve."
+        "model judgment, and never auto-approve. Before asking for a later-turn "
+        "approval, call preview and show/review every page in order. Never "
+        "approve tasks the user has not seen, or reuse hashes if any preview "
+        "page reports changed exact hashes or approvalEligible=false."
     ),
     "parameters": {
         "type": "object",
@@ -813,6 +873,7 @@ PLANNING_V2_SCHEMA = {
                     "status",
                     "events",
                     "start_run",
+                    "preview",
                     "approve_apply",
                 ],
                 "description": "Explicit planning operation.",
@@ -835,7 +896,7 @@ PLANNING_V2_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Exact accepted preview result id returned by Dev Hub. "
-                    "Required for approve_apply."
+                    "Required for preview and approve_apply."
                 ),
             },
             "expected_preview_hash": {
@@ -867,6 +928,23 @@ PLANNING_V2_SCHEMA = {
                     "Optional structured evidence accompanying the user's "
                     "explicit approval; it cannot replace the later-turn "
                     "approval message."
+                ),
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": (
+                    "Zero-based preview task offset. Use nextAction exactly "
+                    "to review every page in order."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": (
+                    "Preview transport page size; defaults to 50. This does "
+                    "not cap the total number of tasks."
                 ),
             },
             "message": {

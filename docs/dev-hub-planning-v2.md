@@ -71,6 +71,7 @@ The model-facing tool is `agent_ops_planning_v2`:
 | `status` | Read concise thread, run, work-progress, needs-decision, and preview facts. |
 | `events` | Read semantic events after an explicit sequence cursor. |
 | `start_run` | Start or replay a run for an explicit thread, including recovery after a lost response. |
+| `preview` | Read one exact accepted-preview task page, including immutable hashes and the next-page action. |
 | `approve_apply` | Approve one exact accepted preview from a later explicit user turn and request the existing canonical apply operation. |
 
 Cross-provider continuation is intentional and explicit. For example, a
@@ -94,8 +95,23 @@ rather than being hidden in a provider chat or an ephemeral Hermes process.
 
 ## Exact preview approval
 
-`approve_apply` is deliberately narrower than the other actions. Hermes calls
-it only after Dev Hub has returned all three immutable values:
+Before approval, Hermes uses `preview` to show and review every task page in
+order. The response repeats the immutable preview and plan hashes on every
+page and returns a machine-readable `nextAction` while more tasks remain.
+Hermes follows that action until `hasMore` is false; it never treats the
+transport page size as a total-task limit. The client iterator likewise has no
+total task-count ceiling, so a 137-task plan is three ordinary pages rather
+than a truncated plan.
+
+Preview reads require runner authentication but no scoped gateway origin
+because they do not mutate thread state. Each page still reports
+`approvalEligible`; changed input, a replacement preview, or another stale
+condition can make it false. Hermes does not ask for approval when eligibility
+is false, when any page remains unseen, or when any page reports a different
+preview or plan hash.
+
+After the complete review, `approve_apply` remains deliberately narrow. Hermes
+calls it only after Dev Hub has returned all three immutable values:
 
 - `preview_result_id`;
 - `expected_preview_hash`;
@@ -131,6 +147,7 @@ stable replay identity. It never converts an HTTP error into a retry.
 | Operation | Automatic transport retry | Replay identity |
 |---|---:|---|
 | Thread/read/input/event reads | Yes, bounded | Read-only |
+| Accepted preview page reads | Yes, bounded | Read-only exact preview result |
 | Thread create | Yes, bounded | Scoped provider event |
 | Input append / endpoint bind | Yes, bounded | Scoped provider event |
 | Run create | Yes, bounded | Exact `Idempotency-Key` header |

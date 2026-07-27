@@ -150,6 +150,42 @@ def _approval_key(provider: str = "discord") -> str:
     )
 
 
+def _preview_page(
+    *,
+    offset: int,
+    tasks: list[dict[str, Any]],
+    task_count: int = 137,
+    limit: int = 60,
+    next_offset: int | None,
+) -> dict[str, Any]:
+    return {
+        "threadId": "thread-1",
+        "runId": "run-1",
+        "previewResultId": "preview-1",
+        "previewResultHash": "sha256:preview-1",
+        "planHash": "sha256:plan-1",
+        "basisInputSequence": 4,
+        "taskCount": task_count,
+        "offset": offset,
+        "limit": limit,
+        "returned": len(tasks),
+        "tasks": tasks,
+        "hasMore": next_offset is not None,
+        "nextOffset": next_offset,
+        "title": "Planning V2 delivery",
+        "objective": "Ship the accepted implementation chain",
+        "summary": "A complete dependency-ordered implementation plan.",
+        "decisions": [{"code": "ready_for_approval"}],
+        "coverage": {
+            "ready": True,
+            "totalSources": 12,
+            "findings": [],
+        },
+        "acceptedAt": "2026-07-27T12:30:00Z",
+        "approvalEligible": True,
+    }
+
+
 def test_client_exposes_complete_exact_runner_surface() -> None:
     transport = _ScriptedTransport(
         _Response(201, _thread_projection()),
@@ -402,6 +438,111 @@ def test_preview_approval_uses_exact_hashes_origin_and_replay_header() -> None:
         "expectedPreviewHash": "sha256:preview-1",
         "origin": origin,
     }
+
+
+def test_preview_read_wire_needs_runner_auth_but_no_turn_origin() -> None:
+    transport = _ScriptedTransport(
+        _Response(
+            200,
+            _preview_page(
+                offset=20,
+                tasks=[{"stableTaskId": "task-21"}],
+                task_count=21,
+                limit=10,
+                next_offset=None,
+            ),
+        )
+    )
+
+    response = _client(transport).get_preview_page(
+        "thread-1",
+        "preview-1",
+        offset=20,
+        limit=10,
+    )
+
+    assert response.payload["previewResultHash"] == "sha256:preview-1"
+    call = transport.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == (
+        f"https://hub.example.test{PLANNING_V2_PREFIX}/threads/thread-1"
+        "/previews/preview-1?offset=20&limit=10"
+    )
+    assert call["headers"]["authorization"] == "Bearer runner-token"
+    assert call["body"] is None
+
+
+def test_preview_iterator_reads_all_137_tasks_without_total_cap() -> None:
+    tasks = [
+        {"stableTaskId": f"task-{index:03d}"}
+        for index in range(1, 138)
+    ]
+    transport = _ScriptedTransport(
+        _Response(
+            200,
+            _preview_page(
+                offset=0,
+                tasks=tasks[:60],
+                next_offset=60,
+            ),
+        ),
+        _Response(
+            200,
+            _preview_page(
+                offset=60,
+                tasks=tasks[60:120],
+                next_offset=120,
+            ),
+        ),
+        _Response(
+            200,
+            _preview_page(
+                offset=120,
+                tasks=tasks[120:],
+                next_offset=None,
+            ),
+        ),
+    )
+
+    received = list(
+        _client(transport).iter_preview_tasks(
+            "thread-1",
+            "preview-1",
+            page_size=60,
+        )
+    )
+
+    assert received == tasks
+    assert len(received) == 137
+    assert [
+        call["url"].rsplit("?", 1)[-1] for call in transport.calls
+    ] == [
+        "offset=0&limit=60",
+        "offset=60&limit=60",
+        "offset=120&limit=60",
+    ]
+
+
+def test_preview_schema_rejects_nullable_or_stalled_page_fields() -> None:
+    malformed = _preview_page(
+        offset=0,
+        tasks=[{"stableTaskId": "task-1"}],
+        task_count=2,
+        limit=1,
+        next_offset=0,
+    )
+    malformed["summary"] = None
+    transport = _ScriptedTransport(_Response(200, malformed))
+
+    with pytest.raises(PlanningV2ProtocolError) as captured:
+        _client(transport).get_preview_page(
+            "thread-1",
+            "preview-1",
+            limit=1,
+        )
+
+    assert captured.value.code == "planning.hub_response_invalid"
+    assert "summary" in str(captured.value.detail)
 
 
 def test_approval_key_is_stable_and_scoped_without_message_content() -> None:
