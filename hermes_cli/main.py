@@ -10736,9 +10736,12 @@ def _resolve_update_branch(args) -> str:
     Centralizes the "default to main, accept --branch override, treat empty
     or whitespace-only values as the default" parsing so every consumer of
     ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
-    the same answer.
+    the same answer. Managed distributions may pin their reviewed branch via
+    ``HERMES_UPDATE_BRANCH``; an explicit CLI flag always wins.
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    explicit = (getattr(args, "branch", None) or "").strip()
+    managed = os.getenv("HERMES_UPDATE_BRANCH", "").strip()
+    return explicit or managed or "main"
 
 
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):

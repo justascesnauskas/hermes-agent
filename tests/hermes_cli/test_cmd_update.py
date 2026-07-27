@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from hermes_cli.main import cmd_update, PROJECT_ROOT
+from hermes_cli.main import PROJECT_ROOT, _resolve_update_branch, cmd_update
 
 
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
@@ -842,6 +842,14 @@ class TestCmdUpdateBranchFlag:
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
         rev_list_cmds = [c for c in commands if "rev-list" in c]
         assert all("origin/main" in c for c in rev_list_cmds), rev_list_cmds
+
+    def test_managed_update_branch_is_default_but_explicit_flag_wins(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_UPDATE_BRANCH", "mygom-stable")
+
+        assert _resolve_update_branch(SimpleNamespace(branch=None)) == "mygom-stable"
+        assert _resolve_update_branch(SimpleNamespace(branch="bb/gui")) == "bb/gui"
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
