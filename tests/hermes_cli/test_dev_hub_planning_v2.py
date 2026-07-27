@@ -16,6 +16,7 @@ from hermes_cli.dev_hub_planning_v2 import (
     PlanningV2HTTPError,
     PlanningV2ProtocolError,
     PlanningV2TransportError,
+    derive_approval_idempotency_key,
 )
 
 
@@ -113,6 +114,40 @@ def _run_projection() -> dict[str, Any]:
         "basisInputSequence": 1,
         "workItems": [],
     }
+
+
+def _approval_projection(*, replayed: bool = False) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "replayed": replayed,
+        "applyBindingId": "apply-binding-1",
+        "threadId": "thread-1",
+        "runId": "run-1",
+        "previewResultId": "preview-1",
+        "previewResultHash": "sha256:preview-1",
+        "planHash": "sha256:plan-1",
+        "basisInputSequence": 1,
+        "planId": "plan-1",
+        "approvalId": "approval-1",
+        "operationId": "operation-1",
+        "status": "requested",
+        "operation": {"status": "queued"},
+        "error": None,
+        "createdAt": "2026-07-27T12:30:00Z",
+        "updatedAt": "2026-07-27T12:30:00Z",
+    }
+
+
+def _approval_key(provider: str = "discord") -> str:
+    origin = _origin(provider)
+    return derive_approval_idempotency_key(
+        runner_id="runner-1",
+        thread_id="thread-1",
+        preview_result_id="preview-1",
+        provider=provider,
+        gateway_account_id=origin["gatewayAccountId"],
+        provider_event_id=origin["providerEventId"],
+    )
 
 
 def test_client_exposes_complete_exact_runner_surface() -> None:
@@ -333,6 +368,110 @@ def test_claim_200_preserves_run_results_and_failure_context() -> None:
     assert response.payload["context"]["failures"][0]["errorCode"] == (
         "provider_503"
     )
+
+
+def test_preview_approval_uses_exact_hashes_origin_and_replay_header() -> None:
+    transport = _ScriptedTransport(_Response(200, _approval_projection()))
+    client = _client(transport)
+    origin = _origin()
+    key = _approval_key()
+
+    response = client.approve_and_apply_preview(
+        "thread-1",
+        "preview-1",
+        idempotency_key=key,
+        origin=origin,
+        expected_preview_hash="sha256:preview-1",
+        expected_plan_hash="sha256:plan-1",
+        approval_message="Tvirtinu šį tikslų planą",
+        approval_evidence={"verbatimClause": "Tvirtinu"},
+    )
+
+    assert response.payload["operationId"] == "operation-1"
+    call = transport.calls[0]
+    assert call["method"] == "POST"
+    assert call["url"] == (
+        f"https://hub.example.test{PLANNING_V2_PREFIX}/threads/thread-1"
+        "/previews/preview-1/approve-apply"
+    )
+    assert call["headers"]["idempotency-key"] == key
+    assert json.loads(call["body"]) == {
+        "approvalEvidence": {"verbatimClause": "Tvirtinu"},
+        "approvalMessage": "Tvirtinu šį tikslų planą",
+        "expectedPlanHash": "sha256:plan-1",
+        "expectedPreviewHash": "sha256:preview-1",
+        "origin": origin,
+    }
+
+
+def test_approval_key_is_stable_and_scoped_without_message_content() -> None:
+    first = _approval_key()
+    repeated = _approval_key()
+    another_preview = derive_approval_idempotency_key(
+        runner_id="runner-1",
+        thread_id="thread-1",
+        preview_result_id="preview-2",
+        provider="discord",
+        gateway_account_id="discord-account",
+        provider_event_id="discord-event",
+    )
+    another_provider = derive_approval_idempotency_key(
+        runner_id="runner-1",
+        thread_id="thread-1",
+        preview_result_id="preview-1",
+        provider="slack",
+        gateway_account_id="slack-account",
+        provider_event_id="discord-event",
+    )
+
+    assert first == repeated
+    assert first.startswith("hermes-planning-approval-v1:")
+    assert first != another_preview
+    assert first != another_provider
+    assert "Tvirtinu" not in first
+
+
+def test_approval_lost_response_replays_exact_request() -> None:
+    transport = _ScriptedTransport(
+        TimeoutError("approval response lost after commit"),
+        _Response(200, _approval_projection(replayed=True)),
+    )
+    key = _approval_key()
+
+    response = _client(transport).approve_and_apply_preview(
+        "thread-1",
+        "preview-1",
+        idempotency_key=key,
+        origin=_origin(),
+        expected_preview_hash="sha256:preview-1",
+        expected_plan_hash="sha256:plan-1",
+        approval_message="Tvirtinu",
+    )
+
+    assert response.replayed is True
+    assert response.transport_attempts == 2
+    assert transport.calls[0]["headers"]["idempotency-key"] == key
+    assert transport.calls[0]["body"] == transport.calls[1]["body"]
+
+
+def test_approval_response_identity_mismatch_is_protocol_failure() -> None:
+    malformed = _approval_projection()
+    malformed["planHash"] = "sha256:another-plan"
+    transport = _ScriptedTransport(_Response(200, malformed))
+
+    with pytest.raises(PlanningV2ProtocolError) as captured:
+        _client(transport).approve_and_apply_preview(
+            "thread-1",
+            "preview-1",
+            idempotency_key=_approval_key(),
+            origin=_origin(),
+            expected_preview_hash="sha256:preview-1",
+            expected_plan_hash="sha256:plan-1",
+            approval_message="Tvirtinu",
+        )
+
+    assert captured.value.code == "planning.hub_response_invalid"
+    assert "identity mismatch" in str(captured.value.detail)
 
 
 def test_complete_response_reports_exact_replay_marker() -> None:

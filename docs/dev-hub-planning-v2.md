@@ -71,6 +71,7 @@ The model-facing tool is `agent_ops_planning_v2`:
 | `status` | Read concise thread, run, work-progress, needs-decision, and preview facts. |
 | `events` | Read semantic events after an explicit sequence cursor. |
 | `start_run` | Start or replay a run for an explicit thread, including recovery after a lost response. |
+| `approve_apply` | Approve one exact accepted preview from a later explicit user turn and request the existing canonical apply operation. |
 
 Cross-provider continuation is intentional and explicit. For example, a
 thread created from Discord can be continued from Slack by passing the same
@@ -91,6 +92,37 @@ revisions. Page size is merely a transport control, not a semantic limit.
 Artifact bytes and durability remain the Dev Hub storage plane's responsibility
 rather than being hidden in a provider chat or an ephemeral Hermes process.
 
+## Exact preview approval
+
+`approve_apply` is deliberately narrower than the other actions. Hermes calls
+it only after Dev Hub has returned all three immutable values:
+
+- `preview_result_id`;
+- `expected_preview_hash`;
+- `expected_plan_hash`.
+
+The user must explicitly approve that exact preview in a later conversation
+turn. A request to plan, approval-like wording from an earlier turn, silence,
+or the model's own judgment is never approval. During a real gateway turn,
+Hermes sends the exact current `user_task` as `approvalMessage`; a
+model-supplied `approval_message` cannot replace or rewrite it. The explicit
+argument exists only for non-gateway callers and replay-focused tests.
+
+The current scoped `TurnOriginV1` is mandatory. Dev Hub verifies that its
+machine identity is attested by the runner token, its provider sender maps to
+the thread owner, and its exact provider endpoint is actively bound to the
+thread. This same rule supports intentional cross-provider approval: a Slack
+turn can approve a preview created from Discord only after that Slack endpoint
+was explicitly bound to the same planning thread.
+
+Hermes derives the approval replay key from runner, planning thread, preview,
+provider, provider account, and provider-event identity. It uses the distinct
+`hermes-planning-approval-v1` namespace and never includes approval or planning
+message content. Dev Hub checks the supplied preview and plan hashes again
+inside canonical apply admission, so a concurrent edit, replacement preview,
+changed input head, or registry drift requires a new preview instead of
+applying stale work.
+
 ## Retry and ambiguity contract
 
 Hermes retries only transport failures and only when the Hub operation has a
@@ -102,6 +134,7 @@ stable replay identity. It never converts an HTTP error into a retry.
 | Thread create | Yes, bounded | Scoped provider event |
 | Input append / endpoint bind | Yes, bounded | Scoped provider event |
 | Run create | Yes, bounded | Exact `Idempotency-Key` header |
+| Exact preview approve/apply | Yes, bounded | Exact approval `Idempotency-Key` + bound provider event |
 | Work heartbeat | Yes, bounded | Worker + attempt + lease epoch fence |
 | Work complete | Yes, bounded | Deterministic attempt/result identity |
 | Work claim | No | A lost response may already hold a lease |
@@ -117,6 +150,14 @@ was stored but the run response remains unavailable, the tool returns a
 machine-readable recovery action containing the same thread id and exact run
 idempotency key. Replaying that action reads as the same run rather than
 creating another one.
+
+If an approval response is lost after Dev Hub commits it, the tool returns an
+`approve_apply` recovery action with the same thread, preview id, both hashes,
+approval evidence, exact approval message, and idempotency key. Replaying it
+from the same scoped provider event returns the existing apply binding and
+cannot enqueue a second Jira operation. Typed Hub rejections—including
+same-turn approval, ambiguous intent, an unbound provider, stale hashes, and
+registry drift—pass through unchanged and are not converted into retry loops.
 
 ## Progress surface
 

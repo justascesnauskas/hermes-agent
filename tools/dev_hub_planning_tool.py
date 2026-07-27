@@ -19,6 +19,7 @@ from hermes_cli.dev_hub_planning_v2 import (
     PlanningV2Client,
     PlanningV2ClientError,
     PlanningV2ConfigError,
+    derive_approval_idempotency_key,
     derive_run_idempotency_key,
 )
 from hermes_cli.turn_origin import get_current_turn_origin
@@ -362,6 +363,50 @@ def _run_key(
     )
 
 
+def _approval_message(
+    args: Mapping[str, Any],
+    *,
+    user_task: Any,
+) -> str:
+    """Use the exact active user turn, never model-transcribed approval text."""
+
+    message = (
+        str(user_task)
+        if user_task is not None
+        else str(args.get("approval_message") or "")
+    )
+    if not message.strip():
+        raise PlanningV2ConfigError(
+            "planning.approval_message_required",
+            detail=(
+                "The exact current user turn is required for approval. "
+                "approval_message is only a non-gateway/testing fallback."
+            ),
+        )
+    return message
+
+
+def _approval_key(
+    args: Mapping[str, Any],
+    *,
+    client: PlanningV2Client,
+    thread_id: str,
+    preview_result_id: str,
+    origin: PlanningOriginPayload,
+) -> str:
+    explicit = str(args.get("idempotency_key") or "").strip()
+    if explicit:
+        return explicit
+    return derive_approval_idempotency_key(
+        runner_id=client.runner_id,
+        thread_id=thread_id,
+        preview_result_id=preview_result_id,
+        provider=origin["provider"],
+        gateway_account_id=origin["gatewayAccountId"],
+        provider_event_id=origin["providerEventId"],
+    )
+
+
 def _start_run(
     client: PlanningV2Client,
     args: Mapping[str, Any],
@@ -400,9 +445,19 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
             code="planning.tool_not_enabled",
         )
     action = str(args.get("action") or "").strip().lower()
-    if action not in {"create", "continue", "status", "events", "start_run"}:
+    if action not in {
+        "create",
+        "continue",
+        "status",
+        "events",
+        "start_run",
+        "approve_apply",
+    }:
         return tool_error(
-            "action must be create, continue, status, events, or start_run",
+            (
+                "action must be create, continue, status, events, start_run, "
+                "or approve_apply"
+            ),
             code="planning.action_invalid",
         )
 
@@ -553,6 +608,81 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                 }
             )
 
+        if action == "approve_apply":
+            thread_id = _required_id(args, "thread_id")
+            preview_result_id = _required_id(args, "preview_result_id")
+            expected_preview_hash = _required_id(
+                args,
+                "expected_preview_hash",
+            )
+            expected_plan_hash = _required_id(args, "expected_plan_hash")
+            origin = client.current_origin()
+            approval_message = _approval_message(
+                args,
+                user_task=kwargs.get("user_task"),
+            )
+            approval_evidence = (
+                None
+                if args.get("approval_evidence") is None
+                else _mapping(args, "approval_evidence")
+            )
+            approval_idempotency_key = _approval_key(
+                args,
+                client=client,
+                thread_id=thread_id,
+                preview_result_id=preview_result_id,
+                origin=origin,
+            )
+            approval_recovery_arguments = {
+                "action": "approve_apply",
+                "thread_id": thread_id,
+                "preview_result_id": preview_result_id,
+                "expected_preview_hash": expected_preview_hash,
+                "expected_plan_hash": expected_plan_hash,
+                "approval_message": approval_message,
+                "idempotency_key": approval_idempotency_key,
+            }
+            if approval_evidence is not None:
+                approval_recovery_arguments["approval_evidence"] = (
+                    approval_evidence
+                )
+            partial = {
+                "threadId": thread_id,
+                "previewResultId": preview_result_id,
+                "expectedPreviewHash": expected_preview_hash,
+                "expectedPlanHash": expected_plan_hash,
+                "approvalIdempotencyKey": approval_idempotency_key,
+                "_recoveryArguments": approval_recovery_arguments,
+            }
+            approval_response = client.approve_and_apply_preview(
+                thread_id,
+                preview_result_id,
+                idempotency_key=approval_idempotency_key,
+                origin=origin,
+                expected_preview_hash=expected_preview_hash,
+                expected_plan_hash=expected_plan_hash,
+                approval_message=approval_message,
+                approval_evidence=approval_evidence,
+            )
+            approval = approval_response.payload
+            operation = approval.get("operation")
+            result = {
+                "ok": True,
+                "action": action,
+                "threadId": approval["threadId"],
+                "runId": approval["runId"],
+                "previewResultId": approval["previewResultId"],
+                "previewResultHash": approval["previewResultHash"],
+                "planHash": approval["planHash"],
+                "applyBindingId": approval["applyBindingId"],
+                "operationId": approval["operationId"],
+                "status": approval["status"],
+                "replayed": approval["replayed"],
+            }
+            if isinstance(operation, Mapping) and operation.get("status"):
+                result["operationStatus"] = operation["status"]
+            return tool_result(result)
+
         if action == "start_run":
             thread_id = _required_id(args, "thread_id")
             run_idempotency_key = _run_key(
@@ -627,13 +757,25 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
     except PlanningV2ClientError as exc:
         failure = exc.compact()
         if partial:
-            recovery = dict(partial)
+            recovery = {
+                name: value
+                for name, value in partial.items()
+                if not name.startswith("_")
+            }
             if exc.retryable or exc.ambiguous:
-                recovery_arguments = {
-                    "action": "start_run",
-                    "thread_id": partial["threadId"],
-                }
-                if partial.get("runIdempotencyKey"):
+                configured_recovery = partial.get("_recoveryArguments")
+                recovery_arguments = (
+                    dict(configured_recovery)
+                    if isinstance(configured_recovery, Mapping)
+                    else {
+                        "action": "start_run",
+                        "thread_id": partial["threadId"],
+                    }
+                )
+                if (
+                    not configured_recovery
+                    and partial.get("runIdempotencyKey")
+                ):
                     recovery_arguments["idempotency_key"] = partial[
                         "runIdempotencyKey"
                     ]
@@ -653,7 +795,12 @@ PLANNING_V2_SCHEMA = {
         "planning thread. Do not call for ordinary discussion, brainstorming, "
         "answers, the existing Kanban/tasking flow, or shadow traffic. "
         "Cross-provider continuation requires the explicit thread_id returned "
-        "by an earlier call; never infer a planning thread from chat text."
+        "by an earlier call; never infer a planning thread from chat text. "
+        "approve_apply is exceptional: call it only after Dev Hub returned "
+        "the exact preview id/hash and plan hash, and the user explicitly "
+        "approved that exact preview in a later conversation turn. Never "
+        "infer approval from a planning request, prior context, silence, or "
+        "model judgment, and never auto-approve."
     ),
     "parameters": {
         "type": "object",
@@ -666,6 +813,7 @@ PLANNING_V2_SCHEMA = {
                     "status",
                     "events",
                     "start_run",
+                    "approve_apply",
                 ],
                 "description": "Explicit planning operation.",
             },
@@ -681,6 +829,44 @@ PLANNING_V2_SCHEMA = {
                 "description": (
                     "Optional exact run id for status; otherwise the thread's "
                     "active run is read."
+                ),
+            },
+            "preview_result_id": {
+                "type": "string",
+                "description": (
+                    "Exact accepted preview result id returned by Dev Hub. "
+                    "Required for approve_apply."
+                ),
+            },
+            "expected_preview_hash": {
+                "type": "string",
+                "description": (
+                    "Exact accepted preview result hash returned by Dev Hub. "
+                    "Required for approve_apply; never reconstruct it."
+                ),
+            },
+            "expected_plan_hash": {
+                "type": "string",
+                "description": (
+                    "Exact canonical plan hash returned with the preview. "
+                    "Required for approve_apply; never reconstruct it."
+                ),
+            },
+            "approval_message": {
+                "type": "string",
+                "description": (
+                    "Non-gateway/testing fallback only. During a real turn "
+                    "Hermes always sends the exact current user message, "
+                    "ignoring model-transcribed text."
+                ),
+            },
+            "approval_evidence": {
+                "type": "object",
+                "additionalProperties": True,
+                "description": (
+                    "Optional structured evidence accompanying the user's "
+                    "explicit approval; it cannot replace the later-turn "
+                    "approval message."
                 ),
             },
             "message": {
@@ -736,9 +922,11 @@ PLANNING_V2_SCHEMA = {
             "idempotency_key": {
                 "type": "string",
                 "description": (
-                    "Optional exact run Idempotency-Key. When omitted, Hermes "
-                    "derives it from runner + planning thread + the scoped "
-                    "provider/account/event namespace, never message text."
+                    "Optional exact replay key for run or approve_apply "
+                    "recovery. When omitted, Hermes derives an "
+                    "operation-specific key from runner + planning thread + "
+                    "the scoped provider/account/event namespace (plus exact "
+                    "preview for approval), never message text."
                 ),
             },
             "start_run": {

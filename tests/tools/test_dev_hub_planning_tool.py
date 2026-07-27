@@ -578,6 +578,259 @@ def test_started_run_keeps_recovery_key_when_followup_read_times_out(
     assert fake.run_keys == ["operator-stable-key", "operator-stable-key"]
 
 
+class _ApprovalClient:
+    runner_id = "runner-1"
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def current_origin(self) -> dict[str, Any]:
+        return planning_origin_from_current_turn(runner_id=self.runner_id)
+
+    def approve_and_apply_preview(
+        self,
+        thread_id: str,
+        preview_result_id: str,
+        **kwargs: Any,
+    ) -> PlanningV2Response[dict[str, Any]]:
+        self.calls.append(
+            {
+                "threadId": thread_id,
+                "previewResultId": preview_result_id,
+                **kwargs,
+            }
+        )
+        return PlanningV2Response(
+            200,
+            {
+                "ok": True,
+                "replayed": len(self.calls) > 1,
+                "applyBindingId": "apply-binding-1",
+                "threadId": thread_id,
+                "runId": "run-1",
+                "previewResultId": preview_result_id,
+                "previewResultHash": kwargs["expected_preview_hash"],
+                "planHash": kwargs["expected_plan_hash"],
+                "operationId": "operation-1",
+                "status": "requested",
+                "operation": {"status": "queued"},
+            },
+        )
+
+
+def test_approval_uses_exact_current_turn_and_cross_provider_origin(
+    monkeypatch,
+) -> None:
+    fake = _ApprovalClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+    exact_user_turn = "Tvirtinu būtent preview-1 planą."
+
+    with scoped_turn_origin(_turn_origin("slack", event_id="approval-event")):
+        result = json.loads(
+            planning_tool._handle_planning_v2(
+                {
+                    "action": "approve_apply",
+                    "thread_id": "planning-thread-1",
+                    "preview_result_id": "preview-1",
+                    "expected_preview_hash": "sha256:preview-1",
+                    "expected_plan_hash": "sha256:plan-1",
+                    "approval_message": "modelio perrašytas tekstas",
+                    "approval_evidence": {"verbatimClause": "Tvirtinu"},
+                },
+                user_task=exact_user_turn,
+            )
+        )
+
+    call = fake.calls[0]
+    assert call["approval_message"] == exact_user_turn
+    assert call["origin"]["provider"] == "slack"
+    assert call["origin"]["gatewayAccountId"] == "slack-account"
+    assert call["origin"]["providerEventId"] == "approval-event"
+    assert call["idempotency_key"].startswith(
+        "hermes-planning-approval-v1:"
+    )
+    assert exact_user_turn not in call["idempotency_key"]
+    assert result == {
+        "ok": True,
+        "action": "approve_apply",
+        "threadId": "planning-thread-1",
+        "runId": "run-1",
+        "previewResultId": "preview-1",
+        "previewResultHash": "sha256:preview-1",
+        "planHash": "sha256:plan-1",
+        "applyBindingId": "apply-binding-1",
+        "operationId": "operation-1",
+        "status": "requested",
+        "replayed": False,
+        "operationStatus": "queued",
+    }
+
+
+def test_approval_requires_current_scoped_origin_before_hub_write(
+    monkeypatch,
+) -> None:
+    fake = _ApprovalClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+
+    result = json.loads(
+        planning_tool._handle_planning_v2(
+            {
+                "action": "approve_apply",
+                "thread_id": "planning-thread-1",
+                "preview_result_id": "preview-1",
+                "expected_preview_hash": "sha256:preview-1",
+                "expected_plan_hash": "sha256:plan-1",
+                "approval_message": "Tvirtinu",
+            }
+        )
+    )
+
+    assert result["code"] == "planning.origin_missing"
+    assert fake.calls == []
+
+
+def test_same_turn_approval_rejection_passes_through_without_retry(
+    monkeypatch,
+) -> None:
+    fake = _ApprovalClient()
+
+    def _reject(*_args: Any, **_kwargs: Any):
+        raise PlanningV2HTTPError(
+            "planning.same_turn_approval_forbidden",
+            status=409,
+            detail="Approval must arrive in a later user turn.",
+        )
+
+    monkeypatch.setattr(fake, "approve_and_apply_preview", _reject)
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+
+    with scoped_turn_origin(_turn_origin("discord", event_id="same-turn")):
+        result = json.loads(
+            planning_tool._handle_planning_v2(
+                {
+                    "action": "approve_apply",
+                    "thread_id": "planning-thread-1",
+                    "preview_result_id": "preview-1",
+                    "expected_preview_hash": "sha256:preview-1",
+                    "expected_plan_hash": "sha256:plan-1",
+                },
+                user_task="Tvirtinu",
+            )
+        )
+
+    assert result["code"] == "planning.same_turn_approval_forbidden"
+    assert result["httpStatus"] == 409
+    assert result["detail"] == "Approval must arrive in a later user turn."
+    assert "nextAction" not in result["recovery"]
+
+
+def test_lost_approval_response_has_exact_replay_recovery(
+    monkeypatch,
+) -> None:
+    class _LostApprovalClient(_ApprovalClient):
+        def approve_and_apply_preview(
+            self,
+            thread_id: str,
+            preview_result_id: str,
+            **kwargs: Any,
+        ) -> PlanningV2Response[dict[str, Any]]:
+            if not self.calls:
+                self.calls.append(
+                    {
+                        "threadId": thread_id,
+                        "previewResultId": preview_result_id,
+                        **kwargs,
+                    }
+                )
+                raise PlanningV2TransportError(
+                    "planning.hub_timeout",
+                    detail="approval response lost after commit",
+                    retryable=True,
+                    ambiguous=True,
+                    attempts=2,
+                )
+            return super().approve_and_apply_preview(
+                thread_id,
+                preview_result_id,
+                **kwargs,
+            )
+
+    fake = _LostApprovalClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+    initial = {
+        "action": "approve_apply",
+        "thread_id": "planning-thread-1",
+        "preview_result_id": "preview-1",
+        "expected_preview_hash": "sha256:preview-1",
+        "expected_plan_hash": "sha256:plan-1",
+        "approval_evidence": {"verbatimClause": "Tvirtinu"},
+    }
+
+    with scoped_turn_origin(_turn_origin("discord", event_id="approval-event")):
+        failed = json.loads(
+            planning_tool._handle_planning_v2(
+                initial,
+                user_task="Tvirtinu",
+            )
+        )
+        recovery = failed["recovery"]["nextAction"]
+        recovered = json.loads(
+            planning_tool._handle_planning_v2(recovery["arguments"])
+        )
+
+    assert recovery["tool"] == planning_tool.PLANNING_V2_TOOL_NAME
+    assert recovery["arguments"]["action"] == "approve_apply"
+    assert recovery["arguments"]["approval_message"] == "Tvirtinu"
+    assert recovery["arguments"]["idempotency_key"].startswith(
+        "hermes-planning-approval-v1:"
+    )
+    assert len(fake.calls) == 2
+    assert fake.calls[0]["idempotency_key"] == fake.calls[1][
+        "idempotency_key"
+    ]
+    assert fake.calls[0]["origin"] == fake.calls[1]["origin"]
+    assert recovered["replayed"] is True
+    assert recovered["operationId"] == "operation-1"
+
+
+def test_approval_tool_schema_requires_later_explicit_exact_preview() -> None:
+    schema = planning_tool.PLANNING_V2_SCHEMA
+    properties = schema["parameters"]["properties"]
+
+    assert "approve_apply" in properties["action"]["enum"]
+    assert {
+        "preview_result_id",
+        "expected_preview_hash",
+        "expected_plan_hash",
+        "approval_message",
+        "approval_evidence",
+    } <= set(properties)
+    description = schema["description"]
+    assert "exact preview id/hash and plan hash" in description
+    assert "later conversation turn" in description
+    assert "never auto-approve" in description
+
+
 def test_permanent_run_rejection_does_not_offer_a_retry_loop(
     monkeypatch,
 ) -> None:

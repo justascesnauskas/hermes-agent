@@ -5,6 +5,7 @@ another one:
 
 * thread create/input/bind requests are replay-safe by provider event origin;
 * run creation is replay-safe only with the exact ``Idempotency-Key`` header;
+* exact preview approval/apply is replay-safe by its bound turn + header;
 * work completion is replay-safe by attempt/result identity;
 * claim, failure, and resume are never retried after an ambiguous transport
   failure.
@@ -214,6 +215,26 @@ class PlanningWorkFailureDTO(TypedDict, total=False):
     occurredAt: str
     resolvedAt: Optional[str]
     resolution: Optional[str]
+    createdAt: str
+    updatedAt: str
+
+
+class PlanningApplyDTO(TypedDict):
+    ok: bool
+    replayed: bool
+    applyBindingId: str
+    threadId: str
+    runId: str
+    previewResultId: str
+    previewResultHash: str
+    planHash: str
+    basisInputSequence: int
+    planId: str
+    approvalId: str
+    operationId: str
+    status: str
+    operation: Optional[dict[str, Any]]
+    error: Optional[dict[str, Any]]
     createdAt: str
     updatedAt: str
 
@@ -528,6 +549,43 @@ def derive_run_idempotency_key(
         )
     digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
     return f"hermes-planning-run-v1:{digest}"
+
+
+def derive_approval_idempotency_key(
+    *,
+    runner_id: str,
+    thread_id: str,
+    preview_result_id: str,
+    provider: str,
+    gateway_account_id: str,
+    provider_event_id: str,
+) -> str:
+    """Derive one approval replay key from the complete source-event scope.
+
+    Approval and run admission intentionally use distinct namespaces.  The
+    key includes the exact preview identity but never approval or planning
+    message content.
+    """
+
+    identity = {
+        "schemaVersion": PLANNING_V2_ORIGIN_SCHEMA_VERSION,
+        "runnerId": _text(runner_id),
+        "threadId": _text(thread_id),
+        "previewResultId": _text(preview_result_id),
+        "provider": _text(provider),
+        "gatewayAccountId": _text(gateway_account_id),
+        "providerEventId": _text(provider_event_id),
+    }
+    if not all(identity.values()):
+        raise PlanningV2OriginError(
+            "planning.approval_identity_incomplete",
+            detail=(
+                "runner, planning thread, preview, provider account, and "
+                "provider event identities are required."
+            ),
+        )
+    digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
+    return f"hermes-planning-approval-v1:{digest}"
 
 
 def _is_timeout(exc: BaseException) -> bool:
@@ -910,6 +968,96 @@ class PlanningV2Client:
         )
         return response
 
+    @classmethod
+    def _validate_apply_mutation(
+        cls,
+        response: PlanningV2Response[Any],
+        *,
+        thread_id: str,
+        preview_result_id: str,
+        preview_hash: str,
+        plan_hash: str,
+    ) -> PlanningV2Response[Any]:
+        payload = cls._require_fields(
+            response,
+            context="planning preview approval response",
+            fields={
+                "ok": bool,
+                "replayed": bool,
+                "applyBindingId": str,
+                "threadId": str,
+                "runId": str,
+                "previewResultId": str,
+                "previewResultHash": str,
+                "planHash": str,
+                "basisInputSequence": int,
+                "planId": str,
+                "approvalId": str,
+                "operationId": str,
+                "status": str,
+                "createdAt": str,
+                "updatedAt": str,
+            },
+        )
+        for name in (
+            "applyBindingId",
+            "threadId",
+            "runId",
+            "previewResultId",
+            "previewResultHash",
+            "planHash",
+            "planId",
+            "approvalId",
+            "operationId",
+            "status",
+            "createdAt",
+            "updatedAt",
+        ):
+            if not _text(payload[name]):
+                cls._shape_error(
+                    response,
+                    context="planning preview approval response",
+                    detail=f"{name} must be non-empty",
+                )
+        expected = {
+            "threadId": _text(thread_id),
+            "previewResultId": _text(preview_result_id),
+            "previewResultHash": _text(preview_hash),
+            "planHash": _text(plan_hash),
+        }
+        mismatches = {
+            name: {"expected": value, "actual": payload.get(name)}
+            for name, value in expected.items()
+            if payload.get(name) != value
+        }
+        if mismatches:
+            cls._shape_error(
+                response,
+                context="planning preview approval response",
+                detail=f"identity mismatch: {mismatches}",
+            )
+        if payload["ok"] is not True:
+            cls._shape_error(
+                response,
+                context="planning preview approval response",
+                detail="ok must be true for a successful HTTP response",
+            )
+        for nullable_object in ("operation", "error"):
+            if nullable_object not in payload:
+                cls._shape_error(
+                    response,
+                    context="planning preview approval response",
+                    detail=f"{nullable_object} is required",
+                )
+            value = payload.get(nullable_object)
+            if value is not None and not isinstance(value, Mapping):
+                cls._shape_error(
+                    response,
+                    context="planning preview approval response",
+                    detail=f"{nullable_object} must be an object or null",
+                )
+        return response
+
     def create_thread(
         self,
         *,
@@ -1164,6 +1312,60 @@ class PlanningV2Client:
             self._validate_run_projection(response),
         )
 
+    def approve_and_apply_preview(
+        self,
+        thread_id: str,
+        preview_result_id: str,
+        *,
+        idempotency_key: str,
+        origin: PlanningOriginPayload,
+        expected_preview_hash: str,
+        expected_plan_hash: str,
+        approval_message: str,
+        approval_evidence: Optional[dict[str, Any]] = None,
+    ) -> PlanningV2Response[PlanningApplyDTO]:
+        preview_hash = _text(expected_preview_hash)
+        plan_hash = _text(expected_plan_hash)
+        if not preview_hash or not plan_hash:
+            raise PlanningV2ConfigError(
+                "planning.approval_hash_required",
+                detail=(
+                    "expected_preview_hash and expected_plan_hash are required."
+                ),
+            )
+        message = str(approval_message)
+        if not message.strip():
+            raise PlanningV2ConfigError(
+                "planning.approval_message_required"
+            )
+        response = self._request(
+            "POST",
+            (
+                f"{PLANNING_V2_PREFIX}/threads/"
+                f"{self._quoted(thread_id)}/previews/"
+                f"{self._quoted(preview_result_id)}/approve-apply"
+            ),
+            body={
+                "origin": dict(origin),
+                "expectedPreviewHash": preview_hash,
+                "expectedPlanHash": plan_hash,
+                "approvalMessage": message,
+                "approvalEvidence": approval_evidence,
+            },
+            idempotency_key=idempotency_key,
+            retry_safe=True,
+        )
+        return cast(
+            PlanningV2Response[PlanningApplyDTO],
+            self._validate_apply_mutation(
+                response,
+                thread_id=thread_id,
+                preview_result_id=preview_result_id,
+                preview_hash=preview_hash,
+                plan_hash=plan_hash,
+            ),
+        )
+
     def claim_work(
         self,
         *,
@@ -1339,6 +1541,7 @@ __all__ = [
     "PlanningEventsProjection",
     "PlanningInputsPage",
     "PlanningOriginPayload",
+    "PlanningApplyDTO",
     "PlanningRunDTO",
     "PlanningThreadMutation",
     "PlanningThreadProjection",
@@ -1355,6 +1558,7 @@ __all__ = [
     "PlanningWorkItemDTO",
     "PlanningWorkMutation",
     "PlanningWorkResultDTO",
+    "derive_approval_idempotency_key",
     "derive_run_idempotency_key",
     "planning_origin_from_current_turn",
     "planning_origin_from_turn",
