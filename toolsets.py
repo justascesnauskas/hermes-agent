@@ -278,6 +278,16 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "planning_v2": {
+        "description": (
+            "Opt-in durable Dev Hub planning threads and runs. This is "
+            "separate from normal Hermes conversation and the existing "
+            "Kanban/tasking flow."
+        ),
+        "tools": ["agent_ops_planning_v2"],
+        "includes": [],
+    },
+
     "discord": {
         "description": "Discord read and participate tools (fetch messages, search members, create threads)",
         "tools": ["discord"],

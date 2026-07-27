@@ -111,6 +111,7 @@ CONFIGURABLE_TOOLSETS = [
     ("session_search",  "🔎 Session Search",            "search past conversations"),
     ("clarify",         "❓ Clarifying Questions",      "clarify"),
     ("delegation",      "👥 Task Delegation",           "delegate_task"),
+    ("planning_v2",     "🧭 Dev Hub Planning V2",       "durable cross-provider planning threads"),
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),
     ("homeassistant",    "🏠 Home Assistant",           "smart home device control"),
     ("spotify",          "🎵 Spotify",                  "playback, search, playlists, library"),
@@ -150,7 +151,16 @@ def gui_toolset_label(label: str) -> str:
 # `hermes tools` → X (Twitter) Search setup walks users through credential
 # setup. The tool's check_fn means the schema still won't appear to the
 # model if the credential later goes missing or expires.
-_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search"}
+_DEFAULT_OFF_TOOLSETS = {
+    "homeassistant",
+    "spotify",
+    "discord",
+    "discord_admin",
+    "video",
+    "video_gen",
+    "x_search",
+    "planning_v2",
+}
 
 
 def _xai_credentials_present() -> bool:
