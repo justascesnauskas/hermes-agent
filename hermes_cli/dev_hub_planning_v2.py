@@ -57,6 +57,7 @@ DEFAULT_LEASE_SECONDS = 300
 MAX_PREVIEW_PAGE_SIZE = 200
 DEFAULT_ARTIFACT_CHUNK_BYTES = 8 * 1024 * 1024
 _ARTIFACT_ROLE_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,119}$")
+_ARTIFACT_UPLOAD_ID_RE = re.compile(r"^planning-upload-[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -2145,12 +2146,13 @@ class PlanningV2Client:
                     context="planning artifact upload session",
                     detail=f"upload.{name} has an invalid type",
                 )
-        upload_id = _text(upload["uploadId"])
+        upload_id = upload["uploadId"]
         next_offset = upload["nextOffset"]
         maximum = upload["maxChunkBytes"]
         if (
             payload["ok"] is not True
-            or not upload_id
+            or upload_id != upload_id.strip()
+            or not _ARTIFACT_UPLOAD_ID_RE.fullmatch(upload_id)
             or upload["state"] not in {"receiving", "completed"}
             or upload["contractHash"] != contract_hash
             or upload["totalSizeBytes"] != total_size_bytes
@@ -3052,13 +3054,14 @@ class PlanningV2Client:
             committed_offset = int(
                 chunk_response.payload["upload"]["nextOffset"]
             )
-            if committed_offset != next_offset + len(chunk):
+            submitted_end = next_offset + len(chunk)
+            if committed_offset < submitted_end:
                 self._shape_error(
                     chunk_response,
                     context="planning artifact upload session",
                     detail=(
-                        "a successful chunk response did not advance exactly "
-                        "over the submitted immutable byte range"
+                        "a successful chunk response did not cover the "
+                        "submitted immutable byte range"
                     ),
                 )
             next_offset = committed_offset

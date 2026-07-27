@@ -25,6 +25,9 @@ from hermes_cli.dev_hub_planning_v2 import (
 )
 
 
+_ARTIFACT_UPLOAD_ID = "planning-upload-" + ("0" * 32)
+
+
 def _origin(provider: str = "discord") -> dict[str, Any]:
     return {
         "schemaVersion": "1.0",
@@ -423,7 +426,7 @@ def _artifact_upload_session_projection(
         "ok": True,
         "replayed": replayed,
         "upload": {
-            "uploadId": "aupload_0123456789abcdef",
+            "uploadId": _ARTIFACT_UPLOAD_ID,
             "state": state,
             "contractHash": contract_hash,
             "nextOffset": next_offset,
@@ -981,10 +984,10 @@ def test_artifact_upload_resumes_raw_chunk_after_lost_response(
         "/artifact-uploads"
     )
     assert transport.calls[1]["url"].endswith(
-        "/artifact-uploads/aupload_0123456789abcdef/chunks/0"
+        f"/artifact-uploads/{_ARTIFACT_UPLOAD_ID}/chunks/0"
     )
     assert transport.calls[3]["url"].endswith(
-        "/artifact-uploads/aupload_0123456789abcdef/finalize"
+        f"/artifact-uploads/{_ARTIFACT_UPLOAD_ID}/finalize"
     )
     assert transport.calls[0]["headers"]["idempotency-key"] == key
     assert transport.calls[0]["headers"]["content-type"] == (
@@ -1062,6 +1065,138 @@ def test_artifact_upload_resumes_from_server_offset_and_honors_chunk_budget(
     ]
 
 
+def test_artifact_upload_accepts_authoritative_offset_past_submitted_range(
+    tmp_path,
+) -> None:
+    content = b"0123456789"
+    source = tmp_path / "dashboard.png"
+    source.write_bytes(content)
+    contract = _artifact_upload_contract(content)
+    transport = _ScriptedTransport(
+        _Response(
+            201,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=0,
+                max_chunk_bytes=3,
+            ),
+        ),
+        _Response(
+            200,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=7,
+                max_chunk_bytes=3,
+                replayed=True,
+            ),
+        ),
+        _Response(
+            201,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=10,
+                max_chunk_bytes=3,
+            ),
+        ),
+        _Response(201, _artifact_upload_projection(content)),
+    )
+
+    result = _client(transport).upload_artifact(
+        "thread-1",
+        str(source),
+        role="design_reference",
+        position=1,
+        idempotency_key="hermes-planning-artifact-v1:concurrent-resume",
+    )
+
+    assert result.payload["artifact"]["sizeBytes"] == len(content)
+    assert [call["body"] for call in transport.calls[1:3]] == [
+        content[:3],
+        content[7:10],
+    ]
+    assert transport.calls[1]["url"].endswith("/chunks/0")
+    assert transport.calls[2]["url"].endswith("/chunks/7")
+
+
+def test_artifact_upload_rejects_authoritative_offset_before_submitted_end(
+    tmp_path,
+) -> None:
+    content = b"0123456789"
+    source = tmp_path / "dashboard.png"
+    source.write_bytes(content)
+    contract = _artifact_upload_contract(content)
+    transport = _ScriptedTransport(
+        _Response(
+            201,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=0,
+                max_chunk_bytes=3,
+            ),
+        ),
+        _Response(
+            200,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=2,
+                max_chunk_bytes=3,
+                replayed=True,
+            ),
+        ),
+    )
+
+    with pytest.raises(PlanningV2ProtocolError) as captured:
+        _client(transport).upload_artifact(
+            "thread-1",
+            str(source),
+            role="design_reference",
+            position=1,
+            idempotency_key="hermes-planning-artifact-v1:stalled-resume",
+        )
+
+    assert captured.value.code == "planning.hub_response_invalid"
+    assert "did not cover" in str(captured.value.detail)
+
+
+@pytest.mark.parametrize(
+    "upload_id",
+    [
+        f" {_ARTIFACT_UPLOAD_ID}",
+        f"{_ARTIFACT_UPLOAD_ID} ",
+        "planning-upload-" + ("0" * 31),
+        "planning-upload-" + ("g" * 32),
+        "aupload_0123456789abcdef",
+    ],
+)
+def test_artifact_upload_rejects_noncanonical_server_upload_id(
+    tmp_path,
+    upload_id: str,
+) -> None:
+    content = b"exact evidence"
+    source = tmp_path / "dashboard.png"
+    source.write_bytes(content)
+    contract = _artifact_upload_contract(content)
+    malformed = _artifact_upload_session_projection(
+        contract,
+        next_offset=0,
+    )
+    malformed["upload"]["uploadId"] = upload_id
+
+    with pytest.raises(PlanningV2ProtocolError) as captured:
+        _client(
+            _ScriptedTransport(_Response(201, malformed))
+        ).upload_artifact(
+            "thread-1",
+            str(source),
+            role="design_reference",
+            position=1,
+            idempotency_key="hermes-planning-artifact-v1:invalid-upload-id",
+        )
+
+    assert captured.value.code == "planning.hub_response_invalid"
+    assert "upload identity" in str(captured.value.detail)
+
+
 def test_artifact_upload_completed_init_replays_finalize_without_chunks(
     tmp_path,
 ) -> None:
@@ -1103,7 +1238,7 @@ def test_artifact_upload_completed_init_replays_finalize_without_chunks(
     assert all(call["body"] is None for call in transport.calls[1:])
     assert all(
         call["url"].endswith(
-            "/artifact-uploads/aupload_0123456789abcdef/finalize"
+            f"/artifact-uploads/{_ARTIFACT_UPLOAD_ID}/finalize"
         )
         for call in transport.calls[1:]
     )
