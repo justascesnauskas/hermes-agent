@@ -2374,6 +2374,22 @@ def _runtime_main_value(field: str) -> Any:
     return ""
 
 
+def get_runtime_main_route() -> Dict[str, str]:
+    """Return the current turn's non-secret main-model route.
+
+    Consumers that persist durable follow-up work need the exact provider,
+    model and wire mode that the live conversation already resolved.  Reading
+    the context-local values here avoids guessing from profile configuration
+    and remains safe when several gateway conversations overlap.
+    """
+
+    return {
+        "provider": str(_runtime_main_value("provider") or ""),
+        "model": str(_runtime_main_value("model") or ""),
+        "api_mode": str(_runtime_main_value("api_mode") or ""),
+    }
+
+
 def set_runtime_main(
     provider: str,
     model: str,

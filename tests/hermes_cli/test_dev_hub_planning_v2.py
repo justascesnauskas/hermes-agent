@@ -22,6 +22,7 @@ from hermes_cli.dev_hub_planning_v2 import (
     derive_artifact_idempotency_key,
     derive_artifact_input_origin,
     derive_run_idempotency_key,
+    derive_thread_id_from_origin,
 )
 
 
@@ -1615,3 +1616,92 @@ def test_timeout_retry_is_bounded_to_safe_or_idempotent_operations() -> None:
     assert captured_write.value.retryable is True
     assert captured_write.value.ambiguous is True
     assert captured_write.value.attempts == 2
+
+
+def test_thread_identity_is_stable_for_exact_event_and_scoped_by_account() -> None:
+    first = _origin()
+    assert derive_thread_id_from_origin(first).startswith("pthr_")
+    assert derive_thread_id_from_origin(first) == derive_thread_id_from_origin(
+        dict(first)
+    )
+
+    next_event = {**first, "providerEventId": "discord-event-next"}
+    next_account = {**first, "gatewayAccountId": "discord-other-account"}
+    assert derive_thread_id_from_origin(first) != derive_thread_id_from_origin(
+        next_event
+    )
+    assert derive_thread_id_from_origin(first) != derive_thread_id_from_origin(
+        next_account
+    )
+
+
+def test_cancel_thread_sends_exact_origin_and_validates_terminal_aggregate() -> None:
+    payload = {
+        "ok": True,
+        "replayed": False,
+        "thread": {
+            "threadId": "thread-1",
+            "status": "cancelled",
+        },
+        "event": {
+            "threadId": "thread-1",
+            "eventType": "planning_cancelled",
+        },
+        "cancelled": {
+            "runs": 1,
+            "workItems": 5,
+            "attempts": 2,
+            "semanticEvents": 3,
+            "semanticDeliveries": 3,
+            "applyAdmissions": 0,
+        },
+    }
+    transport = _ScriptedTransport(_Response(200, payload))
+    response = _client(transport).cancel_thread(
+        "thread-1",
+        origin=_origin(),
+        reason="explicit_human_cancel",
+    )
+
+    assert response.payload == payload
+    call = transport.calls[0]
+    assert call["method"] == "POST"
+    assert call["url"].endswith(
+        f"{PLANNING_V2_PREFIX}/threads/thread-1/cancel"
+    )
+    assert json.loads(call["body"]) == {
+        "origin": _origin(),
+        "reason": "explicit_human_cancel",
+    }
+
+
+def test_cancel_thread_rejects_malformed_success() -> None:
+    malformed = {
+        "ok": True,
+        "replayed": False,
+        "thread": {
+            "threadId": "another-thread",
+            "status": "cancelled",
+        },
+        "event": {
+            "threadId": "thread-1",
+            "eventType": "planning_cancelled",
+        },
+        "cancelled": {
+            "runs": 0,
+            "workItems": 0,
+            "attempts": 0,
+            "semanticEvents": 0,
+            "semanticDeliveries": 0,
+            "applyAdmissions": 0,
+        },
+    }
+    transport = _ScriptedTransport(_Response(200, malformed))
+
+    with pytest.raises(PlanningV2ProtocolError) as captured:
+        _client(transport).cancel_thread(
+            "thread-1",
+            origin=_origin(),
+        )
+
+    assert captured.value.code == "planning.hub_response_invalid"

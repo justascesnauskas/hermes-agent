@@ -13,6 +13,7 @@ import pytest
 from hermes_cli.dev_hub_planning_v2 import PlanningV2ConfigError
 from hermes_cli.planning_artifact_spool import (
     acknowledge_artifact_recovery,
+    list_artifact_recoveries,
     load_artifact_recovery,
     register_artifact_recovery,
 )
@@ -189,6 +190,47 @@ def test_live_recoveries_have_no_arbitrary_count_or_ttl_eviction(
             hermes_home=home,
         )
         assert Path(record.snapshot_path).read_bytes() == source.read_bytes()
+
+    discovered = list_artifact_recoveries(
+        current_origin={
+            **_origin(),
+            # A later retry turn keeps the same conversation/user scope while
+            # receiving a fresh immutable message and provider event.
+            "messageId": "discord-retry-message",
+            "providerEventId": "discord-retry-event",
+        },
+        thread_id="planning-thread-1",
+        hermes_home=home,
+    )
+    assert len(discovered) == 137
+    assert [record.position for record in discovered] == list(range(1, 138))
+    assert {record.token for record in discovered} == set(tokens)
+
+
+def test_pending_recovery_enumeration_is_thread_and_user_scoped(
+    tmp_path,
+) -> None:
+    home = tmp_path / "hermes-home"
+    source = tmp_path / "reference.pdf"
+    source.write_bytes(b"%PDF exact bytes")
+    _register(home=home, source=source)
+
+    assert list_artifact_recoveries(
+        current_origin=_origin(),
+        thread_id="another-thread",
+        hermes_home=home,
+    ) == ()
+    assert list_artifact_recoveries(
+        current_origin=_origin(sender_id="another-user"),
+        thread_id="planning-thread-1",
+        hermes_home=home,
+    ) == ()
+    exact = list_artifact_recoveries(
+        current_origin=_origin(),
+        thread_id="planning-thread-1",
+        hermes_home=home,
+    )
+    assert len(exact) == 1
 
 
 def test_corrupt_live_snapshot_is_never_silently_replaced(

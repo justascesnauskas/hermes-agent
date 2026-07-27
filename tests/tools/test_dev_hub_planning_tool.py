@@ -1988,6 +1988,35 @@ def test_tool_is_not_available_without_explicit_profile_opt_in(
     assert "normal Hermes conversation is unchanged" in result["error"]
 
 
+def test_negotiated_facade_reuses_handler_without_exposing_direct_toolset(
+    monkeypatch,
+) -> None:
+    fake = _CrossProviderClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: False,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+
+    with scoped_turn_origin(_turn_origin("discord", event_id="event-1")):
+        result = json.loads(
+            planning_tool._handle_planning_v2(
+                {
+                    "action": "create",
+                    "message": "same planning text",
+                    "start_run": False,
+                },
+                user_task="same planning text",
+                _trusted_facade=True,
+            )
+        )
+
+    assert result["ok"] is True
+    assert result["threadId"] == "planning-thread-1"
+    assert len(fake.create_origins) == 1
+
+
 def test_profile_opt_in_is_provider_scoped(monkeypatch) -> None:
     from hermes_cli import config
 

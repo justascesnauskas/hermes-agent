@@ -280,6 +280,14 @@ class PlanningThreadResolution(TypedDict):
     threads: list[PlanningThreadDTO]
 
 
+class PlanningCancelDTO(TypedDict):
+    ok: bool
+    replayed: bool
+    thread: PlanningThreadDTO
+    event: dict[str, Any]
+    cancelled: dict[str, int]
+
+
 class PlanningEventsProjection(TypedDict):
     threadId: str
     afterSequence: int
@@ -621,6 +629,43 @@ def planning_origin_from_current_turn(*, runner_id: str) -> PlanningOriginPayloa
         get_current_turn_origin(),
         runner_id=runner_id,
     )
+
+
+def derive_thread_id_from_origin(origin: PlanningOriginPayload) -> str:
+    """Derive the Hub's stable thread id before the first network request.
+
+    Planning thread creation is keyed by the immutable provider event.  The
+    public derivation lets Hermes durably spool every attachment against its
+    final thread identity before contacting Dev Hub.  The create response is
+    still verified against this value; the client never treats a local
+    derivation as proof that a remote thread exists.
+    """
+
+    identity = {
+        "schemaVersion": _text(origin.get("schemaVersion")),
+        "provider": _text(origin.get("provider")),
+        "gatewayAccountId": _text(origin.get("gatewayAccountId")),
+        "providerEventId": _text(origin.get("providerEventId")),
+    }
+    if (
+        identity["schemaVersion"] != PLANNING_V2_ORIGIN_SCHEMA_VERSION
+        or not all(identity.values())
+    ):
+        raise PlanningV2OriginError(
+            "planning.thread_identity_incomplete",
+            detail=(
+                "origin schema, provider, gateway account, and provider event "
+                "are required to derive a planning thread identity."
+            ),
+        )
+    source_digest = hashlib.sha256(
+        _canonical_json(identity).encode("utf-8")
+    ).hexdigest()
+    source_event_key = f"turn-origin-v1:{source_digest}"
+    thread_digest = hashlib.sha256(
+        _canonical_json({"sourceEventKey": source_event_key}).encode("utf-8")
+    ).hexdigest()
+    return f"pthr_{thread_digest[:32]}"
 
 
 def derive_run_idempotency_key(
@@ -2389,6 +2434,87 @@ class PlanningV2Client:
             self._validate_thread_resolution(response),
         )
 
+    def cancel_thread(
+        self,
+        thread_id: str,
+        *,
+        origin: PlanningOriginPayload,
+        reason: Optional[str] = None,
+    ) -> PlanningV2Response[PlanningCancelDTO]:
+        """Atomically cancel one exact origin-authorized planning aggregate."""
+
+        exact_thread_id = _text(thread_id)
+        if not exact_thread_id:
+            raise PlanningV2ConfigError(
+                "planning.thread_id_required"
+            )
+        body: dict[str, Any] = {"origin": dict(origin)}
+        if reason is not None:
+            exact_reason = str(reason)
+            if (
+                not exact_reason
+                or exact_reason != exact_reason.strip()
+                or len(exact_reason) > 500
+            ):
+                raise PlanningV2ConfigError(
+                    "planning.cancel_reason_invalid"
+                )
+            body["reason"] = exact_reason
+        response = self._request(
+            "POST",
+            (
+                f"{PLANNING_V2_PREFIX}/threads/"
+                f"{self._quoted(exact_thread_id)}/cancel"
+            ),
+            body=body,
+            retry_safe=True,
+        )
+        payload = self._require_fields(
+            response,
+            context="planning thread cancellation",
+            fields={
+                "ok": bool,
+                "replayed": bool,
+                "thread": dict,
+                "event": dict,
+                "cancelled": dict,
+            },
+        )
+        thread = payload["thread"]
+        event = payload["event"]
+        cancelled = payload["cancelled"]
+        expected_counts = {
+            "runs",
+            "workItems",
+            "attempts",
+            "semanticEvents",
+            "semanticDeliveries",
+            "applyAdmissions",
+        }
+        if (
+            payload["ok"] is not True
+            or thread.get("threadId") != exact_thread_id
+            or thread.get("status") != "cancelled"
+            or event.get("threadId") != exact_thread_id
+            or event.get("eventType") != "planning_cancelled"
+            or set(cancelled) != expected_counts
+            or any(
+                isinstance(cancelled[name], bool)
+                or not isinstance(cancelled[name], int)
+                or cancelled[name] < 0
+                for name in expected_counts
+            )
+        ):
+            self._shape_error(
+                response,
+                context="planning thread cancellation",
+                detail="cancellation aggregate identity or counts are invalid",
+            )
+        return cast(
+            PlanningV2Response[PlanningCancelDTO],
+            response,
+        )
+
     def append_thread_input(
         self,
         thread_id: str,
@@ -3337,6 +3463,7 @@ __all__ = [
     "PlanningClaimProjection",
     "PlanningClaimContext",
     "PlanningClaimResultContext",
+    "PlanningCancelDTO",
     "PlanningEventsProjection",
     "PlanningInputIdentity",
     "PlanningInputsPage",
@@ -3370,6 +3497,7 @@ __all__ = [
     "derive_artifact_input_origin",
     "derive_preview_review_idempotency_key",
     "derive_run_idempotency_key",
+    "derive_thread_id_from_origin",
     "planning_origin_from_current_turn",
     "planning_origin_from_turn",
 ]

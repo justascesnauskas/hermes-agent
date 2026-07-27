@@ -727,6 +727,68 @@ def load_registered_artifact_recovery(
     )
 
 
+def list_artifact_recoveries(
+    *,
+    current_origin: PlanningOriginPayload,
+    thread_id: str,
+    hermes_home: Optional[Path] = None,
+) -> tuple[ArtifactRecoveryRecord, ...]:
+    """Return every live recovery owned by this conversation and thread.
+
+    Enumeration is deliberately unbounded: filesystem batching is an
+    implementation detail, never an attachment-count product limit.  Every
+    candidate is checksum-verified before it can be retried, and records from
+    other chats or users are excluded by the same scope fence as token lookup.
+    """
+
+    exact_thread_id = str(thread_id or "").strip()
+    if not exact_thread_id:
+        raise PlanningV2ConfigError(
+            "planning.artifact_recovery_thread_required"
+        )
+    root = _spool_root(hermes_home)
+    if not root.exists():
+        return ()
+    records: list[ArtifactRecoveryRecord] = []
+    with _store_lock:
+        _cleanup_acknowledged_records(root)
+        try:
+            candidates = sorted(
+                candidate
+                for candidate in root.iterdir()
+                if re.fullmatch(r"[0-9a-f]{64}", candidate.name)
+            )
+        except OSError as exc:
+            raise PlanningV2ConfigError(
+                "planning.artifact_recovery_unavailable",
+                detail="Hermes could not inspect its private artifact ingress spool.",
+            ) from exc
+        for candidate in candidates:
+            digest = candidate.name
+            record = _decode_record(
+                token=_token_for_digest(digest),
+                digest=digest,
+                record_path=candidate,
+                verify_snapshot=True,
+            )
+            if record.thread_id != exact_thread_id:
+                continue
+            if any(
+                current_origin.get(name) != record.origin.get(name)
+                for name in _SCOPE_FIELDS
+            ):
+                continue
+            records.append(record)
+    records.sort(
+        key=lambda item: (
+            item.position,
+            item.ingress_ordinal or item.position,
+            item.token,
+        )
+    )
+    return tuple(records)
+
+
 def acknowledge_artifact_recovery(
     token: str,
     *,
@@ -760,6 +822,7 @@ def acknowledge_artifact_recovery(
 __all__ = [
     "ArtifactRecoveryRecord",
     "acknowledge_artifact_recovery",
+    "list_artifact_recoveries",
     "load_artifact_recovery",
     "load_registered_artifact_recovery",
     "register_artifact_recovery",

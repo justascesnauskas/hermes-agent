@@ -763,7 +763,13 @@ def _start_run(
 
 
 def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
-    if not _profile_opted_in():
+    # The separately-installed Agent Ops plugin negotiates the supported
+    # Hermes facade before reaching this internal call.  This process-private
+    # kwarg is never part of a model-visible schema; it lets the canonical
+    # public aliases reuse the exact same implementation without exposing a
+    # second Planning V2 toolset on that surface.
+    trusted_facade = kwargs.pop("_trusted_facade", False) is True
+    if not trusted_facade and not _profile_opted_in():
         return tool_error(
             "Dev Hub Planning V2 is opt-in. Enable planning_v2 for this "
             "surface in the profile's platform_toolsets; normal Hermes "
@@ -792,7 +798,7 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
     partial: dict[str, Any] = {}
     try:
         client = PlanningV2Client()
-        if action != "preview":
+        if action != "preview" and not trusted_facade:
             _require_scoped_provider_opt_in()
 
         if action == "create":
