@@ -194,6 +194,26 @@ async def test_success_without_provider_message_id_uses_gateway_receipt() -> Non
 
 
 @pytest.mark.asyncio
+async def test_unproven_direct_success_creates_zero_review_receipts() -> None:
+    calls: list[ProviderDeliveryReceipt] = []
+    _register("session-unproven", 3, calls)
+    content = prepare_preview_delivery_content(
+        "session-unproven",
+        3,
+        "Preview.",
+    )
+
+    assert not await complete_preview_delivery(
+        "session-unproven",
+        3,
+        delivered_content=content,
+        result=SendResult(success=True, message_id="message-unproven"),
+        delivered_at="2026-07-27T12:30:00+00:00",
+    )
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_multipart_receipt_preserves_complete_send_order() -> None:
     _adapter, calls = await _run_base_delivery(
         SendResult(
@@ -249,7 +269,14 @@ async def test_lost_ack_replays_byte_identical_receipt() -> None:
         "session-replay",
         4,
         delivered_content=content,
-        result=SendResult(success=True, message_id="message-1"),
+        result=SendResult(
+            success=True,
+            message_id="message-1",
+            delivered_content_digest=(
+                "sha256:" + hashlib.sha256(content.encode()).hexdigest()
+            ),
+            delivered_content_complete=True,
+        ),
         delivered_at="2026-07-27T12:30:00+00:00",
     )
     assert attempts[0] == attempts[1] == calls[0]
@@ -353,7 +380,14 @@ async def test_three_pages_are_losslessly_delivered_and_acknowledged() -> None:
         "session-pages",
         12,
         delivered_content=outbound,
-        result=SendResult(success=True, message_id="all-pages-message"),
+        result=SendResult(
+            success=True,
+            message_id="all-pages-message",
+            delivered_content_digest=(
+                "sha256:" + hashlib.sha256(outbound.encode()).hexdigest()
+            ),
+            delivered_content_complete=True,
+        ),
         delivered_at="2026-07-27T12:30:00+00:00",
     )
     assert [offset for offset, _receipt in calls] == [0, 50, 100]

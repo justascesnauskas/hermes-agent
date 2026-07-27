@@ -1531,6 +1531,11 @@ def test_preview_fetch_is_read_only_until_exact_provider_delivery(
                     "discord-outbound-first",
                     "discord-outbound-final",
                 ),
+                delivered_content_digest=(
+                    "sha256:"
+                    + hashlib.sha256(outbound.encode()).hexdigest()
+                ),
+                delivered_content_complete=True,
             ),
             delivered_at="2026-07-27T12:30:00+00:00",
         )
@@ -1611,6 +1616,11 @@ def test_lost_preview_receipt_response_replays_exact_page_before_progressing(
                 success=True,
                 message_id="discord-outbound-1",
                 continuation_message_ids=(),
+                delivered_content_digest=(
+                    "sha256:"
+                    + hashlib.sha256(outbound.encode()).hexdigest()
+                ),
+                delivered_content_complete=True,
             ),
             delivered_at="2026-07-27T12:30:00+00:00",
         )

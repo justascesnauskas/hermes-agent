@@ -22101,9 +22101,9 @@ class GatewayRunner(
                                 run_generation,
                                 first_response,
                             )
-                            _queued_send_result = await adapter.send(
-                                source.chat_id,
-                                _queued_content,
+                            _queued_send_result = await adapter._send_with_retry(
+                                chat_id=source.chat_id,
+                                content=_queued_content,
                                 metadata=_status_thread_metadata,
                             )
                             await complete_preview_delivery(

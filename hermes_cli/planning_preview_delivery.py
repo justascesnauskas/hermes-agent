@@ -287,11 +287,8 @@ async def complete_preview_delivery(
         )
     if (
         not getattr(result, "success", False)
-        or transport_complete is False
-        or (
-            isinstance(transport_digest, str)
-            and transport_digest != delivered_digest
-        )
+        or transport_complete is not True
+        or transport_digest != delivered_digest
         or not message_ids
         or any(
             intent.delivery_content not in delivered_content
