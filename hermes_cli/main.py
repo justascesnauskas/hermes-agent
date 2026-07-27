@@ -12282,6 +12282,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
+                managed_branch = os.getenv("HERMES_UPDATE_BRANCH", "").strip()
+                if managed_branch:
+                    # A managed distribution pins a reviewed fast-forward
+                    # history. Divergence is therefore evidence that this
+                    # checkout needs operator attention, not permission to
+                    # discard local commits. The generic interactive updater
+                    # retains its historical reset fallback below.
+                    print(
+                        "✗ Managed update refused: the local checkout cannot "
+                        f"fast-forward to origin/{branch}."
+                    )
+                    print(
+                        "  Local history was preserved. Ask the distribution "
+                        "operator to inspect this checkout."
+                    )
+                    sys.exit(1)
                 # ff-only failed — local and remote have diverged (e.g. upstream
                 # force-pushed or rebase).  Since local changes are already
                 # stashed, reset to match the remote exactly.

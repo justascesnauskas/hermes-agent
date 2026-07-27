@@ -734,6 +734,36 @@ def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path
     assert "Fast-forward not possible" in out
 
 
+def test_managed_cmd_update_refuses_divergence_without_reset(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    """A managed branch pin must never destroy a diverged local history."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_UPDATE_BRANCH", "mygom-stable")
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: "/usr/bin/uv" if name == "uv" else None,
+    )
+
+    side_effect, recorded = _make_update_side_effect(
+        current_branch="mygom-stable",
+        ff_only_fails=True,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit) as exc:
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert exc.value.code == 1
+    reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
+    assert reset_calls == []
+    out = capsys.readouterr().out
+    assert "Managed update refused" in out
+    assert "Local history was preserved" in out
+
+
 def test_cmd_update_no_reset_when_ff_only_succeeds(monkeypatch, tmp_path):
     """When --ff-only succeeds, no reset is attempted."""
     _setup_update_mocks(monkeypatch, tmp_path)
