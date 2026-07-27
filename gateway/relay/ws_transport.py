@@ -158,6 +158,7 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
         scope_id=src.get("scope_id"),
         parent_chat_id=src.get("parent_chat_id"),
         message_id=src.get("message_id"),
+        gateway_account_id=src.get("gateway_account_id"),
         # The HERMES profile this event is routed to (multiplex mode). The
         # connector stamps it on the wire source when NAS resolves the target
         # profile for a Team-Gateway message; absent for a single-profile
@@ -181,11 +182,12 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
     except ValueError:
         msg_type = MessageType.TEXT
 
-    return MessageEvent(
+    event_kwargs = dict(
         text=raw.get("text", ""),
         message_type=msg_type,
         source=source,
         message_id=raw.get("message_id"),
+        platform_update_id=raw.get("platform_update_id"),
         reply_to_message_id=raw.get("reply_to_message_id"),
         media_urls=raw.get("media_urls") or [],
         # Surrounding channel/group CONTEXT the connector attached for this
@@ -197,7 +199,12 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
         # connector that doesn't send it, a dm, or a no-context platform, so
         # this is purely additive and byte-identical to today when unset.
         channel_context=_render_relay_context(raw.get("context")),
+        event_id=raw.get("event_id"),
     )
+    source_timestamp = raw.get("source_timestamp", raw.get("timestamp"))
+    if source_timestamp is not None:
+        event_kwargs["timestamp"] = source_timestamp
+    return MessageEvent(**event_kwargs)
 
 
 @dataclass

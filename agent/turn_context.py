@@ -263,6 +263,9 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # Versioned gateway/event identity for this turn. Observer-only: it is not
+    # written into the prompt or transcript.
+    turn_origin: Optional[Any] = None
 
 
 def build_turn_context(
@@ -274,6 +277,7 @@ def build_turn_context(
     stream_callback,
     persist_user_message: Optional[Any],
     persist_user_timestamp: Optional[float] = None,
+    turn_origin: Optional[Any] = None,
     *,
     restore_or_build_system_prompt,
     install_safe_stdio,
@@ -697,18 +701,26 @@ def build_turn_context(
     plugin_user_context = ""
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
-            "pre_llm_call",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            user_message=original_user_message,
-            conversation_history=list(messages),
-            is_first_turn=(not bool(conversation_history)),
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
-        )
+        _pre_hook_context = {
+            "session_id": agent.session_id,
+            "task_id": effective_task_id,
+            "turn_id": turn_id,
+            "user_message": original_user_message,
+            "conversation_history": list(messages),
+            "is_first_turn": (not bool(conversation_history)),
+            "model": agent.model,
+            "platform": getattr(agent, "platform", None) or "",
+            "sender_id": getattr(agent, "_user_id", None) or "",
+        }
+        if turn_origin is not None:
+            from hermes_cli.turn_origin import coerce_turn_origin
+
+            _normalized_turn_origin = coerce_turn_origin(turn_origin)
+            if _normalized_turn_origin is not None:
+                _pre_hook_context["turn_origin"] = (
+                    _normalized_turn_origin.to_dict()
+                )
+        _pre_results = _invoke_hook("pre_llm_call", **_pre_hook_context)
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin
         # can't inflate every subsequent turn's prompt. Ported from
@@ -903,4 +915,5 @@ def build_turn_context(
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
+        turn_origin=turn_origin,
     )

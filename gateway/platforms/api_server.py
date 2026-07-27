@@ -2683,6 +2683,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
+        # Thin gateway proxy instances attach their already-normalized origin
+        # here. It is observer metadata only — never authentication or
+        # authorization input — and malformed/future envelopes are ignored.
+        request_turn_origin = None
+        request_metadata = body.get("metadata")
+        if isinstance(request_metadata, dict):
+            from hermes_cli.turn_origin import coerce_turn_origin
+
+            request_turn_origin = coerce_turn_origin(
+                request_metadata.get("hermes_turn_origin")
+            )
+
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
@@ -2878,6 +2890,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                turn_origin=request_turn_origin,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2898,6 +2911,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                turn_origin=request_turn_origin,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -4645,6 +4659,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        turn_origin: Optional[Any] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4690,11 +4705,33 @@ class APIServerAdapter(BasePlatformAdapter):
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
-                    )
+                    conversation_kwargs = {
+                        "user_message": user_message,
+                        "conversation_history": conversation_history,
+                        "task_id": effective_task_id,
+                    }
+                    if turn_origin is not None:
+                        # Keep strict third-party/test AIAgent shims compatible
+                        # while the built-in agent consumes the new envelope.
+                        try:
+                            import inspect
+
+                            run_parameters = inspect.signature(
+                                agent.run_conversation
+                            ).parameters
+                            accepts_turn_origin = (
+                                "turn_origin" in run_parameters
+                                or any(
+                                    parameter.kind
+                                    is inspect.Parameter.VAR_KEYWORD
+                                    for parameter in run_parameters.values()
+                                )
+                            )
+                        except (TypeError, ValueError):
+                            accepts_turn_origin = True
+                        if accepts_turn_origin:
+                            conversation_kwargs["turn_origin"] = turn_origin
+                    result = agent.run_conversation(**conversation_kwargs)
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

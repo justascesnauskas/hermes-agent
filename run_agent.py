@@ -6357,6 +6357,7 @@ class AIAgent:
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        turn_origin: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -6367,6 +6368,11 @@ class AIAgent:
         from agent.portal_tags import (
             reset_conversation_context,
             set_conversation_context,
+        )
+        from hermes_cli.turn_origin import (
+            coerce_turn_origin,
+            get_current_turn_origin,
+            scoped_turn_origin,
         )
         # Publish the conversation id for ambient Nous Portal tagging. Every
         # LLM call made inside this turn — main loop, compression, vision,
@@ -6383,11 +6389,26 @@ class AIAgent:
         )
         from agent.auxiliary_client import scoped_runtime_main
 
+        # Explicit gateway origin wins; nested/subagent turns with no explicit
+        # value inherit the parent turn's immutable ContextVar. The attribute
+        # mirrors the active envelope for agent-internal consumers, but is
+        # restored after the call so cached agents never leak a prior chat.
+        resolved_turn_origin = (
+            coerce_turn_origin(turn_origin)
+            if turn_origin is not None
+            else get_current_turn_origin()
+        )
+        _missing_origin = object()
+        previous_agent_origin = getattr(
+            self, "_current_turn_origin", _missing_origin
+        )
+        self._current_turn_origin = resolved_turn_origin
+
         # The outer token restores the caller's Context even though turn setup
         # replaces the value with the live runtime after fallback restoration.
         # Keep the scope local instead of storing ContextVar tokens on the agent,
         # which may be observed from another thread.
-        with scoped_runtime_main({}):
+        with scoped_runtime_main({}), scoped_turn_origin(resolved_turn_origin):
             try:
                 return run_conversation(
                     self,
@@ -6399,8 +6420,16 @@ class AIAgent:
                     persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
                     moa_config=moa_config,
+                    turn_origin=resolved_turn_origin,
                 )
             finally:
+                if previous_agent_origin is _missing_origin:
+                    try:
+                        delattr(self, "_current_turn_origin")
+                    except AttributeError:
+                        pass
+                else:
+                    self._current_turn_origin = previous_agent_origin
                 reset_accounting_context(acct_token)
                 reset_conversation_context(token)
 

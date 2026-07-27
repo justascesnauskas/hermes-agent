@@ -1247,6 +1247,46 @@ class TestChatCompletionsEndpoint:
             assert resp.status == 400
 
     @pytest.mark.asyncio
+    async def test_proxy_metadata_forwards_turn_origin_to_agent(self, adapter):
+        from hermes_cli.turn_origin import TURN_ORIGIN_SCHEMA_VERSION
+
+        origin = {
+            "schema_version": TURN_ORIGIN_SCHEMA_VERSION,
+            "provider": "discord",
+            "gateway_account_id": "bot-main",
+            "chat_id": "channel-1",
+            "thread_id": "thread-2",
+            "message_id": "message-3",
+            "sender_id": "user-4",
+            "chat_type": "thread",
+            "source_timestamp": "2026-07-27T12:30:00Z",
+            "event_id": "event-5",
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+            ) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "metadata": {"hermes_turn_origin": origin},
+                    },
+                )
+
+        assert response.status == 200
+        forwarded = mock_run.call_args.kwargs["turn_origin"]
+        assert forwarded.to_dict() == origin
+
+    @pytest.mark.asyncio
     async def test_stream_true_returns_sse(self, adapter):
         """stream=true returns SSE format with the full response."""
         app = _create_app(adapter)

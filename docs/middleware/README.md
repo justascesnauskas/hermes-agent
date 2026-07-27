@@ -39,6 +39,10 @@ Every middleware callback receives:
 - Runtime context such as `session_id`, `task_id`, `turn_id`,
   `api_request_id`, `provider`, `model`, `api_mode`, `tool_name`, and
   `tool_call_id` when applicable.
+- `turn_origin` during a gateway-originated turn. This is the same
+  `hermes.turn_origin.v1` envelope delivered to observer hooks (provider,
+  gateway account, chat/thread/message/sender identity, chat type, source
+  timestamp, and event id); it is omitted for non-gateway calls.
 
 Supported middleware kinds:
 

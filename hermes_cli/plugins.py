@@ -1910,6 +1910,14 @@ class PluginManager:
         persisted to session DB.
         """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        # Gateway turns bind one immutable TurnOriginV1 around the whole agent
+        # call. Add its JSON envelope centrally so every observer hook
+        # (pre-LLM, pre/post-tool, API, approval, subagent, etc.) sees the same
+        # origin without provider-specific or per-hook plumbing. Outside a
+        # gateway turn no key is added, preserving legacy callback payloads.
+        from hermes_cli.turn_origin import inject_current_turn_origin
+
+        inject_current_turn_origin(kwargs)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
         for cb in callbacks:

@@ -8,6 +8,7 @@ from gateway.config import Platform, StreamingConfig
 from gateway.platforms.base import resolve_proxy_url
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from hermes_cli.turn_origin import TURN_ORIGIN_SCHEMA_VERSION
 
 
 def _make_runner(proxy_url=None):
@@ -256,6 +257,18 @@ class TestRunAgentViaProxy:
                         ],
                         source=source,
                         session_id="session-abc",
+                        turn_origin={
+                            "schema_version": TURN_ORIGIN_SCHEMA_VERSION,
+                            "provider": "matrix",
+                            "gateway_account_id": "matrix-main",
+                            "chat_id": "!room:server.org",
+                            "thread_id": None,
+                            "message_id": "event-1",
+                            "sender_id": "@user:server.org",
+                            "chat_type": "group",
+                            "source_timestamp": "2026-07-27T12:30:00Z",
+                            "event_id": "origin-event-1",
+                        },
                     )
 
         # Verify request URL
@@ -276,6 +289,18 @@ class TestRunAgentViaProxy:
 
         # Verify streaming is requested
         assert session.captured_json["stream"] is True
+        assert session.captured_json["metadata"]["hermes_turn_origin"] == {
+            "schema_version": TURN_ORIGIN_SCHEMA_VERSION,
+            "provider": "matrix",
+            "gateway_account_id": "matrix-main",
+            "chat_id": "!room:server.org",
+            "thread_id": None,
+            "message_id": "event-1",
+            "sender_id": "@user:server.org",
+            "chat_type": "group",
+            "source_timestamp": "2026-07-27T12:30:00Z",
+            "event_id": "origin-event-1",
+        }
 
         # Verify response was assembled
         assert result["final_response"] == "Hello world"

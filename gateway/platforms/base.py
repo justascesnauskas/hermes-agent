@@ -501,6 +501,12 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
+from hermes_cli.turn_origin import (
+    TurnOriginV1,
+    coerce_turn_origin,
+    derive_turn_event_id,
+    serialize_source_timestamp,
+)
 
 
 GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
@@ -1821,6 +1827,72 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Stable, provider-neutral event identity. ``event_id`` may be supplied by
+    # an upstream gateway/relay; otherwise ``ensure_turn_origin`` derives one
+    # from structured identifiers. ``turn_origin`` is normalized at the shared
+    # gateway ingestion boundary, after any thread/topic recovery has run.
+    event_id: Optional[str] = None
+    turn_origin: Optional[TurnOriginV1] = None
+
+    def ensure_turn_origin(
+        self,
+        *,
+        gateway_account_id: Optional[str] = None,
+    ) -> TurnOriginV1:
+        """Build the V1 origin envelope once at the common ingress boundary."""
+
+        existing = coerce_turn_origin(self.turn_origin)
+        if existing is not None:
+            self.turn_origin = existing
+            if self.event_id is None:
+                self.event_id = existing.event_id
+            return existing
+
+        source = self.source
+        platform = getattr(source, "platform", None)
+        provider = getattr(platform, "value", platform) or "unknown"
+        metadata = self.metadata if isinstance(self.metadata, dict) else {}
+        account_id = (
+            gateway_account_id
+            or getattr(source, "gateway_account_id", None)
+            or metadata.get("gateway_account_id")
+        )
+        chat_id = getattr(source, "chat_id", None)
+        thread_id = getattr(source, "thread_id", None)
+        message_id = self.message_id or getattr(source, "message_id", None)
+        sender_id = getattr(source, "user_id", None)
+        chat_type = getattr(source, "chat_type", None)
+        source_timestamp = serialize_source_timestamp(self.timestamp)
+
+        explicit_event_id = self.event_id or metadata.get("event_id")
+        event_id = str(explicit_event_id).strip() if explicit_event_id else None
+        if event_id is None:
+            event_id = derive_turn_event_id(
+                provider=provider,
+                gateway_account_id=account_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                message_id=message_id,
+                sender_id=sender_id,
+                source_timestamp=source_timestamp,
+                upstream_event_id=self.platform_update_id,
+            )
+
+        origin = TurnOriginV1(
+            provider=str(provider),
+            gateway_account_id=account_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            message_id=message_id,
+            sender_id=sender_id,
+            chat_type=chat_type,
+            source_timestamp=source_timestamp,
+            event_id=event_id,
+        )
+        self.event_id = origin.event_id
+        self.turn_origin = origin
+        return origin
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -4830,6 +4902,33 @@ class BasePlatformAdapter(ABC):
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
 
+        # Normalize origin once, after topic recovery has finalized the
+        # platform-neutral chat/thread lane. Every adapter reaches this shared
+        # boundary, so new providers inherit TurnOriginV1 without bespoke code.
+        try:
+            source_account_id = getattr(
+                getattr(event, "source", None),
+                "gateway_account_id",
+                None,
+            )
+            if not source_account_id:
+                adapter_extra = getattr(self.config, "extra", None)
+                if isinstance(adapter_extra, dict):
+                    source_account_id = adapter_extra.get(
+                        "gateway_account_id"
+                    )
+            event.ensure_turn_origin(
+                gateway_account_id=source_account_id
+            )
+        except Exception:
+            # Origin is observability context; a malformed optional provider
+            # field must never make the user message undeliverable.
+            logger.warning(
+                "[%s] Could not normalize turn origin; continuing without it",
+                self.name,
+                exc_info=True,
+            )
+
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
@@ -5746,6 +5845,7 @@ class BasePlatformAdapter(ABC):
         role_authorized: bool = False,
         auto_thread_created: bool = False,
         auto_thread_initial_name: Optional[str] = None,
+        gateway_account_id: Optional[str] = None,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform.
 
@@ -5758,6 +5858,14 @@ class BasePlatformAdapter(ABC):
         # Normalize empty topic to None
         if chat_topic is not None and not chat_topic.strip():
             chat_topic = None
+
+        # Generic multi-account seam.  No adapter should expose a token here;
+        # operators/adapters may provide an opaque account id explicitly or
+        # through ``platforms.<provider>.extra.gateway_account_id``.
+        if not gateway_account_id:
+            extra = getattr(self.config, "extra", None)
+            if isinstance(extra, dict):
+                gateway_account_id = extra.get("gateway_account_id")
 
         # Resolve profile from configured routes (None when no match / no routes)
         profile = None
@@ -5780,6 +5888,9 @@ class BasePlatformAdapter(ABC):
                         guild_id=str(guild_id) if guild_id else None,
                         parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
                         message_id=str(message_id) if message_id else None,
+                        gateway_account_id=(
+                            str(gateway_account_id) if gateway_account_id else None
+                        ),
                     )
                 )
             except Exception:
@@ -5808,6 +5919,9 @@ class BasePlatformAdapter(ABC):
             role_authorized=role_authorized,
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
+            gateway_account_id=(
+                str(gateway_account_id) if gateway_account_id else None
+            ),
         )
     
     @abstractmethod

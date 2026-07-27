@@ -204,6 +204,12 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Optional platform-account identity for gateways that serve more than one
+    # bot/account for the same provider.  This is intentionally generic and
+    # never inferred from a credential/token.  Adapters or relay peers may
+    # supply an opaque, non-secret account id; older callers leave it unset.
+    gateway_account_id: Optional[str] = None
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other
@@ -213,6 +219,9 @@ class SessionSource:
             self.scope_id = self.guild_id
         elif self.scope_id is not None:
             self.guild_id = self.scope_id
+        if self.gateway_account_id is not None:
+            normalized_account_id = str(self.gateway_account_id).strip()
+            self.gateway_account_id = normalized_account_id or None
 
     @property
     def description(self) -> str:
@@ -268,6 +277,8 @@ class SessionSource:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
             d["auto_thread_initial_name"] = self.auto_thread_initial_name
+        if self.gateway_account_id:
+            d["gateway_account_id"] = self.gateway_account_id
         return d
 
     @classmethod
@@ -291,6 +302,7 @@ class SessionSource:
             profile=data.get("profile"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
+            gateway_account_id=data.get("gateway_account_id"),
         )
     
 

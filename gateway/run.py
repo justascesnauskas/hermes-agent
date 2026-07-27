@@ -10053,6 +10053,31 @@ class GatewayRunner(
         except Exception:
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
 
+        # Normalize the provider-neutral turn identity at the runner boundary
+        # as well as BasePlatformAdapter.handle_message. The second guard is
+        # intentional: API/tests/custom adapters may invoke the runner directly
+        # and must receive the same envelope as built-in polling adapters.
+        # This stays after the ContextVar reset above so the handler's
+        # cross-session pre-bind window remains fail-safe.
+        turn_origin = None
+        try:
+            gateway_account_id = getattr(source, "gateway_account_id", None)
+            if not gateway_account_id:
+                origin_adapter = self._adapter_for_source(source)
+                origin_extra = getattr(
+                    getattr(origin_adapter, "config", None), "extra", None
+                )
+                if isinstance(origin_extra, dict):
+                    gateway_account_id = origin_extra.get("gateway_account_id")
+            turn_origin = event.ensure_turn_origin(
+                gateway_account_id=gateway_account_id
+            )
+        except Exception:
+            logger.warning(
+                "Could not normalize turn origin for inbound gateway event",
+                exc_info=True,
+            )
+
         if (
             getattr(self, "_startup_restore_in_progress", False)
             and not getattr(event, "internal", False)
@@ -10088,6 +10113,9 @@ class GatewayRunner(
                     event=event,
                     gateway=self,
                     session_store=self.session_store,
+                    turn_origin=(
+                        turn_origin.to_dict() if turn_origin is not None else None
+                    ),
                 )
             except Exception as _hook_exc:
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
@@ -13009,6 +13037,11 @@ class GatewayRunner(
                 "chat_type": getattr(source, "chat_type", "") or "",
                 "session_id": session_entry.session_id,
                 "message": message_text[:500],
+                "turn_origin": (
+                    turn_origin.to_dict()
+                    if turn_origin is not None
+                    else None
+                ),
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
@@ -13030,6 +13063,7 @@ class GatewayRunner(
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                turn_origin=turn_origin,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -18556,6 +18590,7 @@ class GatewayRunner(
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        turn_origin: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -18631,6 +18666,19 @@ class GatewayRunner(
             "messages": api_messages,
             "stream": True,
         }
+        # Preserve gateway origin across thin-proxy deployments. The remote
+        # Hermes API consumes this namespaced metadata field and re-binds the
+        # same V1 envelope around its local AIAgent turn.
+        try:
+            from hermes_cli.turn_origin import coerce_turn_origin
+
+            proxy_turn_origin = coerce_turn_origin(turn_origin)
+            if proxy_turn_origin is not None:
+                body["metadata"] = {
+                    "hermes_turn_origin": proxy_turn_origin.to_dict(),
+                }
+        except Exception:
+            logger.debug("Proxy turn-origin serialization failed", exc_info=True)
 
         # Set up platform streaming if available -------------------------
         _stream_consumer = None
@@ -18860,6 +18908,7 @@ class GatewayRunner(
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        turn_origin: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -18878,6 +18927,7 @@ class GatewayRunner(
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                turn_origin=turn_origin,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -18889,6 +18939,7 @@ class GatewayRunner(
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                turn_origin=turn_origin,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -19010,6 +19061,7 @@ class GatewayRunner(
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        turn_origin: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -19034,10 +19086,20 @@ class GatewayRunner(
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                turn_origin=turn_origin,
             )
 
         from run_agent import AIAgent
         import queue
+
+        from hermes_cli.turn_origin import coerce_turn_origin
+
+        _turn_origin_obj = coerce_turn_origin(turn_origin)
+        _turn_origin_payload = (
+            _turn_origin_obj.to_dict()
+            if _turn_origin_obj is not None
+            else None
+        )
 
         def _run_still_current() -> bool:
             if run_generation is None or not session_key:
@@ -19945,6 +20007,7 @@ class GatewayRunner(
                     "iteration": iteration,
                     "tool_names": _names,
                     "tools": prev_tools,
+                    "turn_origin": _turn_origin_payload,
                 }),
                 _loop_for_step,
                 logger=logger,
@@ -19955,8 +20018,10 @@ class GatewayRunner(
         # (e.g. session:compress fires after context compression splits a session)
         def _event_callback_sync(event_type: str, context: dict) -> None:
             try:
+                hook_context = dict(context)
+                hook_context.setdefault("turn_origin", _turn_origin_payload)
                 asyncio.run_coroutine_threadsafe(
-                    _hooks_ref.emit(event_type, context),
+                    _hooks_ref.emit(event_type, hook_context),
                     _loop_for_step,
                 )
             except Exception as _e:
@@ -21019,6 +21084,25 @@ class GatewayRunner(
                     "conversation_history": agent_history,
                     "task_id": session_id,
                 }
+                if turn_origin is not None:
+                    # Real AIAgent accepts the V1 envelope. Keep compatibility
+                    # with third-party/test agent shims that implement the
+                    # older strict signature and do not accept **kwargs.
+                    try:
+                        _run_params = inspect.signature(
+                            agent.run_conversation
+                        ).parameters
+                        _accepts_turn_origin = (
+                            "turn_origin" in _run_params
+                            or any(
+                                p.kind is inspect.Parameter.VAR_KEYWORD
+                                for p in _run_params.values()
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        _accepts_turn_origin = True
+                    if _accepts_turn_origin:
+                        _conversation_kwargs["turn_origin"] = turn_origin
                 if _persist_user_message_override is not None:
                     _conversation_kwargs["persist_user_message"] = _persist_user_message_override
                 elif observed_group_context:
@@ -22018,8 +22102,16 @@ class GatewayRunner(
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_turn_origin = turn_origin
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
+                    try:
+                        next_turn_origin = pending_event.ensure_turn_origin()
+                    except Exception:
+                        logger.debug(
+                            "Queued follow-up turn-origin normalization failed",
+                            exc_info=True,
+                        )
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
@@ -22090,6 +22182,7 @@ class GatewayRunner(
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    turn_origin=next_turn_origin,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

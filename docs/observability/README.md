@@ -42,6 +42,31 @@ The plugin manager injects this field into every hook payload:
 telemetry_schema_version = "hermes.observer.v1"
 ```
 
+Gateway-originated turns also receive a `turn_origin` object. It is omitted
+outside a bound gateway turn; fields unavailable from a provider are `null`:
+
+```json
+{
+  "schema_version": "hermes.turn_origin.v1",
+  "provider": "discord",
+  "gateway_account_id": "bot-main",
+  "chat_id": "channel-1",
+  "thread_id": "thread-2",
+  "message_id": "message-3",
+  "sender_id": "user-4",
+  "chat_type": "thread",
+  "source_timestamp": "2026-07-27T12:30:00Z",
+  "event_id": "evt_v1_..."
+}
+```
+
+The same envelope follows the complete turn into LLM, tool, API, approval,
+subagent, and middleware callbacks, including concurrent tool worker threads
+and thin gateway proxy mode. `event_id` is derived from structured provider /
+account / chat / event identity when an upstream id is unavailable; message
+text is never used as identity. Treat the envelope as observer context, not as
+authentication or authorization proof.
+
 Hook callbacks are fail-open. Hermes catches callback exceptions, logs a
 warning, and keeps the agent loop running.
 

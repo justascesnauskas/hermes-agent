@@ -46,12 +46,18 @@ class RequestMiddlewareResult:
 
 def observer_payload(**kwargs: Any) -> Dict[str, Any]:
     kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+    from hermes_cli.turn_origin import inject_current_turn_origin
+
+    inject_current_turn_origin(kwargs)
     return kwargs
 
 
 def middleware_payload(**kwargs: Any) -> Dict[str, Any]:
     kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
     kwargs.setdefault("middleware_schema_version", MIDDLEWARE_SCHEMA_VERSION)
+    from hermes_cli.turn_origin import inject_current_turn_origin
+
+    inject_current_turn_origin(kwargs)
     return kwargs
 
 
