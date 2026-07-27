@@ -20,6 +20,7 @@ from hermes_cli.dev_hub_planning_v2 import (
     derive_approval_idempotency_key,
     derive_artifact_idempotency_key,
     derive_artifact_input_origin,
+    derive_run_idempotency_key,
 )
 
 
@@ -101,6 +102,7 @@ def _thread_projection(
         "thread": {
             "threadId": "thread-1",
             "status": "active",
+            "headInputSequence": 1,
             "activeRunId": "run-1",
             "activePreviewVersionId": None,
         },
@@ -733,6 +735,36 @@ def test_artifact_identity_is_stable_scoped_and_preserves_turn_origin() -> None:
     assert "exact evidence" not in first
 
 
+def test_run_identity_binds_input_head_digest_policy_route_and_correlation() -> None:
+    base = {
+        "runner_id": "runner-1",
+        "thread_id": "thread-1",
+        "provider": "discord",
+        "gateway_account_id": "discord-account",
+        "provider_event_id": "discord-event",
+        "basis_input_sequence": 2,
+        "input_digest": "sha256:" + "a" * 64,
+        "policy": {"quality": "maximum"},
+        "route_policy": {"model": "frontier"},
+        "correlation_id": "corr-1",
+    }
+    first = derive_run_idempotency_key(**base)
+    repeated = derive_run_idempotency_key(**base)
+
+    assert first == repeated
+    assert first.startswith("hermes-planning-run-v2:")
+    for field, value in (
+        ("basis_input_sequence", 3),
+        ("input_digest", "sha256:" + "b" * 64),
+        ("policy", {"quality": "balanced"}),
+        ("route_policy", {"model": "fast"}),
+        ("correlation_id", "corr-2"),
+    ):
+        changed = dict(base)
+        changed[field] = value
+        assert derive_run_idempotency_key(**changed) != first
+
+
 def test_approval_key_is_stable_and_scoped_without_message_content() -> None:
     first = _approval_key()
     repeated = _approval_key()
@@ -854,6 +886,73 @@ def test_paginated_inputs_can_be_consumed_without_client_count_cap() -> None:
     assert transport.calls[1]["url"].endswith(
         "afterSequence=1&limit=500"
     )
+
+
+def test_run_input_identity_matches_hub_sequence_content_hash_digest() -> None:
+    first_hash = "sha256:" + "1" * 64
+    second_hash = "sha256:" + "2" * 64
+    thread = _thread_projection()
+    thread["thread"]["headInputSequence"] = 2
+    transport = _ScriptedTransport(
+        _Response(200, thread),
+        _Response(
+            200,
+            {
+                "threadId": "thread-1",
+                "basisInputSequence": 2,
+                "inputs": [
+                    {"sequence": 1, "contentHash": first_hash},
+                    {"sequence": 2, "contentHash": second_hash},
+                ],
+                "hasMore": False,
+                "nextAfterSequence": 2,
+            },
+        ),
+        _Response(200, thread),
+    )
+
+    identity = _client(transport).get_thread_input_identity("thread-1")
+    expected_material = [
+        {"sequence": 1, "contentHash": first_hash},
+        {"sequence": 2, "contentHash": second_hash},
+    ]
+    expected_digest = "sha256:" + hashlib.sha256(
+        json.dumps(
+            expected_material,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert identity == {
+        "threadId": "thread-1",
+        "basisInputSequence": 2,
+        "inputDigest": expected_digest,
+    }
+
+
+def test_run_input_identity_fails_closed_if_head_changes_during_read() -> None:
+    thread = _thread_projection()
+    thread["thread"]["headInputSequence"] = 2
+    transport = _ScriptedTransport(
+        _Response(200, thread),
+        _Response(
+            200,
+            {
+                "threadId": "thread-1",
+                "basisInputSequence": 3,
+                "inputs": [],
+                "hasMore": False,
+                "nextAfterSequence": 0,
+            },
+        ),
+    )
+
+    with pytest.raises(PlanningV2ProtocolError) as captured:
+        _client(transport).get_thread_input_identity("thread-1")
+
+    assert captured.value.code == "planning.input_head_changed"
 
 
 def test_paginated_inputs_pin_the_initial_basis_during_concurrent_append() -> None:

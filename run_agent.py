@@ -6373,6 +6373,7 @@ class AIAgent:
             coerce_turn_origin,
             get_current_turn_origin,
             scoped_turn_origin,
+            scoped_turn_user_text,
         )
         # Publish the conversation id for ambient Nous Portal tagging. Every
         # LLM call made inside this turn — main loop, compression, vision,
@@ -6408,7 +6409,16 @@ class AIAgent:
         # replaces the value with the live runtime after fallback restoration.
         # Keep the scope local instead of storing ContextVar tokens on the agent,
         # which may be observed from another thread.
-        with scoped_runtime_main({}), scoped_turn_origin(resolved_turn_origin):
+        exact_turn_text = (
+            persist_user_message
+            if persist_user_message is not None
+            else user_message
+        )
+        with (
+            scoped_runtime_main({}),
+            scoped_turn_origin(resolved_turn_origin),
+            scoped_turn_user_text(exact_turn_text),
+        ):
             try:
                 return run_conversation(
                     self,

@@ -16,6 +16,7 @@ from hermes_cli.turn_origin import (
     TURN_ORIGIN_SCHEMA_VERSION,
     TurnOriginV1,
     get_current_turn_origin,
+    get_current_turn_user_text,
 )
 
 
@@ -203,6 +204,7 @@ def test_conversation_origin_reaches_pre_llm_and_tool_plugin_hooks(monkeypatch):
 
     def _fake_conversation_loop(*_args, **kwargs):
         assert kwargs["turn_origin"] == origin
+        assert get_current_turn_user_text() == "hello"
         plugins.invoke_hook(
             "pre_llm_call",
             session_id="session-1",
@@ -235,7 +237,11 @@ def test_conversation_origin_reaches_pre_llm_and_tool_plugin_hooks(monkeypatch):
     agent.session_id = "session-1"
     agent._session_db = None
 
-    result = agent.run_conversation("hello", turn_origin=origin)
+    result = agent.run_conversation(
+        "[API-only observed context]\nhello",
+        persist_user_message="hello",
+        turn_origin=origin,
+    )
 
     assert result == {"final_response": "ok"}
     for hook_name in (
@@ -250,4 +256,27 @@ def test_conversation_origin_reaches_pre_llm_and_tool_plugin_hooks(monkeypatch):
     assert observed["pre_llm_call"]["platform"] == "telegram"
     assert observed["pre_llm_call"]["sender_id"] == "user-8"
     assert get_current_turn_origin() is None
+    assert get_current_turn_user_text() is None
     assert not hasattr(agent, "_current_turn_origin")
+
+
+def test_gateway_origin_adds_opaque_attachment_ingress_identity() -> None:
+    event = _event(chat_id="chat-media")
+    event.media_urls = [
+        "/gateway/private/cache/design.png",
+        "/gateway/private/cache/schema.pdf",
+    ]
+    event.metadata["attachment_ids"] = ["provider-file-7", "provider-file-8"]
+
+    payload = event.ensure_turn_origin(
+        gateway_account_id="account-primary"
+    ).to_dict()
+
+    assert [item["ingress_ordinal"] for item in payload["attachments"]] == [1, 2]
+    assert all(
+        item["attachment_id"].startswith("att_v1_")
+        for item in payload["attachments"]
+    )
+    rendered = str(payload)
+    assert "provider-file-7" not in rendered
+    assert "/gateway/private/cache" not in rendered

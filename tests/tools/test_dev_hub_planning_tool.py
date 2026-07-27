@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Any
 
 from hermes_cli.dev_hub_planning_v2 import (
@@ -12,9 +13,12 @@ from hermes_cli.dev_hub_planning_v2 import (
     planning_origin_from_current_turn,
 )
 from hermes_cli.turn_origin import (
+    TurnAttachmentOriginV1,
     TurnOriginV1,
     get_current_turn_origin,
     scoped_turn_origin,
+    scoped_turn_user_text,
+    turn_attachment_path_fingerprint,
 )
 from tools import dev_hub_planning_tool as planning_tool
 from toolsets import resolve_toolset, validate_toolset
@@ -46,6 +50,7 @@ def _thread_projection(
         "thread": {
             "threadId": "planning-thread-1",
             "status": "active",
+            "headInputSequence": input_count,
             "activeRunId": active_run_id,
             "activePreviewVersionId": active_preview_version_id,
         },
@@ -138,6 +143,17 @@ class _CrossProviderClient:
             _run_projection(run_id=f"run-{len(self.run_keys)}"),
         )
 
+    def get_thread_input_identity(
+        self,
+        _thread_id: str,
+    ) -> dict[str, Any]:
+        basis = len(self.run_keys) + 1
+        return {
+            "threadId": "planning-thread-1",
+            "basisInputSequence": basis,
+            "inputDigest": "sha256:" + f"{basis:064x}",
+        }
+
 
 def test_explicit_discord_to_slack_continuation_uses_only_scoped_origin(
     monkeypatch,
@@ -153,7 +169,8 @@ def test_explicit_discord_to_slack_continuation_uses_only_scoped_origin(
     with scoped_turn_origin(_turn_origin("discord", event_id="shared-event-id")):
         created = json.loads(
             planning_tool._handle_planning_v2(
-                {"action": "create", "message": "same planning text"}
+                {"action": "create", "message": "same planning text"},
+                user_task="same planning text",
             )
         )
     assert get_current_turn_origin() is None
@@ -165,7 +182,8 @@ def test_explicit_discord_to_slack_continuation_uses_only_scoped_origin(
                     "action": "continue",
                     "thread_id": created["threadId"],
                     "message": "same planning text",
-                }
+                },
+                user_task="same planning text",
             )
         )
     assert get_current_turn_origin() is None
@@ -191,7 +209,7 @@ def test_explicit_discord_to_slack_continuation_uses_only_scoped_origin(
     )
     assert len(set(fake.run_keys)) == 2
     assert all(
-        key.startswith("hermes-planning-run-v1:") for key in fake.run_keys
+        key.startswith("hermes-planning-run-v2:") for key in fake.run_keys
     )
     assert created["boundProviders"] == ["discord"]
     assert continued["boundProviders"] == ["discord", "slack"]
@@ -199,7 +217,8 @@ def test_explicit_discord_to_slack_continuation_uses_only_scoped_origin(
 
     missing_origin = json.loads(
         planning_tool._handle_planning_v2(
-            {"action": "create", "message": "same planning text"}
+            {"action": "create", "message": "same planning text"},
+            user_task="same planning text",
         )
     )
     assert missing_origin["code"] == "planning.origin_missing"
@@ -228,13 +247,74 @@ def test_missing_gateway_account_id_fails_closed_before_hub_write(
     with scoped_turn_origin(incomplete):
         result = json.loads(
             planning_tool._handle_planning_v2(
-                {"action": "create", "message": "must not write"}
+                {"action": "create", "message": "must not write"},
+                user_task="must not write",
             )
         )
 
     assert result["code"] == "planning.origin_incomplete"
     assert "gateway_account_id" in result["detail"]["missing"]
     assert fake.create_origins == []
+
+
+def test_exact_runtime_turn_text_cannot_be_replaced_by_model_arguments(
+    monkeypatch,
+) -> None:
+    class _ExactInputClient(_CrossProviderClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.payloads: list[dict[str, Any]] = []
+
+        def create_thread(
+            self,
+            *,
+            origin: dict[str, Any],
+            payload: dict[str, Any],
+            **_kwargs: Any,
+        ) -> PlanningV2Response[dict[str, Any]]:
+            self.create_origins.append(origin)
+            self.payloads.append(payload)
+            return PlanningV2Response(
+                201,
+                _thread_projection(providers=("discord",), input_count=1),
+            )
+
+    fake = _ExactInputClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+
+    with (
+        scoped_turn_origin(_turn_origin("discord", event_id="exact-input")),
+        scoped_turn_user_text("Exact gateway instruction"),
+    ):
+        result = json.loads(
+            planning_tool._handle_planning_v2(
+                {
+                    "action": "create",
+                    "message": "Model paraphrase",
+                    "payload": {
+                        "text": "Attempted replacement",
+                        "audience": "SMB",
+                    },
+                    "start_run": False,
+                }
+            )
+        )
+
+    assert result["ok"] is True
+    assert fake.payloads == [
+        {
+            "text": "Exact gateway instruction",
+            "modelNormalization": {
+                "message": "Model paraphrase",
+                "payload": {"audience": "SMB"},
+            },
+        }
+    ]
 
 
 class _ArtifactClient:
@@ -383,26 +463,138 @@ def test_artifact_upload_uses_current_origin_and_appends_opaque_input(
     }
 
 
+def test_artifact_retry_identity_uses_ingress_attachment_not_model_labels(
+    monkeypatch,
+) -> None:
+    fake = _ArtifactClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+    cached_path = "/gateway/cache/exact-upload.png"
+    origin = replace(
+        _turn_origin("discord", event_id="attachment-event"),
+        attachments=(
+            TurnAttachmentOriginV1(
+                attachment_id="att_v1_provider_exact",
+                ingress_ordinal=1,
+                path_fingerprint=turn_attachment_path_fingerprint(cached_path),
+            ),
+        ),
+    )
+
+    with scoped_turn_origin(origin):
+        first = json.loads(
+            planning_tool._handle_planning_v2(
+                {
+                    "action": "upload_artifact",
+                    "thread_id": "planning-thread-1",
+                    "local_path": cached_path,
+                    "role": "design_reference",
+                    "position": 7,
+                }
+            )
+        )
+        second = json.loads(
+            planning_tool._handle_planning_v2(
+                {
+                    "action": "upload_artifact",
+                    "thread_id": "planning-thread-1",
+                    "local_path": cached_path,
+                    "role": "database_schema",
+                    "position": 99,
+                }
+            )
+        )
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert fake.upload_calls[0]["idempotency_key"] == fake.upload_calls[1][
+        "idempotency_key"
+    ]
+    assert fake.append_calls[0]["origin"]["providerEventId"] == fake.append_calls[
+        1
+    ]["origin"]["providerEventId"]
+    assert fake.upload_calls[0]["role"] != fake.upload_calls[1]["role"]
+    assert fake.upload_calls[0]["position"] != fake.upload_calls[1]["position"]
+
+
+def test_artifact_upload_resolves_sandbox_cache_path_on_gateway(
+    monkeypatch,
+) -> None:
+    from tools import credential_files
+
+    fake = _ArtifactClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+    host_path = "/home/gateway/.hermes/cache/documents/schema.pdf"
+    sandbox_path = "/root/.hermes/cache/documents/schema.pdf"
+    monkeypatch.setattr(
+        credential_files,
+        "from_agent_visible_cache_path",
+        lambda value: host_path if value == sandbox_path else value,
+    )
+    origin = replace(
+        _turn_origin("discord", event_id="sandbox-attachment"),
+        attachments=(
+            TurnAttachmentOriginV1(
+                attachment_id="att_v1_sandbox",
+                ingress_ordinal=1,
+                path_fingerprint=turn_attachment_path_fingerprint(host_path),
+            ),
+        ),
+    )
+
+    with scoped_turn_origin(origin):
+        result = json.loads(
+            planning_tool._handle_planning_v2(
+                {
+                    "action": "upload_artifact",
+                    "thread_id": "planning-thread-1",
+                    "local_path": sandbox_path,
+                    "role": "database_schema",
+                    "position": 1,
+                }
+            )
+        )
+
+    assert result["ok"] is True
+    assert fake.upload_calls[0]["path"] == host_path
+
+
 def test_artifact_upload_has_exact_recovery_after_lost_response(
     monkeypatch,
 ) -> None:
     class _LostArtifactClient(_ArtifactClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lose_first_response = True
+
         def upload_artifact(
             self,
             thread_id: str,
             path: str,
             **kwargs: Any,
         ) -> PlanningV2Response[dict[str, Any]]:
-            self.upload_calls.append(
-                {"threadId": thread_id, "path": path, **kwargs}
-            )
-            raise PlanningV2TransportError(
-                "planning.hub_timeout",
-                detail="upload response lost after commit",
-                retryable=True,
-                ambiguous=True,
-                attempts=2,
-            )
+            if self.lose_first_response:
+                self.lose_first_response = False
+                self.upload_calls.append(
+                    {"threadId": thread_id, "path": path, **kwargs}
+                )
+                raise PlanningV2TransportError(
+                    "planning.hub_timeout",
+                    detail="upload response lost after commit",
+                    retryable=True,
+                    ambiguous=True,
+                    attempts=2,
+                )
+            return super().upload_artifact(thread_id, path, **kwargs)
 
     fake = _LostArtifactClient()
     monkeypatch.setattr(
@@ -432,17 +624,26 @@ def test_artifact_upload_has_exact_recovery_after_lost_response(
     recovery = failure["recovery"]["nextAction"]["arguments"]
     assert failure["outcomeAmbiguous"] is True
     assert failure["recovery"]["artifactUploadStarted"] is True
+    assert recovery["action"] == "upload_artifact"
+    assert recovery["recovery_token"].startswith("artrec_v1_")
     assert recovery == {
         "action": "upload_artifact",
-        "thread_id": "planning-thread-1",
-        "local_path": "/gateway/cache/schema.pdf",
-        "role": "database_schema",
-        "position": 2,
-        "required": True,
-        "idempotency_key": fake.upload_calls[0]["idempotency_key"],
-        "content_type": "application/pdf",
-        "retain_until": "2027-07-27T00:00:00Z",
+        "recovery_token": recovery["recovery_token"],
     }
+    assert "/gateway/cache/schema.pdf" not in json.dumps(failure)
+
+    with scoped_turn_origin(
+        _turn_origin("slack", event_id="recovery-turn-event")
+    ):
+        recovered = json.loads(
+            planning_tool._handle_planning_v2(recovery)
+        )
+
+    assert recovered["ok"] is True
+    assert recovered["inputStored"] is True
+    assert fake.upload_calls[0]["idempotency_key"] == fake.upload_calls[1][
+        "idempotency_key"
+    ]
 
 
 def test_artifact_upload_requires_current_scoped_origin(monkeypatch) -> None:
@@ -469,6 +670,48 @@ def test_artifact_upload_requires_current_scoped_origin(monkeypatch) -> None:
     assert result["code"] == "planning.origin_missing"
     assert fake.upload_calls == []
     assert fake.append_calls == []
+
+
+def test_artifact_recovery_token_rejects_model_path_or_metadata_overrides(
+    monkeypatch,
+) -> None:
+    fake = _ArtifactClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+    scoped = _turn_origin("discord", event_id="artifact-recovery-origin")
+
+    with scoped_turn_origin(scoped):
+        wire_origin = fake.current_origin()
+        token = planning_tool._register_artifact_recovery(
+            thread_id="planning-thread-1",
+            local_path="/gateway/cache/private.pdf",
+            origin=wire_origin,
+            role="database_schema",
+            position=1,
+            required=True,
+            idempotency_key="hermes-planning-artifact-v1:exact",
+            content_type="application/pdf",
+            retain_until=None,
+            attachment_identity=None,
+            ingress_ordinal=None,
+        )
+        result = json.loads(
+            planning_tool._handle_planning_v2(
+                {
+                    "action": "upload_artifact",
+                    "recovery_token": token,
+                    "local_path": "/gateway/cache/replacement.pdf",
+                }
+            )
+        )
+
+    assert result["code"] == "planning.artifact_recovery_ambiguous"
+    assert "/gateway/cache/private.pdf" not in json.dumps(result)
+    assert fake.upload_calls == []
 
 
 def test_artifact_flow_has_no_total_count_cap(monkeypatch) -> None:
@@ -698,6 +941,7 @@ class _LostRunResponseClient:
 
     def __init__(self) -> None:
         self.run_keys: list[str] = []
+        self.run_calls: list[dict[str, Any]] = []
         self.lose_first_response = True
 
     def current_origin(self) -> dict[str, Any]:
@@ -717,9 +961,12 @@ class _LostRunResponseClient:
         _thread_id: str,
         *,
         idempotency_key: str,
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> PlanningV2Response[dict[str, Any]]:
         self.run_keys.append(idempotency_key)
+        self.run_calls.append(
+            {"idempotency_key": idempotency_key, **kwargs}
+        )
         if self.lose_first_response:
             self.lose_first_response = False
             raise PlanningV2TransportError(
@@ -746,6 +993,16 @@ class _LostRunResponseClient:
             ),
         )
 
+    def get_thread_input_identity(
+        self,
+        _thread_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "threadId": "planning-thread-1",
+            "basisInputSequence": 1,
+            "inputDigest": "sha256:" + "1" * 64,
+        }
+
 
 def test_lost_run_response_returns_replay_safe_recovery_action(
     monkeypatch,
@@ -761,7 +1018,14 @@ def test_lost_run_response_returns_replay_safe_recovery_action(
     with scoped_turn_origin(_turn_origin("discord", event_id="event-1")):
         failure = json.loads(
             planning_tool._handle_planning_v2(
-                {"action": "create", "message": "persist this plan"}
+                {
+                    "action": "create",
+                    "message": "persist this plan",
+                    "run_policy": {"quality": "maximum"},
+                    "route_policy": {"model": "frontier"},
+                    "correlation_id": "correlation-exact",
+                },
+                user_task="persist this plan",
             )
         )
 
@@ -779,6 +1043,10 @@ def test_lost_run_response_returns_replay_safe_recovery_action(
         recovery["idempotency_key"],
         recovery["idempotency_key"],
     ]
+    assert fake.run_calls[0] == fake.run_calls[1]
+    assert recovery["run_policy"] == {"quality": "maximum"}
+    assert recovery["route_policy"] == {"model": "frontier"}
+    assert recovery["correlation_id"] == "correlation-exact"
 
 
 def test_started_run_keeps_recovery_key_when_followup_read_times_out(
@@ -1263,7 +1531,8 @@ def test_permanent_run_rejection_does_not_offer_a_retry_loop(
     with scoped_turn_origin(_turn_origin("discord", event_id="event-1")):
         failure = json.loads(
             planning_tool._handle_planning_v2(
-                {"action": "create", "message": "persist this plan"}
+                {"action": "create", "message": "persist this plan"},
+                user_task="persist this plan",
             )
         )
 

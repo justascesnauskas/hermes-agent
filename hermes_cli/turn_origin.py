@@ -23,6 +23,7 @@ from typing import Any, ClassVar, Iterator, Mapping, MutableMapping, Optional
 
 
 TURN_ORIGIN_SCHEMA_VERSION = "hermes.turn_origin.v1"
+TURN_ATTACHMENT_SCHEMA_VERSION = "hermes.turn_attachment.v1"
 
 
 def _optional_text(value: Any) -> Optional[str]:
@@ -112,6 +113,130 @@ def derive_turn_event_id(
     return f"evt_v1_{hashlib.sha256(encoded).hexdigest()[:32]}"
 
 
+def turn_attachment_path_fingerprint(value: Any) -> Optional[str]:
+    """Return an opaque gateway-local path match key.
+
+    The fingerprint lets a tool relate the model-visible cached path back to
+    the immutable ingress ordinal without carrying the absolute path in tool
+    output, provider metadata, or an idempotency key.
+    """
+
+    path = _optional_text(value)
+    if path is None:
+        return None
+    return "sha256:" + hashlib.sha256(path.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TurnAttachmentOriginV1:
+    """Opaque identity for one attachment in provider ingress order."""
+
+    SCHEMA_VERSION: ClassVar[str] = TURN_ATTACHMENT_SCHEMA_VERSION
+
+    attachment_id: str
+    ingress_ordinal: int
+    path_fingerprint: str
+
+    def __post_init__(self) -> None:
+        attachment_id = _optional_text(self.attachment_id)
+        path_fingerprint = _optional_text(self.path_fingerprint)
+        if attachment_id is None or path_fingerprint is None:
+            raise ValueError("attachment identity and path fingerprint are required")
+        if isinstance(self.ingress_ordinal, bool):
+            raise ValueError("attachment ingress ordinal must be positive")
+        ordinal = int(self.ingress_ordinal)
+        if ordinal < 1:
+            raise ValueError("attachment ingress ordinal must be positive")
+        object.__setattr__(self, "attachment_id", attachment_id)
+        object.__setattr__(self, "ingress_ordinal", ordinal)
+        object.__setattr__(self, "path_fingerprint", path_fingerprint)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "TurnAttachmentOriginV1":
+        schema_version = value.get("schema_version")
+        if schema_version not in (None, "", TURN_ATTACHMENT_SCHEMA_VERSION):
+            raise ValueError(
+                f"Unsupported turn-attachment schema: {schema_version}"
+            )
+        return cls(
+            attachment_id=value.get("attachment_id") or value.get("id"),
+            ingress_ordinal=(
+                value.get("ingress_ordinal")
+                if "ingress_ordinal" in value
+                else value.get("ordinal")
+            ),
+            path_fingerprint=(
+                value.get("path_fingerprint")
+                if "path_fingerprint" in value
+                else value.get("pathFingerprint")
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": TURN_ATTACHMENT_SCHEMA_VERSION,
+            "attachment_id": self.attachment_id,
+            "ingress_ordinal": self.ingress_ordinal,
+            "path_fingerprint": self.path_fingerprint,
+        }
+
+
+def derive_turn_attachment_origins(
+    *,
+    provider: Any,
+    event_id: Any,
+    media_paths: Any,
+    provider_attachment_ids: Any = None,
+) -> tuple[TurnAttachmentOriginV1, ...]:
+    """Bind cached media paths to provider identity or a stable ingress ordinal."""
+
+    if not isinstance(media_paths, (list, tuple)):
+        return ()
+    raw_ids = (
+        list(provider_attachment_ids)
+        if isinstance(provider_attachment_ids, (list, tuple))
+        else []
+    )
+    provider_text = _optional_text(provider) or "unknown"
+    event_text = _optional_text(event_id)
+    attachments: list[TurnAttachmentOriginV1] = []
+    for index, raw_path in enumerate(media_paths, 1):
+        path_fingerprint = turn_attachment_path_fingerprint(raw_path)
+        if path_fingerprint is None:
+            continue
+        provider_attachment_id = (
+            _optional_text(raw_ids[index - 1])
+            if index <= len(raw_ids)
+            else None
+        )
+        identity = {
+            "schema_version": TURN_ATTACHMENT_SCHEMA_VERSION,
+            "provider": provider_text,
+            "event_id": event_text,
+            "provider_attachment_id": provider_attachment_id,
+            # The ordinal remains part of the identity even when a provider id
+            # exists. Some providers reuse a media id when one file is attached
+            # more than once to the same event.
+            "ingress_ordinal": index,
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                identity,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        attachments.append(
+            TurnAttachmentOriginV1(
+                attachment_id=f"att_v1_{digest[:32]}",
+                ingress_ordinal=index,
+                path_fingerprint=path_fingerprint,
+            )
+        )
+    return tuple(attachments)
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TurnOriginV1:
     """Generic origin envelope attached to one user-facing turn."""
@@ -127,6 +252,7 @@ class TurnOriginV1:
     chat_type: Optional[str] = None
     source_timestamp: Optional[str] = None
     event_id: Optional[str] = None
+    attachments: tuple[TurnAttachmentOriginV1, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "provider", _optional_text(self.provider) or "unknown")
@@ -149,6 +275,21 @@ class TurnOriginV1:
             "source_timestamp",
             serialize_source_timestamp(self.source_timestamp),
         )
+        normalized_attachments: list[TurnAttachmentOriginV1] = []
+        for item in self.attachments or ():
+            if isinstance(item, TurnAttachmentOriginV1):
+                normalized_attachments.append(item)
+            elif isinstance(item, Mapping):
+                normalized_attachments.append(
+                    TurnAttachmentOriginV1.from_mapping(item)
+                )
+            else:
+                raise ValueError("turn attachments must be mappings")
+        if len(
+            {attachment.ingress_ordinal for attachment in normalized_attachments}
+        ) != len(normalized_attachments):
+            raise ValueError("turn attachment ingress ordinals must be unique")
+        object.__setattr__(self, "attachments", tuple(normalized_attachments))
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "TurnOriginV1":
@@ -179,12 +320,13 @@ class TurnOriginV1:
                 else value.get("timestamp")
             ),
             event_id=value.get("event_id"),
+            attachments=tuple(value.get("attachments") or ()),
         )
 
     def to_dict(self) -> dict[str, Any]:
         """Return the stable hook/middleware wire shape, including nulls."""
 
-        return {
+        payload = {
             "schema_version": TURN_ORIGIN_SCHEMA_VERSION,
             "provider": self.provider,
             "gateway_account_id": self.gateway_account_id,
@@ -196,6 +338,13 @@ class TurnOriginV1:
             "source_timestamp": self.source_timestamp,
             "event_id": self.event_id,
         }
+        # Preserve the exact historical hook shape for turns without media.
+        # Attachment identity is additive and contains no provider id or path.
+        if self.attachments:
+            payload["attachments"] = [
+                attachment.to_dict() for attachment in self.attachments
+            ]
+        return payload
 
 
 def coerce_turn_origin(value: Any) -> Optional[TurnOriginV1]:
@@ -217,6 +366,10 @@ _CURRENT_TURN_ORIGIN: ContextVar[Optional[TurnOriginV1]] = ContextVar(
     "hermes_current_turn_origin",
     default=None,
 )
+_CURRENT_TURN_USER_TEXT: ContextVar[Optional[str]] = ContextVar(
+    "hermes_current_turn_user_text",
+    default=None,
+)
 
 
 def get_current_turn_origin() -> Optional[TurnOriginV1]:
@@ -226,6 +379,29 @@ def get_current_turn_origin() -> Optional[TurnOriginV1]:
 def get_current_turn_origin_payload() -> Optional[dict[str, Any]]:
     origin = get_current_turn_origin()
     return origin.to_dict() if origin is not None else None
+
+
+def _coerce_turn_user_text(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        parts: list[str] = []
+        for item in value:
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("type") in {"text", "input_text"}:
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        if parts:
+            return "\n".join(parts)
+    return None
+
+
+def get_current_turn_user_text() -> Optional[str]:
+    """Return the immutable user text bound before model tool arguments exist."""
+
+    return _CURRENT_TURN_USER_TEXT.get()
 
 
 @contextmanager
@@ -238,6 +414,18 @@ def scoped_turn_origin(value: Any) -> Iterator[Optional[TurnOriginV1]]:
         yield origin
     finally:
         _CURRENT_TURN_ORIGIN.reset(token)
+
+
+@contextmanager
+def scoped_turn_user_text(value: Any) -> Iterator[Optional[str]]:
+    """Bind exact current-turn input for gateway-sensitive side effects."""
+
+    text = _coerce_turn_user_text(value)
+    token = _CURRENT_TURN_USER_TEXT.set(text)
+    try:
+        yield text
+    finally:
+        _CURRENT_TURN_USER_TEXT.reset(token)
 
 
 def inject_current_turn_origin(payload: MutableMapping[str, Any]) -> None:

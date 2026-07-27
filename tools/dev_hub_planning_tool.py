@@ -8,8 +8,12 @@ are available.  Invocations are direct writes, never shadow traffic.
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, OrderedDict
+from dataclasses import dataclass
 import json
+import secrets
+import threading
+import time
 from typing import Any, Mapping, Optional
 
 from hermes_cli.dev_hub_planning_v2 import (
@@ -24,12 +28,39 @@ from hermes_cli.dev_hub_planning_v2 import (
     derive_artifact_input_origin,
     derive_run_idempotency_key,
 )
-from hermes_cli.turn_origin import get_current_turn_origin
+from hermes_cli.turn_origin import (
+    TurnAttachmentOriginV1,
+    get_current_turn_origin,
+    get_current_turn_user_text,
+    turn_attachment_path_fingerprint,
+)
 from tools.registry import registry, tool_error, tool_result
 
 
 PLANNING_V2_TOOLSET = "planning_v2"
 PLANNING_V2_TOOL_NAME = "agent_ops_planning_v2"
+_ARTIFACT_RECOVERY_TTL_SECONDS = 3600.0
+_ARTIFACT_RECOVERY_MAX_ENTRIES = 8192
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactRecovery:
+    expires_at: float
+    thread_id: str
+    local_path: str
+    origin: PlanningOriginPayload
+    role: str
+    position: int
+    required: bool
+    idempotency_key: str
+    content_type: Optional[str]
+    retain_until: Optional[str]
+    attachment_identity: Optional[str]
+    ingress_ordinal: Optional[int]
+
+
+_artifact_recoveries: OrderedDict[str, _ArtifactRecovery] = OrderedDict()
+_artifact_recovery_lock = threading.Lock()
 
 
 def _profile_opted_in(provider: Optional[str] = None) -> bool:
@@ -100,12 +131,31 @@ def _mapping(
     return dict(value)
 
 
+def _exact_turn_text(*, user_task: Any = None) -> str:
+    """Return only runtime-bound current-turn text, never a model argument."""
+
+    current = get_current_turn_user_text()
+    if current is not None:
+        return current
+    if isinstance(user_task, str):
+        # Compatibility for direct dispatcher/tests that already pass the
+        # original task out-of-band. Model JSON cannot populate this kwarg.
+        return user_task
+    raise PlanningV2ConfigError(
+        "planning.current_input_required",
+        detail=(
+            "The exact current gateway user turn is unavailable. No planning "
+            "input was written; retry from the original conversation turn."
+        ),
+    )
+
+
 def _input_payload(
     args: Mapping[str, Any],
     *,
     user_task: Any = None,
 ) -> dict[str, Any]:
-    """Build content without ever using it as identity."""
+    """Store exact turn text and isolate optional model normalization."""
 
     explicit = args.get("payload")
     if explicit is not None and not isinstance(explicit, dict):
@@ -113,19 +163,21 @@ def _input_payload(
             "planning.tool_argument_invalid",
             detail="payload must be an object.",
         )
-    payload = dict(explicit or {})
+    exact_text = _exact_turn_text(user_task=user_task)
+    payload: dict[str, Any] = {"text": exact_text}
+    normalization: dict[str, Any] = {}
     message = args.get("message")
-    if message is None and not payload:
-        message = user_task
     if message is not None:
         text = str(message)
-        if text:
-            payload.setdefault("text", text)
-    if not payload:
-        raise PlanningV2ConfigError(
-            "planning.input_required",
-            detail="message or payload is required for a planning input.",
-        )
+        if text and text != exact_text:
+            normalization["message"] = text
+    if explicit:
+        normalized_payload = dict(explicit)
+        normalized_payload.pop("text", None)
+        if normalized_payload:
+            normalization["payload"] = normalized_payload
+    if normalization:
+        payload["modelNormalization"] = normalization
     return payload
 
 
@@ -356,13 +408,49 @@ def _run_key(
     if explicit:
         return explicit
     resolved_origin = origin or client.current_origin()
+    input_identity = client.get_thread_input_identity(thread_id)
+    run_policy = _mapping(args, "run_policy")
+    route_policy = _mapping(args, "route_policy")
+    correlation_id = (
+        str(args["correlation_id"])
+        if args.get("correlation_id") is not None
+        else None
+    )
     return derive_run_idempotency_key(
         runner_id=client.runner_id,
         thread_id=thread_id,
         provider=resolved_origin["provider"],
         gateway_account_id=resolved_origin["gatewayAccountId"],
         provider_event_id=resolved_origin["providerEventId"],
+        basis_input_sequence=input_identity["basisInputSequence"],
+        input_digest=input_identity["inputDigest"],
+        policy=run_policy,
+        route_policy=route_policy,
+        correlation_id=correlation_id,
     )
+
+
+def _run_recovery_arguments(
+    args: Mapping[str, Any],
+    *,
+    thread_id: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    recovery: dict[str, Any] = {
+        "action": "start_run",
+        "thread_id": thread_id,
+        "idempotency_key": idempotency_key,
+    }
+    for source, target in (
+        ("run_policy", "run_policy"),
+        ("route_policy", "route_policy"),
+    ):
+        value = args.get(source)
+        if isinstance(value, dict) and value:
+            recovery[target] = dict(value)
+    if args.get("correlation_id") is not None:
+        recovery["correlation_id"] = str(args["correlation_id"])
+    return recovery
 
 
 def _approval_message(
@@ -372,10 +460,15 @@ def _approval_message(
 ) -> str:
     """Use the exact active user turn, never model-transcribed approval text."""
 
+    current = get_current_turn_user_text()
     message = (
-        str(user_task)
-        if user_task is not None
-        else str(args.get("approval_message") or "")
+        current
+        if current is not None
+        else (
+            str(user_task)
+            if user_task is not None
+            else str(args.get("approval_message") or "")
+        )
     )
     if not message.strip():
         raise PlanningV2ConfigError(
@@ -417,6 +510,8 @@ def _artifact_key(
     origin: PlanningOriginPayload,
     role: str,
     position: int,
+    attachment_identity: Optional[str] = None,
+    ingress_ordinal: Optional[int] = None,
 ) -> str:
     derived = derive_artifact_idempotency_key(
         runner_id=client.runner_id,
@@ -426,6 +521,8 @@ def _artifact_key(
         provider_event_id=origin["providerEventId"],
         role=role,
         position=position,
+        attachment_identity=attachment_identity,
+        ingress_ordinal=ingress_ordinal,
     )
     explicit = str(args.get("idempotency_key") or "").strip()
     if explicit and explicit != derived:
@@ -433,10 +530,173 @@ def _artifact_key(
             "planning.artifact_idempotency_key_mismatch",
             detail=(
                 "Artifact replay key does not match the current scoped turn, "
-                "thread, role, and position."
+                "thread, and immutable attachment identity."
             ),
         )
     return derived
+
+
+def _matching_turn_attachment(
+    local_path: str,
+    *,
+    position: int,
+) -> Optional[TurnAttachmentOriginV1]:
+    origin = get_current_turn_origin()
+    if origin is None or not origin.attachments:
+        return None
+    fingerprint = turn_attachment_path_fingerprint(local_path)
+    matches = [
+        attachment
+        for attachment in origin.attachments
+        if attachment.path_fingerprint == fingerprint
+    ]
+    if not matches:
+        raise PlanningV2ConfigError(
+            "planning.artifact_not_in_current_turn",
+            detail=(
+                "The requested cached path is not an attachment from the "
+                "current immutable gateway turn."
+            ),
+        )
+    if len(matches) == 1:
+        return matches[0]
+    ordinal_match = [
+        attachment
+        for attachment in matches
+        if attachment.ingress_ordinal == position
+    ]
+    if len(ordinal_match) == 1:
+        return ordinal_match[0]
+    raise PlanningV2ConfigError(
+        "planning.artifact_identity_ambiguous",
+        detail=(
+            "Multiple current-turn attachments resolve to the same cached "
+            "path; retry with their exact ingress ordinal as position."
+        ),
+    )
+
+
+def _gateway_local_path(model_visible_path: str) -> str:
+    """Resolve a sandbox-visible cache path back to the gateway host."""
+
+    try:
+        from tools.credential_files import from_agent_visible_cache_path
+
+        return from_agent_visible_cache_path(model_visible_path)
+    except Exception:
+        return model_visible_path
+
+
+def _prune_artifact_recoveries(now: float) -> None:
+    expired = [
+        token
+        for token, recovery in _artifact_recoveries.items()
+        if recovery.expires_at <= now
+    ]
+    for token in expired:
+        _artifact_recoveries.pop(token, None)
+    while len(_artifact_recoveries) >= _ARTIFACT_RECOVERY_MAX_ENTRIES:
+        _artifact_recoveries.popitem(last=False)
+
+
+def _register_artifact_recovery(
+    *,
+    thread_id: str,
+    local_path: str,
+    origin: PlanningOriginPayload,
+    role: str,
+    position: int,
+    required: bool,
+    idempotency_key: str,
+    content_type: Optional[str],
+    retain_until: Optional[str],
+    attachment_identity: Optional[str],
+    ingress_ordinal: Optional[int],
+) -> str:
+    now = time.monotonic()
+    token = f"artrec_v1_{secrets.token_urlsafe(24)}"
+    recovery = _ArtifactRecovery(
+        expires_at=now + _ARTIFACT_RECOVERY_TTL_SECONDS,
+        thread_id=thread_id,
+        local_path=local_path,
+        origin=dict(origin),
+        role=role,
+        position=position,
+        required=required,
+        idempotency_key=idempotency_key,
+        content_type=content_type,
+        retain_until=retain_until,
+        attachment_identity=attachment_identity,
+        ingress_ordinal=ingress_ordinal,
+    )
+    with _artifact_recovery_lock:
+        _prune_artifact_recoveries(now)
+        _artifact_recoveries[token] = recovery
+    return token
+
+
+def _consume_artifact_recovery(
+    args: Mapping[str, Any],
+    *,
+    current_origin: PlanningOriginPayload,
+) -> tuple[str, _ArtifactRecovery]:
+    token = str(args.get("recovery_token") or "").strip()
+    if not token:
+        raise PlanningV2ConfigError(
+            "planning.artifact_recovery_token_required"
+        )
+    forbidden = {
+        "local_path",
+        "role",
+        "position",
+        "required",
+        "idempotency_key",
+        "content_type",
+        "retain_until",
+    }
+    if any(name in args for name in forbidden):
+        raise PlanningV2ConfigError(
+            "planning.artifact_recovery_ambiguous",
+            detail=(
+                "A recovery token is the complete immutable retry contract; "
+                "path or metadata overrides are not accepted."
+            ),
+        )
+    now = time.monotonic()
+    with _artifact_recovery_lock:
+        _prune_artifact_recoveries(now)
+        recovery = _artifact_recoveries.get(token)
+        if recovery is not None:
+            _artifact_recoveries.move_to_end(token)
+    if recovery is None:
+        raise PlanningV2ConfigError(
+            "planning.artifact_recovery_expired",
+            detail=(
+                "The gateway-private recovery token is unavailable or expired. "
+                "Reattach the original file; no absolute cached path was exposed."
+            ),
+        )
+    scope_fields = (
+        "provider",
+        "gatewayAccountId",
+        "chatId",
+        "threadId",
+        "senderId",
+    )
+    if any(
+        current_origin.get(name) != recovery.origin.get(name)
+        for name in scope_fields
+    ):
+        raise PlanningV2ConfigError(
+            "planning.artifact_recovery_scope_mismatch",
+            detail="The recovery token belongs to another conversation scope.",
+        )
+    return token, recovery
+
+
+def _finish_artifact_recovery(token: str) -> None:
+    with _artifact_recovery_lock:
+        _artifact_recoveries.pop(token, None)
 
 
 def _artifact_position(args: Mapping[str, Any]) -> int:
@@ -567,6 +827,11 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                     origin=origin,
                 )
                 partial["runIdempotencyKey"] = run_idempotency_key
+                partial["_recoveryArguments"] = _run_recovery_arguments(
+                    args,
+                    thread_id=thread_id,
+                    idempotency_key=run_idempotency_key,
+                )
                 run_response = _start_run(
                     client,
                     args,
@@ -618,6 +883,11 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                     origin=origin,
                 )
                 partial["runIdempotencyKey"] = run_idempotency_key
+                partial["_recoveryArguments"] = _run_recovery_arguments(
+                    args,
+                    thread_id=thread_id,
+                    idempotency_key=run_idempotency_key,
+                )
                 run_response = _start_run(
                     client,
                     args,
@@ -645,51 +915,92 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
             )
 
         if action == "upload_artifact":
-            thread_id = _required_id(args, "thread_id")
-            local_path = _required_id(args, "local_path")
-            role = _required_id(args, "role")
-            position = _artifact_position(args)
-            origin = client.current_origin()
-            idempotency_key = _artifact_key(
-                args,
-                client=client,
-                thread_id=thread_id,
-                origin=origin,
-                role=role,
-                position=position,
-            )
-            raw_required = args.get("required")
-            if raw_required is not None and not isinstance(
-                raw_required, bool
-            ):
-                raise PlanningV2ConfigError(
-                    "planning.tool_argument_invalid",
-                    detail="required must be a boolean.",
+            current_origin = client.current_origin()
+            recovery_token = str(args.get("recovery_token") or "").strip()
+            if recovery_token:
+                recovery_token, recovery = _consume_artifact_recovery(
+                    args,
+                    current_origin=current_origin,
                 )
-            required = True if raw_required is None else raw_required
-            content_type = (
-                str(args["content_type"])
-                if args.get("content_type") is not None
-                else None
-            )
-            retain_until = (
-                str(args["retain_until"])
-                if args.get("retain_until") is not None
-                else None
-            )
+                thread_id = recovery.thread_id
+                local_path = recovery.local_path
+                origin = recovery.origin
+                role = recovery.role
+                position = recovery.position
+                required = recovery.required
+                idempotency_key = recovery.idempotency_key
+                content_type = recovery.content_type
+                retain_until = recovery.retain_until
+                attachment_identity = recovery.attachment_identity
+                ingress_ordinal = recovery.ingress_ordinal
+            else:
+                thread_id = _required_id(args, "thread_id")
+                local_path = _gateway_local_path(
+                    _required_id(args, "local_path")
+                )
+                role = _required_id(args, "role")
+                position = _artifact_position(args)
+                origin = current_origin
+                raw_required = args.get("required")
+                if raw_required is not None and not isinstance(
+                    raw_required, bool
+                ):
+                    raise PlanningV2ConfigError(
+                        "planning.tool_argument_invalid",
+                        detail="required must be a boolean.",
+                    )
+                required = True if raw_required is None else raw_required
+                content_type = (
+                    str(args["content_type"])
+                    if args.get("content_type") is not None
+                    else None
+                )
+                retain_until = (
+                    str(args["retain_until"])
+                    if args.get("retain_until") is not None
+                    else None
+                )
+                turn_attachment = _matching_turn_attachment(
+                    local_path,
+                    position=position,
+                )
+                attachment_identity = (
+                    turn_attachment.attachment_id
+                    if turn_attachment is not None
+                    else None
+                )
+                ingress_ordinal = (
+                    turn_attachment.ingress_ordinal
+                    if turn_attachment is not None
+                    else None
+                )
+                idempotency_key = _artifact_key(
+                    args,
+                    client=client,
+                    thread_id=thread_id,
+                    origin=origin,
+                    role=role,
+                    position=position,
+                    attachment_identity=attachment_identity,
+                    ingress_ordinal=ingress_ordinal,
+                )
+                recovery_token = _register_artifact_recovery(
+                    thread_id=thread_id,
+                    local_path=local_path,
+                    origin=origin,
+                    role=role,
+                    position=position,
+                    required=required,
+                    idempotency_key=idempotency_key,
+                    content_type=content_type,
+                    retain_until=retain_until,
+                    attachment_identity=attachment_identity,
+                    ingress_ordinal=ingress_ordinal,
+                )
             recovery_arguments: dict[str, Any] = {
                 "action": "upload_artifact",
-                "thread_id": thread_id,
-                "local_path": local_path,
-                "role": role,
-                "position": position,
-                "required": required,
-                "idempotency_key": idempotency_key,
+                "recovery_token": recovery_token,
             }
-            if content_type is not None:
-                recovery_arguments["content_type"] = content_type
-            if retain_until is not None:
-                recovery_arguments["retain_until"] = retain_until
             partial = {
                 "threadId": thread_id,
                 "artifactUploadStarted": True,
@@ -743,6 +1054,8 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                 thread_id=thread_id,
                 role=role,
                 position=position,
+                attachment_identity=attachment_identity,
+                ingress_ordinal=ingress_ordinal,
             )
             input_response = client.append_thread_input(
                 thread_id,
@@ -754,6 +1067,7 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
             partial["inputReplayed"] = bool(
                 input_response.payload.get("duplicate")
             )
+            _finish_artifact_recovery(recovery_token)
             return tool_result(
                 {
                     "ok": True,
@@ -945,6 +1259,15 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                 thread_id=thread_id,
                 origin=None,
             )
+            partial = {
+                "threadId": thread_id,
+                "runIdempotencyKey": run_idempotency_key,
+                "_recoveryArguments": _run_recovery_arguments(
+                    args,
+                    thread_id=thread_id,
+                    idempotency_key=run_idempotency_key,
+                ),
+            }
             run_response = _start_run(
                 client,
                 args,
@@ -952,13 +1275,13 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                 origin=None,
                 idempotency_key=run_idempotency_key,
             )
-            partial = {
-                "threadId": thread_id,
-                "runStarted": True,
-                "runId": run_response.payload.get("runId"),
-                "runReplayed": run_response.status == 200,
-                "runIdempotencyKey": run_idempotency_key,
-            }
+            partial.update(
+                {
+                    "runStarted": True,
+                    "runId": run_response.payload.get("runId"),
+                    "runReplayed": run_response.status == 200,
+                }
+            )
             thread_response = client.get_thread(thread_id)
             return tool_result(
                 _semantic_result(
@@ -1154,16 +1477,27 @@ PLANNING_V2_SCHEMA = {
             "message": {
                 "type": "string",
                 "description": (
-                    "Planning input text. It is content only and is never used "
-                    "as event or thread identity."
+                    "Optional model normalization hint. Hermes always stores "
+                    "the exact runtime-bound current user turn as authoritative "
+                    "text; this field can never replace it."
                 ),
             },
             "local_path": {
                 "type": "string",
                 "description": (
                     "Exact absolute gateway-cached attachment path. Required "
-                    "only for upload_artifact. Bytes are streamed from this "
-                    "path and are never embedded in model JSON."
+                    "only for the first upload_artifact attempt. Bytes are "
+                    "streamed from this path and are never embedded in model "
+                    "JSON or returned in recovery output."
+                ),
+            },
+            "recovery_token": {
+                "type": "string",
+                "description": (
+                    "Opaque gateway-private upload retry contract returned "
+                    "after an ambiguous artifact failure. Send it alone with "
+                    "action=upload_artifact; never combine it with path, role, "
+                    "position, or idempotency overrides."
                 ),
             },
             "role": {
@@ -1179,7 +1513,9 @@ PLANNING_V2_SCHEMA = {
                 "description": (
                     "Positive 1-based position within the artifact role. "
                     "Every attachment needs a distinct role/position pair; "
-                    "there is no maximum total artifact count."
+                    "there is no maximum total artifact count. When gateway "
+                    "ingress identity exists, retries bind to that immutable "
+                    "attachment and ingress ordinal, not this model label."
                 ),
             },
             "required": {
@@ -1205,8 +1541,10 @@ PLANNING_V2_SCHEMA = {
             "payload": {
                 "type": "object",
                 "description": (
-                    "Arbitrary structured planning input, including artifact "
-                    "references. Hermes imposes no artifact or task-count cap."
+                    "Optional structured model normalization stored separately "
+                    "from exact current-turn text. It cannot override the "
+                    "authoritative text. Hermes imposes no artifact or "
+                    "task-count cap."
                 ),
                 "additionalProperties": True,
             },
@@ -1250,11 +1588,12 @@ PLANNING_V2_SCHEMA = {
                 "description": (
                     "Optional exact replay key for run or approve_apply "
                     "recovery. upload_artifact accepts only its Hermes-derived "
-                    "recovery key for the current scoped turn. When omitted, "
-                    "Hermes derives an "
-                    "operation-specific key from runner + planning thread + "
-                    "the scoped provider/account/event namespace (plus exact "
-                    "preview for approval), never message text."
+                    "key on an initial attempt; ambiguous upload recovery uses "
+                    "only recovery_token. When omitted, run identity includes "
+                    "the exact immutable input head/digest, canonical run and "
+                    "route policies, correlation mode, and scoped provider "
+                    "event. Approval additionally binds the exact preview. "
+                    "Message text is never an identity key."
                 ),
             },
             "start_run": {

@@ -1879,6 +1879,17 @@ class MessageEvent:
                 upstream_event_id=self.platform_update_id,
             )
 
+        # Only consume the provider-neutral, path-aligned list. Raw platform
+        # ``attachments`` collections may include failed downloads or use a
+        # different order, so guessing from them would bind the wrong identity.
+        provider_attachment_ids = (
+            metadata.get("media_attachment_ids")
+            or metadata.get("attachment_ids")
+        )
+        if not isinstance(provider_attachment_ids, (list, tuple)):
+            provider_attachment_ids = ()
+        from hermes_cli.turn_origin import derive_turn_attachment_origins
+
         origin = TurnOriginV1(
             provider=str(provider),
             gateway_account_id=account_id,
@@ -1889,6 +1900,12 @@ class MessageEvent:
             chat_type=chat_type,
             source_timestamp=source_timestamp,
             event_id=event_id,
+            attachments=derive_turn_attachment_origins(
+                provider=provider,
+                event_id=event_id,
+                media_paths=self.media_urls,
+                provider_attachment_ids=provider_attachment_ids,
+            ),
         )
         self.event_id = origin.event_id
         self.turn_origin = origin

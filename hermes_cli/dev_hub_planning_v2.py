@@ -287,6 +287,12 @@ class PlanningInputsPage(TypedDict):
     nextAfterSequence: int
 
 
+class PlanningInputIdentity(TypedDict):
+    threadId: str
+    basisInputSequence: int
+    inputDigest: str
+
+
 class PlanningPreviewPage(TypedDict):
     threadId: str
     runId: str
@@ -587,9 +593,23 @@ def derive_run_idempotency_key(
     provider: str,
     gateway_account_id: str,
     provider_event_id: str,
+    basis_input_sequence: int,
+    input_digest: str,
+    policy: Optional[Mapping[str, Any]] = None,
+    route_policy: Optional[Mapping[str, Any]] = None,
+    correlation_id: Optional[str] = None,
 ) -> str:
-    """Derive one retry key from the Hub's complete source-event namespace."""
+    """Derive one retry key from the exact immutable run contract."""
 
+    if isinstance(basis_input_sequence, bool):
+        raise PlanningV2OriginError("planning.run_identity_incomplete")
+    try:
+        basis = int(basis_input_sequence)
+    except (TypeError, ValueError) as exc:
+        raise PlanningV2OriginError(
+            "planning.run_identity_incomplete"
+        ) from exc
+    digest_value = _text(input_digest)
     identity = {
         "schemaVersion": PLANNING_V2_ORIGIN_SCHEMA_VERSION,
         "runnerId": _text(runner_id),
@@ -597,17 +617,40 @@ def derive_run_idempotency_key(
         "provider": _text(provider),
         "gatewayAccountId": _text(gateway_account_id),
         "providerEventId": _text(provider_event_id),
+        "basisInputSequence": basis,
+        "inputDigest": digest_value,
+        "policy": dict(policy or {}),
+        "routePolicy": dict(route_policy or {}),
+        "correlation": (
+            {"mode": "explicit", "value": _text(correlation_id)}
+            if _text(correlation_id)
+            else {"mode": "server_default"}
+        ),
     }
-    if not all(identity.values()):
+    if (
+        not all(
+            identity[name]
+            for name in (
+                "runnerId",
+                "threadId",
+                "provider",
+                "gatewayAccountId",
+                "providerEventId",
+                "inputDigest",
+            )
+        )
+        or basis < 1
+        or not _SHA256_RE.fullmatch(digest_value)
+    ):
         raise PlanningV2OriginError(
             "planning.run_identity_incomplete",
             detail=(
-                "runner, planning thread, provider account, and provider event "
-                "identities are required."
+                "runner, planning thread, provider account/event, positive "
+                "input head, and exact sha256 input digest are required."
             ),
         )
     digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
-    return f"hermes-planning-run-v1:{digest}"
+    return f"hermes-planning-run-v2:{digest}"
 
 
 def derive_approval_idempotency_key(
@@ -656,6 +699,8 @@ def _artifact_event_identity(
     provider_event_id: str,
     role: str,
     position: int,
+    attachment_identity: Optional[str] = None,
+    ingress_ordinal: Optional[int] = None,
 ) -> dict[str, Any]:
     artifact_role = _text(role)
     if isinstance(position, bool):
@@ -670,18 +715,57 @@ def _artifact_event_identity(
             "planning.artifact_identity_incomplete",
             detail="Artifact position must be a positive integer.",
         ) from exc
-    identity = {
+    exact_attachment = _text(attachment_identity)
+    exact_ordinal: Optional[int] = None
+    if ingress_ordinal is not None:
+        if isinstance(ingress_ordinal, bool):
+            raise PlanningV2OriginError(
+                "planning.artifact_identity_incomplete"
+            )
+        try:
+            exact_ordinal = int(ingress_ordinal)
+        except (TypeError, ValueError) as exc:
+            raise PlanningV2OriginError(
+                "planning.artifact_identity_incomplete"
+            ) from exc
+        if exact_ordinal < 1:
+            raise PlanningV2OriginError(
+                "planning.artifact_identity_incomplete"
+            )
+    identity: dict[str, Any] = {
         "schemaVersion": PLANNING_V2_ORIGIN_SCHEMA_VERSION,
         "runnerId": _text(runner_id),
         "threadId": _text(thread_id),
         "provider": _text(provider),
         "gatewayAccountId": _text(gateway_account_id),
         "providerEventId": _text(provider_event_id),
-        "role": artifact_role,
-        "position": artifact_position,
     }
+    if exact_attachment:
+        if exact_ordinal is None:
+            raise PlanningV2OriginError(
+                "planning.artifact_identity_incomplete"
+            )
+        identity.update(
+            {
+                "attachmentIdentity": exact_attachment,
+                "ingressOrdinal": exact_ordinal,
+            }
+        )
+    else:
+        # Backward-compatible fallback for surfaces that do not yet expose
+        # immutable ingress attachment identity.
+        identity.update(
+            {
+                "role": artifact_role,
+                "position": artifact_position,
+            }
+        )
     if (
-        not all(value for name, value in identity.items() if name != "position")
+        not all(
+            value
+            for name, value in identity.items()
+            if name not in {"position", "ingressOrdinal"}
+        )
         or artifact_position < 1
         or not _ARTIFACT_ROLE_RE.fullmatch(artifact_role)
     ):
@@ -704,6 +788,8 @@ def derive_artifact_idempotency_key(
     provider_event_id: str,
     role: str,
     position: int,
+    attachment_identity: Optional[str] = None,
+    ingress_ordinal: Optional[int] = None,
 ) -> str:
     """Derive one upload replay key without file path, bytes, or message text."""
 
@@ -715,6 +801,8 @@ def derive_artifact_idempotency_key(
         provider_event_id=provider_event_id,
         role=role,
         position=position,
+        attachment_identity=attachment_identity,
+        ingress_ordinal=ingress_ordinal,
     )
     digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
     return f"hermes-planning-artifact-v1:{digest}"
@@ -727,6 +815,8 @@ def derive_artifact_input_origin(
     thread_id: str,
     role: str,
     position: int,
+    attachment_identity: Optional[str] = None,
+    ingress_ordinal: Optional[int] = None,
 ) -> PlanningOriginPayload:
     """Create one deterministic artifact sub-event from the current turn.
 
@@ -743,6 +833,8 @@ def derive_artifact_input_origin(
         provider_event_id=origin["providerEventId"],
         role=role,
         position=position,
+        attachment_identity=attachment_identity,
+        ingress_ordinal=ingress_ordinal,
     )
     digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
     derived = dict(origin)
@@ -1913,6 +2005,117 @@ class PlanningV2Client:
                 )
             cursor = next_cursor
 
+    def get_thread_input_identity(
+        self,
+        thread_id: str,
+    ) -> PlanningInputIdentity:
+        """Read and hash the same immutable input basis the Hub binds to a run."""
+
+        projection = self.get_thread(thread_id).payload
+        thread = projection.get("thread")
+        if not isinstance(thread, Mapping):
+            raise PlanningV2ProtocolError(
+                "planning.hub_response_invalid",
+                detail="Planning thread projection is missing thread.",
+            )
+        try:
+            expected_head = int(thread.get("headInputSequence"))
+        except (TypeError, ValueError) as exc:
+            raise PlanningV2ProtocolError(
+                "planning.hub_response_invalid",
+                detail="Planning thread input head is invalid.",
+            ) from exc
+        if expected_head < 1:
+            raise PlanningV2ConfigError(
+                "planning.thread_has_no_input",
+                detail="A planning run requires at least one immutable input.",
+            )
+
+        identities: list[dict[str, Any]] = []
+        cursor = 0
+        while True:
+            page = self.get_thread_inputs(
+                thread_id,
+                after_sequence=cursor,
+                limit=500,
+            ).payload
+            if int(page["basisInputSequence"]) != expected_head:
+                raise PlanningV2ProtocolError(
+                    "planning.input_head_changed",
+                    detail=(
+                        "Planning inputs changed while the run identity was "
+                        "being resolved; retry against the new immutable head."
+                    ),
+                )
+            for item in page["inputs"]:
+                try:
+                    sequence = int(item.get("sequence"))
+                except (TypeError, ValueError) as exc:
+                    raise PlanningV2ProtocolError(
+                        "planning.hub_response_invalid",
+                        detail="Planning input sequence is invalid.",
+                    ) from exc
+                if sequence > expected_head:
+                    continue
+                content_hash = _text(item.get("contentHash"))
+                if not _SHA256_RE.fullmatch(content_hash):
+                    raise PlanningV2ProtocolError(
+                        "planning.hub_response_invalid",
+                        detail="Planning input contentHash is invalid.",
+                    )
+                identities.append(
+                    {"sequence": sequence, "contentHash": content_hash}
+                )
+            if (
+                cursor >= expected_head
+                or any(
+                    int(item.get("sequence", 0)) >= expected_head
+                    for item in page["inputs"]
+                )
+                or not page["hasMore"]
+            ):
+                break
+            next_cursor = int(page["nextAfterSequence"])
+            if next_cursor <= cursor:
+                raise PlanningV2ProtocolError(
+                    "planning.input_cursor_stalled",
+                    detail="Dev Hub input pagination did not advance.",
+                )
+            cursor = next_cursor
+        if (
+            len(identities) != expected_head
+            or not identities
+            or [item["sequence"] for item in identities]
+            != list(range(1, expected_head + 1))
+        ):
+            raise PlanningV2ProtocolError(
+                "planning.input_head_incomplete",
+                detail=(
+                    "Planning inputs changed or were incomplete while the run "
+                    "identity was being resolved."
+                ),
+            )
+        confirmed = self.get_thread(thread_id).payload.get("thread")
+        if (
+            not isinstance(confirmed, Mapping)
+            or int(confirmed.get("headInputSequence", 0)) != expected_head
+        ):
+            raise PlanningV2ProtocolError(
+                "planning.input_head_changed",
+                detail=(
+                    "Planning inputs changed before the run identity could be "
+                    "confirmed; retry against the new immutable head."
+                ),
+            )
+        input_digest = "sha256:" + hashlib.sha256(
+            _canonical_json(identities).encode("utf-8")
+        ).hexdigest()
+        return {
+            "threadId": _text(thread_id),
+            "basisInputSequence": expected_head,
+            "inputDigest": input_digest,
+        }
+
     def get_thread_events(
         self,
         thread_id: str,
@@ -2344,6 +2547,7 @@ __all__ = [
     "PlanningClaimContext",
     "PlanningClaimResultContext",
     "PlanningEventsProjection",
+    "PlanningInputIdentity",
     "PlanningInputsPage",
     "PlanningArtifactDTO",
     "PlanningArtifactReferenceDTO",
