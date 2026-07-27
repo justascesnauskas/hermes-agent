@@ -177,11 +177,11 @@ def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
 def test_skipped_compression_returns_messages_unchanged(tmp_path: Path) -> None:
     """The loser of the lock race must return its input messages verbatim.
 
-    Callers (preflight compression in ``conversation_loop.py``) detect the
-    no-op via ``len(returned) == len(input)`` and stop the auto-compress
-    retry loop.  If the skipped path returned the compressed view, that
-    detection would break and the caller would mutate the conversation
-    without going through state.db rotation.
+    Callers detect that neither rows nor estimated request tokens materially
+    decreased and stop the immediate auto-compress retry loop. If the skipped
+    path returned the compressed view, that detection would break and the
+    caller would mutate the conversation without going through state.db
+    rotation.
     """
     db = SessionDB(db_path=tmp_path / "state.db")
     parent_sid = "LOSER_TEST"
@@ -192,6 +192,10 @@ def test_skipped_compression_returns_messages_unchanged(tmp_path: Path) -> None:
     assert held is True
 
     agent = _build_agent_with_db(db, parent_sid)
+    status_events: list[tuple[str, str]] = []
+    agent.status_callback = lambda event, message: status_events.append(
+        (event, message)
+    )
     messages = [{"role": "user", "content": "m1"}, {"role": "user", "content": "m2"}]
 
     compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
@@ -201,6 +205,9 @@ def test_skipped_compression_returns_messages_unchanged(tmp_path: Path) -> None:
     assert agent.session_id == parent_sid
     # Compressor was never called (the skip happens before .compress())
     agent.context_compressor.compress.assert_not_called()
+    assert not any(
+        "Compacting context" in message for _event, message in status_events
+    ), "A lock loser must not claim that compaction started"
 
 
 def test_compression_restores_user_turn_when_compressor_drops_all_users(tmp_path: Path) -> None:

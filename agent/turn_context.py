@@ -632,7 +632,6 @@ def build_turn_context(
                 getattr(agent, "codex_app_server_auto_compaction", "native"),
             )
         elif _compressor.should_compress(_preflight_tokens):
-            _preflight_compressed = True
             _touch_activity = getattr(agent, "_touch_activity", None)
             if callable(_touch_activity):
                 _touch_activity("compacting earlier conversation before continuing")
@@ -643,7 +642,7 @@ def build_turn_context(
                 agent.model,
                 f"{_compressor.context_length:,}",
             )
-            agent._emit_status(
+            _preflight_status = (
                 f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
                 f">= {_compressor.threshold_tokens:,} threshold. "
                 "This may take a moment."
@@ -654,6 +653,7 @@ def build_turn_context(
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
+                    status_message=_preflight_status if _pass == 0 else None,
                 )
                 # Re-estimate now so size-only compression (same row count,
                 # lower token count — e.g. summarising tool outputs) is
@@ -668,6 +668,7 @@ def build_turn_context(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens
                 ):
                     break  # Cannot compress further: neither rows nor tokens moved
+                _preflight_compressed = True
                 conversation_history = conversation_history_after_compression(
                     agent, messages
                 )

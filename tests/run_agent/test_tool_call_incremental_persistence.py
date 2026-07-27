@@ -10,6 +10,9 @@ results that were produced before it fired.  These tests pin the contract:
     2. The SEQUENTIAL tool path flushes each tool result to the session DB
        immediately after appending it — BEFORE the next tool dispatches.
     3. The CONCURRENT tool path flushes each tool result in append order.
+    4. A large batch is bounded before those incremental flushes, so a gateway
+       restart cannot reload raw results that only the in-memory aggregate pass
+       had compacted.
 
 These exercise the REAL production dispatch surfaces:
 
@@ -250,3 +253,39 @@ def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
     # production flush call breaks one of these assertions.
     assert flushed_tool_ids == ["c1", "c2"]
     assert flush_lengths == [1, 2]
+
+
+def test_large_batch_is_bounded_before_incremental_session_flush():
+    """17 medium results must never reach SessionDB as a ~900K raw batch."""
+    agent = _make_agent()
+    tool_calls = [
+        _mock_tool_call(name="web_search", call_id=f"c{i}")
+        for i in range(17)
+    ]
+    messages: list = []
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+    flush_snapshots: list[list] = []
+
+    def _fake_dispatch(function_name, function_args, effective_task_id, **kwargs):
+        return "x" * 53_000
+
+    def _record_flush(flush_messages, conversation_history=None):
+        flush_snapshots.append(copy.deepcopy(flush_messages))
+
+    sandbox = MagicMock()
+    sandbox.execute.return_value = {"output": "", "returncode": 0}
+    sandbox.get_temp_dir.return_value = "/tmp"
+    agent._flush_messages_to_session_db = MagicMock(side_effect=_record_flush)
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=_fake_dispatch),
+        patch("agent.tool_executor.get_active_env", return_value=sandbox),
+    ):
+        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+
+    assert len(flush_snapshots) == 17
+    assert all(
+        len(snapshot[-1]["content"]) < 53_000
+        for snapshot in flush_snapshots
+    )
+    assert sum(len(msg["content"]) for msg in flush_snapshots[-1]) <= 200_000

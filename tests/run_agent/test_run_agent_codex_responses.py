@@ -1909,8 +1909,16 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
 
     compress_calls = []
 
-    def _fake_compress_context(messages, system_message, *, approx_tokens=None, task_id="default", focus_topic=None):
-        compress_calls.append(approx_tokens)
+    def _fake_compress_context(
+        messages,
+        system_message,
+        *,
+        approx_tokens=None,
+        task_id="default",
+        focus_topic=None,
+        status_message=None,
+    ):
+        compress_calls.append((approx_tokens, status_message))
         return [
             {"role": "user", "content": "[summary of prior tool-heavy work]"},
         ], "You are Hermes."
@@ -1923,7 +1931,66 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     assert result["completed"] is True
     assert result["final_response"] == "Summary after compaction."
     assert len(compress_calls) == 1
-    assert compress_calls[0] >= 15_000
+    assert compress_calls[0][0] >= 15_000
+    assert "Pre-API compression" in compress_calls[0][1]
+    assert len(requests) == 2
+
+
+def test_mid_turn_noop_compression_is_not_retried_three_times(monkeypatch):
+    """A lock-loser/no-op pass must not emit the screenshot's retry burst."""
+    agent = _build_agent(monkeypatch)
+    agent.context_compressor.context_length = 20_000
+    agent.context_compressor.threshold_tokens = 20_000
+
+    responses = [
+        _codex_tool_call_response(),
+        _codex_message_response("Continued without duplicate compaction."),
+    ]
+    requests = []
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda api_kwargs: requests.append(api_kwargs) or responses.pop(0),
+    )
+
+    def _fake_execute_tool_calls(
+        assistant_message,
+        messages,
+        effective_task_id,
+        api_call_count=0,
+    ):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": "x" * 80_000,
+                }
+            )
+
+    compression_statuses = []
+
+    def _noop_compress_context(
+        messages,
+        system_message,
+        *,
+        approx_tokens=None,
+        task_id="default",
+        focus_topic=None,
+        status_message=None,
+    ):
+        compression_statuses.append(status_message)
+        return messages, agent._cached_system_prompt or "You are Hermes."
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+    monkeypatch.setattr(agent, "_compress_context", _noop_compress_context)
+
+    result = agent.run_conversation("do a tool-heavy task")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Continued without duplicate compaction."
+    assert len(compression_statuses) == 1
+    assert "Pre-API compression" in compression_statuses[0]
     assert len(requests) == 2
 
 
@@ -1969,7 +2036,15 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
                 {"role": "tool", "tool_call_id": call.id, "content": "x" * 80_000}
             )
 
-    def _fake_compress_context(messages, system_message, *, approx_tokens=None, task_id="default", focus_topic=None):
+    def _fake_compress_context(
+        messages,
+        system_message,
+        *,
+        approx_tokens=None,
+        task_id="default",
+        focus_topic=None,
+        status_message=None,
+    ):
         # Emulate the real in-place compaction DB side effect: soft-archive the
         # prior rows and insert the compacted set under the SAME session id,
         # then reset the flush identity seed — exactly as archive_and_compact +

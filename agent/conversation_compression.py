@@ -184,9 +184,11 @@ def _compression_lock_holder(agent: Any) -> str:
     we want each acquire to be unique).
     """
     import threading
+    from hermes_state import compression_lock_holder_process_prefix
+
+    process_prefix = compression_lock_holder_process_prefix()
     return (
-        f"pid={os.getpid()}"
-        f":tid={threading.get_ident()}"
+        f"{process_prefix}:tid={threading.get_ident()}"
         f":agent={id(agent):x}"
         f":nonce={uuid.uuid4().hex[:8]}"
     )
@@ -704,6 +706,7 @@ def compress_context(
     task_id: str = "default",
     focus_topic: Optional[str] = None,
     force: bool = False,
+    status_message: Optional[str] = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -721,13 +724,17 @@ def compress_context(
             by the manual ``/compress`` slash command so users can retry
             immediately after an auto-compress abort.  Auto-compress
             callers use the default ``False``.
+        status_message: Optional caller-specific lifecycle text. It is emitted
+            only after this path owns the durable compression lock and passes
+            the stale-session/cooldown guards.
 
     Returns:
         ``(compressed_messages, new_system_prompt)`` tuple.  When
         compression aborts (aux LLM failed to produce a usable summary),
         returns the original messages unchanged and the existing system
-        prompt — the session is NOT rotated.  Callers should detect the
-        no-op via ``len(returned) == len(input)`` and stop the retry loop.
+        prompt — the session is NOT rotated. Callers compare both rows and
+        estimated request tokens and stop immediate retries when neither
+        materially decreased.
     """
     # Codex app-server sessions: the codex agent owns the real thread context;
     # Hermes' summarizer would only rewrite a local mirror without shrinking
@@ -745,6 +752,7 @@ def compress_context(
             approx_tokens=approx_tokens,
             task_id=task_id,
             force=force,
+            status_message=status_message,
         )
 
     # Every automatic entrypoint must honor compressor-owned cooldown and
@@ -791,14 +799,6 @@ def compress_context(
     # Set True once the in-place DB write actually completes (the DB block can
     # raise and skip it). Surfaced to the gateway via agent._last_compaction_in_place.
     compacted_in_place = False
-    logger.info(
-        "context compression started: session=%s messages=%d tokens=~%s model=%s focus=%r",
-        agent.session_id or "none", _pre_msg_count,
-        f"{approx_tokens:,}" if approx_tokens else "unknown", agent.model,
-        focus_topic,
-    )
-    agent._emit_status(COMPACTION_STATUS)
-
     # ── Compression lock ────────────────────────────────────────────────
     # Atomic, state.db-backed lock per session_id.  Without this, two
     # AIAgent instances that share the same session_id (most commonly the
@@ -818,7 +818,7 @@ def compress_context(
     # If we can't acquire the lock, another path is mid-compression on
     # this session.  Aborting is correct: the messages are unchanged, the
     # other path's rotation will produce the canonical new session_id,
-    # and our caller's auto-compress loop sees ``len(returned) == len(input)``
+    # and our caller's auto-compress loop sees no material row/token progress
     # and stops retrying for this cycle. The session is NOT corrupted —
     # we just sit out this round and let the winner finish.
     _lock_db = getattr(agent, "_session_db", None)
@@ -927,7 +927,8 @@ def compress_context(
                 try:
                     agent._emit_warning(
                         "⚠ Skipping concurrent compression — another path "
-                        "is already compressing this session. Will retry "
+                        "is already compressing this session. Continuing "
+                        "without duplicate attempts; compression can retry "
                         "after it finishes."
                     )
                 except Exception:
@@ -1007,6 +1008,20 @@ def compress_context(
                 existing_prompt = agent._build_system_prompt(system_message)
             return messages, existing_prompt
 
+    # A "Compacting" lifecycle event promises that work really started. Keep
+    # it behind lock ownership and every no-op guard so a restarted gateway
+    # does not render three identical progress messages while merely losing
+    # the same lock race.
+    logger.info(
+        "context compression started: session=%s messages=%d tokens=~%s model=%s focus=%r",
+        agent.session_id or "none",
+        _pre_msg_count,
+        f"{approx_tokens:,}" if approx_tokens else "unknown",
+        agent.model,
+        focus_topic,
+    )
+    agent._emit_status(status_message or COMPACTION_STATUS)
+
     try:
         if _lock_holder is not None:
             _lock_refresher = _CompressionLockLeaseRefresher(
@@ -1081,7 +1096,7 @@ def compress_context(
         # the compressor returns the input messages unchanged.  Surface the
         # error to the user, skip the session-rotation work entirely (no
         # session has logically ended), and let auto-compress callers detect
-        # the no-op via len(returned) == len(input).
+        # that neither rows nor estimated request tokens materially decreased.
         if getattr(agent.context_compressor, "_last_compress_aborted", False):
             try:
                 _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
@@ -1529,6 +1544,7 @@ def _compress_context_via_codex_app_server(
     approx_tokens: Optional[int] = None,
     task_id: str = "default",
     force: bool = False,
+    status_message: Optional[str] = None,
 ) -> Tuple[list, str]:
     """Route compaction to Codex app-server for Codex-owned threads.
 
@@ -1577,7 +1593,7 @@ def _compress_context_via_codex_app_server(
         f"{approx_tokens:,}" if approx_tokens else "unknown",
     )
     try:
-        agent._emit_status(COMPACTION_STATUS)
+        agent._emit_status(status_message or COMPACTION_STATUS)
     except Exception:
         pass
 

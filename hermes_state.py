@@ -15,8 +15,10 @@ Key design decisions:
 """
 
 import asyncio
+import errno
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -31,6 +33,86 @@ from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
+
+
+_COMPRESSION_LOCK_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
+_COMPRESSION_LOCK_BOOT_RE = re.compile(r"(?:^|:)boot=([^:]+)(?::|$)")
+_COMPRESSION_LOCK_PIDNS_RE = re.compile(r"(?:^|:)pidns=(\d+)(?::|$)")
+
+
+def _compression_lock_process_scope() -> Optional[Tuple[str, int]]:
+    """Return the Linux boot + PID-namespace identity, when available."""
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8"
+        ).strip()
+        pid_namespace = int(os.stat("/proc/self/ns/pid").st_ino)
+    except (OSError, TypeError, ValueError):
+        return None
+    if not boot_id or pid_namespace <= 0:
+        return None
+    return boot_id, pid_namespace
+
+
+def compression_lock_holder_process_prefix(pid: Optional[int] = None) -> str:
+    """Build a process identity safe for local abandoned-lock detection."""
+    process_id = os.getpid() if pid is None else int(pid)
+    scope = _compression_lock_process_scope()
+    if scope is None:
+        # The DB will keep TTL-only recovery for this unscoped identity.
+        return f"pid={process_id}"
+    boot_id, pid_namespace = scope
+    return (
+        f"boot={boot_id}:pidns={pid_namespace}:pid={process_id}"
+    )
+
+
+def _compression_lock_holder_process_alive(holder: str) -> Optional[bool]:
+    """Return whether a PID-stamped compression-lock holder is still alive.
+
+    ``None`` means the holder predates PID-stamped identities or cannot be
+    checked safely, so callers must retain the normal TTL-only recovery path.
+    A confirmed-dead process can never refresh its lease; reclaiming that row
+    immediately avoids making a freshly restarted gateway wait for the full
+    five-minute foreground compression TTL.
+    """
+    holder_text = str(holder or "")
+    pid_match = _COMPRESSION_LOCK_PID_RE.search(holder_text)
+    boot_match = _COMPRESSION_LOCK_BOOT_RE.search(holder_text)
+    pidns_match = _COMPRESSION_LOCK_PIDNS_RE.search(holder_text)
+    if pid_match is None or boot_match is None or pidns_match is None:
+        return None
+    try:
+        pid = int(pid_match.group(1))
+        holder_pid_namespace = int(pidns_match.group(1))
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    scope = _compression_lock_process_scope()
+    if scope is None:
+        return None
+    current_boot_id, current_pid_namespace = scope
+    if boot_match.group(1) != current_boot_id:
+        # A process from an earlier boot is definitively gone.
+        return False
+    if holder_pid_namespace != current_pid_namespace:
+        # A live process in another container/PID namespace can be invisible
+        # to os.kill(pid, 0); retain TTL-only recovery rather than steal.
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        if exc.errno == errno.EPERM:
+            return True
+        return None
+    return True
 
 
 def _scrub_surrogates(value: Any) -> Any:
@@ -2790,14 +2872,15 @@ class SessionDB:
         MUST NOT proceed with compression in that case (its rotation would
         race against the holder's, splitting the session lineage).
 
-        Expired locks (``expires_at < now``) are reclaimed transparently:
-        the stale row is deleted and the new holder acquires it. This
-        prevents a crashed compressor from permanently blocking the
-        session.
+        Expired locks (``expires_at < now``) are reclaimed transparently.
+        PID-stamped locks whose local process is confirmed dead are reclaimed
+        before expiry, which lets a restarted gateway resume immediately
+        instead of inheriting the old process's full lease.
 
-        Implementation: single-transaction DELETE-expired + INSERT-or-IGNORE,
-        followed by a SELECT to confirm we got the row. SQLite serialises
-        writes, so the whole sequence is atomic against other writers.
+        Implementation: one transaction conditionally deletes a confirmed
+        dead/expired holder, performs INSERT-or-IGNORE, then SELECTs to confirm
+        ownership. SQLite serialises writes, so the whole sequence is atomic
+        against other writers.
         """
         if not session_id:
             return False
@@ -2805,7 +2888,35 @@ class SessionDB:
         expires_at = now + ttl_seconds
 
         def _do(conn):
-            # First: reclaim any expired lock for this session_id.
+            reclaimed_holder = None
+            row = conn.execute(
+                "SELECT holder, expires_at FROM compression_locks "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is not None:
+                existing_holder = (
+                    row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+                )
+                existing_expires_at = (
+                    row["expires_at"] if isinstance(row, sqlite3.Row) else row[1]
+                )
+                if (
+                    existing_holder != holder
+                    and float(existing_expires_at or 0.0) >= now
+                    and _compression_lock_holder_process_alive(existing_holder)
+                    is False
+                ):
+                    cur = conn.execute(
+                        "DELETE FROM compression_locks "
+                        "WHERE session_id = ? AND holder = ?",
+                        (session_id, existing_holder),
+                    )
+                    if cur.rowcount > 0:
+                        reclaimed_holder = existing_holder
+
+            # Reclaim an expired lock for this session_id. PID-stamped locks
+            # from a confirmed-dead process were already removed above.
             conn.execute(
                 "DELETE FROM compression_locks "
                 "WHERE session_id = ? AND expires_at < ?",
@@ -2823,12 +2934,21 @@ class SessionDB:
                 "SELECT holder FROM compression_locks WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
-            return row is not None and (
+            acquired = row is not None and (
                 row["holder"] if isinstance(row, sqlite3.Row) else row[0]
             ) == holder
+            return acquired, reclaimed_holder
 
         try:
-            return bool(self._execute_write(_do))
+            acquired, reclaimed_holder = self._execute_write(_do)
+            if reclaimed_holder:
+                logger.warning(
+                    "Reclaimed abandoned compression lock for session=%s "
+                    "from dead holder=%s",
+                    session_id,
+                    reclaimed_holder,
+                )
+            return bool(acquired)
         except sqlite3.Error as exc:
             logger.warning(
                 "try_acquire_compression_lock(%s) failed: %s",
