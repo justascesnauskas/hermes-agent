@@ -90,8 +90,24 @@ references. The Hermes client does not impose an input-history, artifact, or
 work-item count ceiling. Paginated reads pin the first page's input basis, so a
 concurrent append is picked up by the next read instead of mixing two planning
 revisions. Page size is merely a transport control, not a semantic limit.
-Artifact bytes and durability remain the Dev Hub storage plane's responsibility
-rather than being hidden in a provider chat or an ephemeral Hermes process.
+Long-term artifact durability remains the Dev Hub storage plane's
+responsibility rather than being hidden in provider chat history.
+
+Before the first upload request, Hermes atomically snapshots every attachment
+into the active profile's private
+`HERMES_HOME/planning-v2/artifact-ingress/` handoff spool. The journal stores
+immutable upload metadata and a checksum, but never the source attachment's
+absolute path. An ambiguous or lost Hub response returns an opaque recovery
+token that resolves to the same bytes and idempotency key after a gateway or
+machine-process restart; the original provider cache file is no longer needed.
+The token remains scoped to the same provider account, chat/thread, and sender.
+Hermes removes the journal and snapshot only after the artifact and its
+planning input have converged successfully in Dev Hub.
+
+The spool has no attachment-count ceiling and does not evict live,
+unacknowledged inputs by age. Each acknowledged entry is retired atomically and
+deleted. This local spool is a restart-safe ingress handoff, not an alternative
+artifact provider or a retention policy for abandoned planning requests.
 
 ## Exact preview approval
 
@@ -167,6 +183,13 @@ was stored but the run response remains unavailable, the tool returns a
 machine-readable recovery action containing the same thread id and exact run
 idempotency key. Replaying that action reads as the same run rather than
 creating another one.
+
+For artifact uploads, the recovery action contains only the opaque local token.
+It never contains the source path, role, position, or editable upload metadata.
+Replaying it reads the durable profile-local journal, verifies the exact
+conversation/user scope and snapshot checksum, then streams the same bytes with
+the same idempotency key. A restart therefore cannot turn an unknown upload
+outcome into a request to reattach the file or into a duplicate artifact.
 
 If an approval response is lost after Dev Hub commits it, the tool returns an
 `approve_apply` recovery action with the same thread, preview id, both hashes,

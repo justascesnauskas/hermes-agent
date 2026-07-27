@@ -8,12 +8,10 @@ are available.  Invocations are direct writes, never shadow traffic.
 
 from __future__ import annotations
 
-from collections import Counter, OrderedDict
+from collections import Counter
 from dataclasses import dataclass
 import json
 import secrets
-import threading
-import time
 from typing import Any, Mapping, Optional
 
 from hermes_cli.dev_hub_planning_v2 import (
@@ -40,29 +38,18 @@ from hermes_cli.planning_preview_delivery import (
     ProviderDeliveryReceipt,
     register_preview_delivery_intent,
 )
+from hermes_cli.planning_artifact_spool import (
+    ArtifactRecoveryRecord,
+    acknowledge_artifact_recovery,
+    load_artifact_recovery,
+    load_registered_artifact_recovery,
+    register_artifact_recovery,
+)
 from tools.registry import registry, tool_error, tool_result
 
 
 PLANNING_V2_TOOLSET = "planning_v2"
 PLANNING_V2_TOOL_NAME = "agent_ops_planning_v2"
-_ARTIFACT_RECOVERY_TTL_SECONDS = 3600.0
-_ARTIFACT_RECOVERY_MAX_ENTRIES = 8192
-
-
-@dataclass(frozen=True, slots=True)
-class _ArtifactRecovery:
-    expires_at: float
-    thread_id: str
-    local_path: str
-    origin: PlanningOriginPayload
-    role: str
-    position: int
-    required: bool
-    idempotency_key: str
-    content_type: Optional[str]
-    retain_until: Optional[str]
-    attachment_identity: Optional[str]
-    ingress_ordinal: Optional[int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,10 +57,6 @@ class _RunAdmission:
     idempotency_key: str
     expected_basis_input_sequence: Optional[int]
     expected_input_digest: Optional[str]
-
-
-_artifact_recoveries: OrderedDict[str, _ArtifactRecovery] = OrderedDict()
-_artifact_recovery_lock = threading.Lock()
 
 
 def _profile_opted_in(provider: Optional[str] = None) -> bool:
@@ -660,18 +643,6 @@ def _gateway_local_path(model_visible_path: str) -> str:
         return model_visible_path
 
 
-def _prune_artifact_recoveries(now: float) -> None:
-    expired = [
-        token
-        for token, recovery in _artifact_recoveries.items()
-        if recovery.expires_at <= now
-    ]
-    for token in expired:
-        _artifact_recoveries.pop(token, None)
-    while len(_artifact_recoveries) >= _ARTIFACT_RECOVERY_MAX_ENTRIES:
-        _artifact_recoveries.popitem(last=False)
-
-
 def _register_artifact_recovery(
     *,
     thread_id: str,
@@ -686,13 +657,10 @@ def _register_artifact_recovery(
     attachment_identity: Optional[str],
     ingress_ordinal: Optional[int],
 ) -> str:
-    now = time.monotonic()
-    token = f"artrec_v1_{secrets.token_urlsafe(24)}"
-    recovery = _ArtifactRecovery(
-        expires_at=now + _ARTIFACT_RECOVERY_TTL_SECONDS,
+    return register_artifact_recovery(
         thread_id=thread_id,
         local_path=local_path,
-        origin=dict(origin),
+        origin=origin,
         role=role,
         position=position,
         required=required,
@@ -702,23 +670,20 @@ def _register_artifact_recovery(
         attachment_identity=attachment_identity,
         ingress_ordinal=ingress_ordinal,
     )
-    with _artifact_recovery_lock:
-        _prune_artifact_recoveries(now)
-        _artifact_recoveries[token] = recovery
-    return token
 
 
 def _consume_artifact_recovery(
     args: Mapping[str, Any],
     *,
     current_origin: PlanningOriginPayload,
-) -> tuple[str, _ArtifactRecovery]:
+) -> tuple[str, ArtifactRecoveryRecord]:
     token = str(args.get("recovery_token") or "").strip()
     if not token:
         raise PlanningV2ConfigError(
             "planning.artifact_recovery_token_required"
         )
     forbidden = {
+        "thread_id",
         "local_path",
         "role",
         "position",
@@ -735,41 +700,14 @@ def _consume_artifact_recovery(
                 "path or metadata overrides are not accepted."
             ),
         )
-    now = time.monotonic()
-    with _artifact_recovery_lock:
-        _prune_artifact_recoveries(now)
-        recovery = _artifact_recoveries.get(token)
-        if recovery is not None:
-            _artifact_recoveries.move_to_end(token)
-    if recovery is None:
-        raise PlanningV2ConfigError(
-            "planning.artifact_recovery_expired",
-            detail=(
-                "The gateway-private recovery token is unavailable or expired. "
-                "Reattach the original file; no absolute cached path was exposed."
-            ),
-        )
-    scope_fields = (
-        "provider",
-        "gatewayAccountId",
-        "chatId",
-        "threadId",
-        "senderId",
+    return token, load_artifact_recovery(
+        token,
+        current_origin=current_origin,
     )
-    if any(
-        current_origin.get(name) != recovery.origin.get(name)
-        for name in scope_fields
-    ):
-        raise PlanningV2ConfigError(
-            "planning.artifact_recovery_scope_mismatch",
-            detail="The recovery token belongs to another conversation scope.",
-        )
-    return token, recovery
 
 
 def _finish_artifact_recovery(token: str) -> None:
-    with _artifact_recovery_lock:
-        _artifact_recoveries.pop(token, None)
+    acknowledge_artifact_recovery(token)
 
 
 def _artifact_position(args: Mapping[str, Any]) -> int:
@@ -1002,7 +940,7 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                     current_origin=current_origin,
                 )
                 thread_id = recovery.thread_id
-                local_path = recovery.local_path
+                local_path = recovery.snapshot_path
                 origin = recovery.origin
                 role = recovery.role
                 position = recovery.position
@@ -1076,6 +1014,11 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                     attachment_identity=attachment_identity,
                     ingress_ordinal=ingress_ordinal,
                 )
+                recovery = load_registered_artifact_recovery(
+                    recovery_token,
+                    current_origin=current_origin,
+                )
+                local_path = recovery.snapshot_path
             recovery_arguments: dict[str, Any] = {
                 "action": "upload_artifact",
                 "recovery_token": recovery_token,

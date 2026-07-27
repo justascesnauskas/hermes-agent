@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -342,7 +343,12 @@ class _ArtifactClient:
         path: str,
         **kwargs: Any,
     ) -> PlanningV2Response[dict[str, Any]]:
-        call = {"threadId": thread_id, "path": path, **kwargs}
+        call = {
+            "threadId": thread_id,
+            "path": path,
+            "bytes": Path(path).read_bytes(),
+            **kwargs,
+        }
         self.upload_calls.append(call)
         position = int(kwargs["position"])
         blob_id = f"blob-{position}"
@@ -408,6 +414,7 @@ class _ArtifactClient:
 
 def test_legacy_artifact_upload_falls_back_to_separate_opaque_input(
     monkeypatch,
+    tmp_path,
 ) -> None:
     fake = _ArtifactClient()
     monkeypatch.setattr(
@@ -417,6 +424,8 @@ def test_legacy_artifact_upload_falls_back_to_separate_opaque_input(
     )
     monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
     origin = _turn_origin("discord", event_id="attachment-event")
+    source = tmp_path / "dashboard.png"
+    source.write_bytes(b"durable dashboard reference")
 
     with scoped_turn_origin(origin):
         result = json.loads(
@@ -424,7 +433,7 @@ def test_legacy_artifact_upload_falls_back_to_separate_opaque_input(
                 {
                     "action": "upload_artifact",
                     "thread_id": "planning-thread-1",
-                    "local_path": "/gateway/cache/dashboard.png",
+                    "local_path": str(source),
                     "role": "design_reference",
                     "position": 1,
                     "required": True,
@@ -435,11 +444,14 @@ def test_legacy_artifact_upload_falls_back_to_separate_opaque_input(
     upload = fake.upload_calls[0]
     appended = fake.append_calls[0]
     descriptor = appended["payload"]
-    assert upload["path"] == "/gateway/cache/dashboard.png"
+    assert upload["path"] != str(source)
+    assert Path(upload["path"]).name == source.name
+    assert upload["bytes"] == source.read_bytes()
     assert upload["idempotency_key"].startswith(
         "hermes-planning-artifact-v1:"
     )
-    assert "/gateway/cache/dashboard.png" not in upload["idempotency_key"]
+    assert str(source) not in upload["idempotency_key"]
+    assert not Path(upload["path"]).exists()
     assert appended["inputKind"] == "artifact"
     assert appended["origin"]["providerEventId"].startswith(
         "hermes-planning-artifact-input-v1:"
@@ -474,6 +486,7 @@ def test_legacy_artifact_upload_falls_back_to_separate_opaque_input(
 
 def test_convergent_artifact_upload_skips_legacy_append(
     monkeypatch,
+    tmp_path,
 ) -> None:
     class _ConvergentArtifactClient(_ArtifactClient):
         def upload_artifact(
@@ -531,6 +544,8 @@ def test_convergent_artifact_upload_skips_legacy_append(
         lambda _provider=None: True,
     )
     monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+    source = tmp_path / "research.pdf"
+    source.write_bytes(b"%PDF-1.7 durable research")
 
     with scoped_turn_origin(
         _turn_origin("teams", event_id="convergent-artifact-event")
@@ -540,7 +555,7 @@ def test_convergent_artifact_upload_skips_legacy_append(
                 {
                     "action": "upload_artifact",
                     "thread_id": "planning-thread-1",
-                    "local_path": "/gateway/cache/research.pdf",
+                    "local_path": str(source),
                     "role": "research_evidence",
                     "position": 2,
                     "required": False,
@@ -567,6 +582,7 @@ def test_convergent_artifact_upload_skips_legacy_append(
 
 def test_artifact_retry_identity_uses_ingress_attachment_not_model_labels(
     monkeypatch,
+    tmp_path,
 ) -> None:
     fake = _ArtifactClient()
     monkeypatch.setattr(
@@ -575,7 +591,9 @@ def test_artifact_retry_identity_uses_ingress_attachment_not_model_labels(
         lambda _provider=None: True,
     )
     monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
-    cached_path = "/gateway/cache/exact-upload.png"
+    source = tmp_path / "exact-upload.png"
+    source.write_bytes(b"exact immutable attachment")
+    cached_path = str(source)
     origin = replace(
         _turn_origin("discord", event_id="attachment-event"),
         attachments=(
@@ -625,6 +643,7 @@ def test_artifact_retry_identity_uses_ingress_attachment_not_model_labels(
 
 def test_artifact_upload_resolves_sandbox_cache_path_on_gateway(
     monkeypatch,
+    tmp_path,
 ) -> None:
     from tools import credential_files
 
@@ -635,7 +654,9 @@ def test_artifact_upload_resolves_sandbox_cache_path_on_gateway(
         lambda _provider=None: True,
     )
     monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
-    host_path = "/home/gateway/.hermes/cache/documents/schema.pdf"
+    source = tmp_path / "schema.pdf"
+    source.write_bytes(b"%PDF-1.7 schema")
+    host_path = str(source)
     sandbox_path = "/root/.hermes/cache/documents/schema.pdf"
     monkeypatch.setattr(
         credential_files,
@@ -667,11 +688,13 @@ def test_artifact_upload_resolves_sandbox_cache_path_on_gateway(
         )
 
     assert result["ok"] is True
-    assert fake.upload_calls[0]["path"] == host_path
+    assert fake.upload_calls[0]["path"] != host_path
+    assert fake.upload_calls[0]["bytes"] == source.read_bytes()
 
 
 def test_artifact_upload_has_exact_recovery_after_lost_response(
     monkeypatch,
+    tmp_path,
 ) -> None:
     class _LostArtifactClient(_ArtifactClient):
         def __init__(self) -> None:
@@ -687,7 +710,12 @@ def test_artifact_upload_has_exact_recovery_after_lost_response(
             if self.lose_first_response:
                 self.lose_first_response = False
                 self.upload_calls.append(
-                    {"threadId": thread_id, "path": path, **kwargs}
+                    {
+                        "threadId": thread_id,
+                        "path": path,
+                        "bytes": Path(path).read_bytes(),
+                        **kwargs,
+                    }
                 )
                 raise PlanningV2TransportError(
                     "planning.hub_timeout",
@@ -705,6 +733,8 @@ def test_artifact_upload_has_exact_recovery_after_lost_response(
         lambda _provider=None: True,
     )
     monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+    source = tmp_path / "schema.pdf"
+    source.write_bytes(b"%PDF-1.7 exact lost-response bytes")
 
     with scoped_turn_origin(
         _turn_origin("slack", event_id="lost-attachment-event")
@@ -714,7 +744,7 @@ def test_artifact_upload_has_exact_recovery_after_lost_response(
                 {
                     "action": "upload_artifact",
                     "thread_id": "planning-thread-1",
-                    "local_path": "/gateway/cache/schema.pdf",
+                    "local_path": str(source),
                     "role": "database_schema",
                     "position": 2,
                     "content_type": "application/pdf",
@@ -727,12 +757,15 @@ def test_artifact_upload_has_exact_recovery_after_lost_response(
     assert failure["outcomeAmbiguous"] is True
     assert failure["recovery"]["artifactUploadStarted"] is True
     assert recovery["action"] == "upload_artifact"
-    assert recovery["recovery_token"].startswith("artrec_v1_")
+    assert recovery["recovery_token"].startswith("artrec_v2_")
     assert recovery == {
         "action": "upload_artifact",
         "recovery_token": recovery["recovery_token"],
     }
-    assert "/gateway/cache/schema.pdf" not in json.dumps(failure)
+    assert str(source) not in json.dumps(failure)
+    first_spool_path = Path(fake.upload_calls[0]["path"])
+    assert first_spool_path.exists()
+    source.unlink()
 
     with scoped_turn_origin(
         _turn_origin("slack", event_id="recovery-turn-event")
@@ -743,9 +776,12 @@ def test_artifact_upload_has_exact_recovery_after_lost_response(
 
     assert recovered["ok"] is True
     assert recovered["inputStored"] is True
+    assert fake.upload_calls[0]["bytes"] == fake.upload_calls[1]["bytes"]
+    assert fake.upload_calls[0]["path"] == fake.upload_calls[1]["path"]
     assert fake.upload_calls[0]["idempotency_key"] == fake.upload_calls[1][
         "idempotency_key"
     ]
+    assert not first_spool_path.exists()
 
 
 def test_artifact_upload_requires_current_scoped_origin(monkeypatch) -> None:
@@ -776,6 +812,7 @@ def test_artifact_upload_requires_current_scoped_origin(monkeypatch) -> None:
 
 def test_artifact_recovery_token_rejects_model_path_or_metadata_overrides(
     monkeypatch,
+    tmp_path,
 ) -> None:
     fake = _ArtifactClient()
     monkeypatch.setattr(
@@ -785,12 +822,14 @@ def test_artifact_recovery_token_rejects_model_path_or_metadata_overrides(
     )
     monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
     scoped = _turn_origin("discord", event_id="artifact-recovery-origin")
+    source = tmp_path / "private.pdf"
+    source.write_bytes(b"%PDF-1.7 private")
 
     with scoped_turn_origin(scoped):
         wire_origin = fake.current_origin()
         token = planning_tool._register_artifact_recovery(
             thread_id="planning-thread-1",
-            local_path="/gateway/cache/private.pdf",
+            local_path=str(source),
             origin=wire_origin,
             role="database_schema",
             position=1,
@@ -801,22 +840,28 @@ def test_artifact_recovery_token_rejects_model_path_or_metadata_overrides(
             attachment_identity=None,
             ingress_ordinal=None,
         )
-        result = json.loads(
-            planning_tool._handle_planning_v2(
-                {
+        results = [
+            json.loads(
+                planning_tool._handle_planning_v2({
                     "action": "upload_artifact",
                     "recovery_token": token,
-                    "local_path": "/gateway/cache/replacement.pdf",
-                }
+                    **override,
+                })
             )
-        )
+            for override in (
+                {"local_path": "/gateway/cache/replacement.pdf"},
+                {"thread_id": "different-planning-thread"},
+            )
+        ]
 
-    assert result["code"] == "planning.artifact_recovery_ambiguous"
-    assert "/gateway/cache/private.pdf" not in json.dumps(result)
+    assert {
+        result["code"] for result in results
+    } == {"planning.artifact_recovery_ambiguous"}
+    assert str(source) not in json.dumps(results)
     assert fake.upload_calls == []
 
 
-def test_artifact_flow_has_no_total_count_cap(monkeypatch) -> None:
+def test_artifact_flow_has_no_total_count_cap(monkeypatch, tmp_path) -> None:
     fake = _ArtifactClient()
     monkeypatch.setattr(
         planning_tool,
@@ -824,6 +869,8 @@ def test_artifact_flow_has_no_total_count_cap(monkeypatch) -> None:
         lambda _provider=None: True,
     )
     monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+    source = tmp_path / "reference.png"
+    source.write_bytes(b"one source with 137 independent semantic positions")
 
     with scoped_turn_origin(
         _turn_origin("discord", event_id="many-attachments-event")
@@ -834,9 +881,7 @@ def test_artifact_flow_has_no_total_count_cap(monkeypatch) -> None:
                     {
                         "action": "upload_artifact",
                         "thread_id": "planning-thread-1",
-                        "local_path": (
-                            f"/gateway/cache/reference-{position}.png"
-                        ),
+                        "local_path": str(source),
                         "role": "design_reference",
                         "position": position,
                     }
