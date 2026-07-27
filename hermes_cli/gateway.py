@@ -4257,6 +4257,106 @@ def launchd_uninstall():
     print("✓ Service uninstalled")
 
 
+def _launchd_gateway_ready_snapshot(
+    label: str,
+    *,
+    previous_pid: int | None = None,
+) -> int | None:
+    """Return the ready launchd PID, never just a registered job.
+
+    ``launchctl kickstart`` returning zero proves only that launchd accepted
+    the request. A replacement is usable only after launchd exposes its PID,
+    Hermes runtime status belongs to that PID, and the event-loop heartbeat
+    reports a ready phase. Legacy heartbeats without ``phase`` remain
+    compatible once runtime status says ``running``.
+    """
+    try:
+        listed = subprocess.run(
+            ["launchctl", "list", label],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if listed.returncode != 0:
+        return None
+    pid = _parse_launchd_pid_from_list_output(listed.stdout)
+    if pid is None or (previous_pid is not None and pid == previous_pid):
+        return None
+
+    try:
+        from gateway.shutdown_watchdog import get_loop_heartbeat_path
+        from gateway.status import read_runtime_status
+
+        runtime = read_runtime_status()
+        heartbeat_path = get_loop_heartbeat_path()
+        heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+        runtime_pid = runtime.get("pid") if isinstance(runtime, dict) else None
+        heartbeat_pid = heartbeat.get("pid")
+        gateway_state = runtime.get("gateway_state") if isinstance(runtime, dict) else None
+        phase = heartbeat.get("phase")
+        heartbeat_age = time.time() - heartbeat_path.stat().st_mtime
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    if runtime_pid != pid or heartbeat_pid != pid:
+        return None
+    if gateway_state not in {"running", "degraded"}:
+        return None
+    if isinstance(phase, str) and phase.strip().lower() not in {
+        "running",
+        "degraded",
+    }:
+        return None
+    if heartbeat_age < -5.0 or heartbeat_age > 90.0:
+        return None
+    return pid
+
+
+def _wait_for_launchd_gateway_ready(
+    *,
+    previous_pid: int | None = None,
+    timeout: float = 120.0,
+) -> bool:
+    """Wait for two stable ready observations of a launchd replacement."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    stable_pid: int | None = None
+    stable = 0
+    while True:
+        pid = _launchd_gateway_ready_snapshot(
+            get_launchd_label(),
+            previous_pid=previous_pid,
+        )
+        if pid is None:
+            stable_pid = None
+            stable = 0
+        elif pid == stable_pid:
+            stable += 1
+        else:
+            stable_pid = pid
+            stable = 1
+        if stable >= 2:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(1.0, remaining))
+
+
+def _require_launchd_gateway_ready(
+    *,
+    action: str,
+    previous_pid: int | None = None,
+) -> None:
+    if _wait_for_launchd_gateway_ready(previous_pid=previous_pid):
+        return
+    raise RuntimeError(
+        f"launchd accepted gateway {action}, but no stable ready runtime "
+        "appeared within 120 seconds; leaving automatic recovery to launchd"
+    )
+
+
 def launchd_start():
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
@@ -4281,6 +4381,7 @@ def launchd_start():
                 raise
             _launchd_fallback_to_detached(f"launchctl exit {e.returncode}")
             return
+        _require_launchd_gateway_ready(action="start")
         print("✓ Service started")
         _clear_launchd_unsupported_marker()
         return
@@ -4311,6 +4412,7 @@ def launchd_start():
                 raise
             _launchd_fallback_to_detached(f"launchctl exit {e2.returncode}")
             return
+    _require_launchd_gateway_ready(action="start")
     print("✓ Service started")
     _clear_launchd_unsupported_marker()
 
@@ -4432,6 +4534,10 @@ def launchd_restart():
                         f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
                     )
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+        _require_launchd_gateway_ready(
+            action="restart",
+            previous_pid=pid,
+        )
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
     except subprocess.CalledProcessError as e:
@@ -4468,6 +4574,10 @@ def launchd_restart():
                 raise
             _launchd_fallback_to_detached(f"launchctl exit {e2.returncode}")
             return
+        _require_launchd_gateway_ready(
+            action="restart",
+            previous_pid=pid,
+        )
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
 

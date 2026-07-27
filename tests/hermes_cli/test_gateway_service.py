@@ -1,5 +1,6 @@
 """Tests for gateway service management helpers."""
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -624,6 +625,15 @@ class TestGatewayStopCleanup:
 
 
 class TestLaunchdServiceRecovery:
+    @pytest.fixture(autouse=True)
+    def _stable_launchd_runtime(self, monkeypatch):
+        """Most command-routing tests do not build runtime heartbeat files."""
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_gateway_ready",
+            lambda **_kwargs: True,
+        )
+
     def test_get_restart_drain_timeout_prefers_env_then_config_then_default(self, monkeypatch):
         monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
         monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
@@ -879,6 +889,88 @@ class TestLaunchdServiceRecovery:
         out = capsys.readouterr().out
         assert "draining in-flight runs" in out
         assert "up to 12s" in out
+
+    def test_launchd_restart_fails_when_kickstart_never_becomes_ready(
+        self,
+        monkeypatch,
+    ):
+        target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid",
+            lambda: 321,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_request_gateway_self_restart",
+            lambda _pid: False,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_gateway_exit",
+            lambda **_kwargs: True,
+        )
+        monkeypatch.setattr(gateway_cli, "terminate_pid", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_gateway_ready",
+            lambda **_kwargs: False,
+        )
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: calls.append(cmd)
+            or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        with pytest.raises(RuntimeError, match="no stable ready runtime"):
+            gateway_cli.launchd_restart()
+
+        # No second kickstart/restart is attempted by Hermes.
+        assert calls.count(["launchctl", "kickstart", "-k", target]) == 1
+
+    def test_launchd_ready_snapshot_requires_ready_phase_and_matching_pid(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        heartbeat = tmp_path / "gateway.heartbeat"
+        heartbeat.write_text(
+            json.dumps({"pid": 456, "phase": "platforms_connecting"}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(
+                returncode=0,
+                stdout='{\n"PID" = 456;\n}',
+                stderr="",
+            ),
+        )
+        monkeypatch.setattr(
+            "gateway.status.read_runtime_status",
+            lambda: {"pid": 456, "gateway_state": "running"},
+        )
+        monkeypatch.setattr(
+            "gateway.shutdown_watchdog.get_loop_heartbeat_path",
+            lambda: heartbeat,
+        )
+
+        assert gateway_cli._launchd_gateway_ready_snapshot("test") is None
+
+        heartbeat.write_text(
+            json.dumps({"pid": 456, "phase": "running"}),
+            encoding="utf-8",
+        )
+        assert gateway_cli._launchd_gateway_ready_snapshot("test") == 456
+        assert (
+            gateway_cli._launchd_gateway_ready_snapshot(
+                "test",
+                previous_pid=456,
+            )
+            is None
+        )
 
     def test_launchd_restart_self_requests_graceful_restart_without_kickstart(self, monkeypatch, capsys):
         calls = []

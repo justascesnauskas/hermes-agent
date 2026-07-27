@@ -54,6 +54,7 @@ _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.
 
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
+_MISSED_MESSAGE_RETRY_DUPLICATE_WINDOW_SECONDS = 600.0
 # Discord enforces a hard cap of 100 global application (slash) commands per
 # app. Registering more makes the ENTIRE sync fail with error 30032
 # ("Maximum number of application commands reached"), which silently breaks
@@ -2043,6 +2044,7 @@ class DiscordAdapter(BasePlatformAdapter):
         dispatched = 0
         scanned = 0
         missed = 0
+        recovered_retries: dict[tuple[str, str, str], float] = {}
         try:
             async for message in self._iter_missed_message_backfill_candidates(channels):
                 scanned += 1
@@ -2056,6 +2058,31 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not await self._should_backfill_discord_message(message):
                     continue
                 missed += 1
+                retry_fingerprint = self._missed_message_retry_fingerprint(message)
+                retry_created_at = self._missed_message_created_timestamp(message)
+                prior_retry_at = (
+                    recovered_retries.get(retry_fingerprint)
+                    if retry_fingerprint is not None
+                    else None
+                )
+                if (
+                    prior_retry_at is not None
+                    and retry_created_at is not None
+                    and abs(retry_created_at - prior_retry_at)
+                    <= _MISSED_MESSAGE_RETRY_DUPLICATE_WINDOW_SECONDS
+                ):
+                    self._record_recovery_attempt(
+                        message,
+                        status="superseded_duplicate",
+                    )
+                    logger.info(
+                        "[%s] Suppressed repeated missed Discord retry %s; "
+                        "an equivalent request from the same sender/channel "
+                        "was already recovered",
+                        self.name,
+                        message_id,
+                    )
+                    continue
                 logger.info(
                     "[%s] Backfilling missed Discord message %s in channel %s",
                     self.name,
@@ -2067,6 +2094,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     admitted = await self._dispatch_recovered_message(message)
                     if admitted:
                         dispatched += 1
+                        if (
+                            retry_fingerprint is not None
+                            and retry_created_at is not None
+                        ):
+                            recovered_retries[retry_fingerprint] = retry_created_at
                 except asyncio.CancelledError:
                     self._dedup.discard(message_id)
                     self._record_recovery_attempt(message, status="cancelled")
@@ -2113,6 +2145,34 @@ class DiscordAdapter(BasePlatformAdapter):
                 error=str(exc),
             )
             logger.warning("[%s] Missed-message backfill failed: %s", self.name, exc, exc_info=True)
+
+    @staticmethod
+    def _missed_message_created_timestamp(message: Any) -> Optional[float]:
+        created_at = getattr(message, "created_at", None)
+        if created_at is None or not hasattr(created_at, "timestamp"):
+            return None
+        try:
+            return float(created_at.timestamp())
+        except (OSError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _missed_message_retry_fingerprint(
+        message: Any,
+    ) -> Optional[tuple[str, str, str]]:
+        """Identify outage retries without conflating normal live messages."""
+        content = " ".join(str(getattr(message, "content", "") or "").split())
+        if not content:
+            return None
+        channel_id = str(
+            getattr(getattr(message, "channel", None), "id", "") or ""
+        )
+        author_id = str(
+            getattr(getattr(message, "author", None), "id", "") or ""
+        )
+        if not channel_id or not author_id:
+            return None
+        return channel_id, author_id, content.casefold()
 
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Run one recovered message through the live Discord ingress gates."""
@@ -2515,7 +2575,10 @@ class DiscordAdapter(BasePlatformAdapter):
             if not row:
                 return False
             status, replied, outage = row
-            return status == "responded" and bool(replied) and not bool(outage)
+            return (
+                status == "superseded_duplicate"
+                or (status == "responded" and bool(replied) and not bool(outage))
+            )
 
         return bool(self._with_discord_recovery_db(_op, default=False))
 

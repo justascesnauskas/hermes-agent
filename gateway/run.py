@@ -1953,6 +1953,7 @@ from gateway.shutdown_watchdog import (
     arm_shutdown_watchdog,
     loop_heartbeat_forever,
     resolve_shutdown_watchdog_delay,
+    write_loop_heartbeat,
 )
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
@@ -3478,6 +3479,7 @@ class GatewayRunner(
         # the loop is dispatching. External supervisors use the file mtime /
         # updated_at to distinguish "process alive" from "loop frozen".
         self._gateway_started_at: float = time.time()
+        self._gateway_startup_phase: str = "created"
         self._loop_heartbeat_task: Optional[asyncio.Task] = None
 
         # scale-to-zero (Phase 0, F13): gateway-scoped "last inbound seen" clock.
@@ -3490,6 +3492,38 @@ class GatewayRunner(
         # Set after a wake (re-arm cooldown, 0.F) so we don't immediately re-go
         # dormant before the drained backlog has a chance to update the clock.
         self._scale_to_zero_cooldown_until: float = 0.0
+
+    def _ensure_loop_heartbeat(self) -> None:
+        """Start the process-generation heartbeat before slow platform startup.
+
+        Supervisors must be able to distinguish a live gateway progressing
+        through Discord/plugin connection from a dead replacement. The phase
+        remains non-ready until startup completes, so activation verifiers
+        cannot mistake an early process heartbeat for a usable chat runtime.
+        """
+        try:
+            existing = getattr(self, "_loop_heartbeat_task", None)
+            if existing is not None and not existing.done():
+                return
+            self._loop_heartbeat_task = asyncio.create_task(
+                loop_heartbeat_forever(
+                    interval_s=DEFAULT_HEARTBEAT_INTERVAL_S,
+                    start_time=getattr(self, "_gateway_started_at", 0.0),
+                    extra_fn=lambda: {
+                        "phase": getattr(
+                            self,
+                            "_gateway_startup_phase",
+                            "unknown",
+                        ),
+                    },
+                )
+            )
+            background = getattr(self, "_background_tasks", None)
+            if background is not None:
+                background.add(self._loop_heartbeat_task)
+                self._loop_heartbeat_task.add_done_callback(background.discard)
+        except Exception:
+            logger.debug("Failed to start gateway loop heartbeat", exc_info=True)
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -7359,6 +7393,8 @@ class GatewayRunner(
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        self._gateway_startup_phase = "booting"
+        self._ensure_loop_heartbeat()
         try:
             self._gateway_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -7676,6 +7712,7 @@ class GatewayRunner(
         enabled_platform_count = 0
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
+        self._gateway_startup_phase = "platforms_connecting"
         
         # Initialize and connect each configured platform
         _multiplex_on = bool(getattr(self.config, "multiplex_profiles", False))
@@ -7932,27 +7969,22 @@ class GatewayRunner(
         self._wire_teams_pipeline_runtime()
 
         self._running = True
+        self._gateway_startup_phase = (
+            "degraded"
+            if enabled_platform_count > 0 and connected_count == 0
+            else "running"
+        )
+        write_loop_heartbeat(
+            start_time=getattr(self, "_gateway_started_at", 0.0),
+            extra={"phase": self._gateway_startup_phase},
+        )
         self._update_runtime_status("running")
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
         # other background tasks during stop(). Best-effort — a liveness probe
         # must never be able to abort startup.
-        try:
-            _existing_hb = getattr(self, "_loop_heartbeat_task", None)
-            if _existing_hb is None or _existing_hb.done():
-                self._loop_heartbeat_task = asyncio.create_task(
-                    loop_heartbeat_forever(
-                        interval_s=DEFAULT_HEARTBEAT_INTERVAL_S,
-                        start_time=getattr(self, "_gateway_started_at", 0.0),
-                    )
-                )
-                _bg = getattr(self, "_background_tasks", None)
-                if _bg is not None:
-                    _bg.add(self._loop_heartbeat_task)
-                    self._loop_heartbeat_task.add_done_callback(_bg.discard)
-        except Exception:
-            logger.debug("Failed to start gateway loop heartbeat", exc_info=True)
+        self._ensure_loop_heartbeat()
 
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
