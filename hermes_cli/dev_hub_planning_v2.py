@@ -16,6 +16,7 @@ opted-in planning action lives in :mod:`tools.dev_hub_planning_tool`.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -32,6 +33,7 @@ from typing import (
     Iterator,
     Literal,
     Mapping,
+    NotRequired,
     Optional,
     TypeVar,
     TypedDict,
@@ -364,6 +366,11 @@ class PlanningArtifactUploadDTO(TypedDict):
     disposition: str
     artifact: PlanningArtifactDTO
     reference: PlanningArtifactReferenceDTO
+    artifactInput: NotRequired[dict[str, Any]]
+    inputStored: NotRequired[bool]
+    inputReplayed: NotRequired[bool]
+    previewInvalidated: NotRequired[bool]
+    inputEvent: NotRequired[dict[str, Any]]
 
 
 class PlanningClaimProjection(TypedDict):
@@ -1145,6 +1152,8 @@ class PlanningV2Client:
         request_path: str,
         content_type: str,
         idempotency_key: str,
+        planning_input_origin: Optional[str] = None,
+        planning_input_required: Optional[bool] = None,
         expected_statuses: frozenset[int],
     ) -> PlanningV2Response[Any]:
         """Stream one exact local file and reopen it for replay-safe retries."""
@@ -1223,6 +1232,26 @@ class PlanningV2Client:
         }
         if filename is not None:
             headers["X-Artifact-Filename"] = filename
+        if (planning_input_origin is None) != (
+            planning_input_required is None
+        ):
+            raise PlanningV2ConfigError(
+                "planning.artifact_input_contract_incomplete"
+            )
+        if planning_input_origin is not None:
+            if (
+                not planning_input_origin
+                or len(planning_input_origin.encode("ascii")) > 8 * 1024
+                or "\r" in planning_input_origin
+                or "\n" in planning_input_origin
+            ):
+                raise PlanningV2ConfigError(
+                    "planning.artifact_input_origin_invalid"
+                )
+            headers["X-Planning-Input-Origin"] = planning_input_origin
+            headers["X-Planning-Input-Required"] = (
+                "true" if planning_input_required else "false"
+            )
 
         attempts = 0
         while True:
@@ -1799,10 +1828,13 @@ class PlanningV2Client:
         cls,
         response: PlanningV2Response[Any],
         *,
+        thread_id: str,
         role: str,
         position: int,
         size_bytes: int,
         content_type: str,
+        input_origin: Optional[PlanningOriginPayload],
+        required: Optional[bool],
     ) -> PlanningV2Response[Any]:
         payload = cls._require_fields(
             response,
@@ -1956,6 +1988,90 @@ class PlanningV2Client:
                 response,
                 context="planning artifact upload response",
                 detail="artifact timestamps and retention policy are required",
+            )
+
+        convergence_fields = {
+            "artifactInput",
+            "inputStored",
+            "inputReplayed",
+            "previewInvalidated",
+            "inputEvent",
+        }
+        present_fields = convergence_fields.intersection(payload)
+        if present_fields and present_fields != convergence_fields:
+            cls._shape_error(
+                response,
+                context="planning artifact upload response",
+                detail=(
+                    "convergent artifact input fields must be returned "
+                    "together"
+                ),
+            )
+        if not present_fields:
+            return response
+        if input_origin is None or required is None:
+            cls._shape_error(
+                response,
+                context="planning artifact upload response",
+                detail=(
+                    "convergent artifact input fields were returned without "
+                    "a requested immutable input contract"
+                ),
+            )
+        if (
+            not isinstance(payload["artifactInput"], dict)
+            or payload["inputStored"] is not True
+            or not isinstance(payload["inputReplayed"], bool)
+            or not isinstance(payload["previewInvalidated"], bool)
+            or not isinstance(payload["inputEvent"], dict)
+        ):
+            cls._shape_error(
+                response,
+                context="planning artifact upload response",
+                detail="convergent artifact input fields have invalid types",
+            )
+
+        descriptor: dict[str, Any] = {
+            "schemaVersion": "1.0",
+            "artifactId": blob_id,
+            "artifactRef": artifact_ref,
+            "sourceReference": artifact_ref,
+            "referenceId": reference["referenceId"],
+            "checksum": artifact["checksum"],
+            "sizeBytes": artifact["sizeBytes"],
+            "contentType": artifact["contentType"],
+            "role": reference["role"],
+            "position": reference["position"],
+            "required": required,
+        }
+        provenance = reference["provenance"]
+        filename = provenance.get("filename")
+        if isinstance(filename, str) and filename.strip():
+            descriptor["filename"] = filename
+        if payload["artifactInput"] != descriptor:
+            cls._shape_error(
+                response,
+                context="planning artifact upload response",
+                detail="artifactInput does not match the stored artifact identity",
+            )
+
+        input_event = payload["inputEvent"]
+        if (
+            not _text(input_event.get("eventId"))
+            or input_event.get("threadId") != _text(thread_id)
+            or input_event.get("inputKind") != "artifact"
+            or input_event.get("payload") != descriptor
+            or input_event.get("origin") != dict(input_origin)
+            or input_event.get("causationId")
+            != input_origin["providerEventId"]
+        ):
+            cls._shape_error(
+                response,
+                context="planning artifact upload response",
+                detail=(
+                    "inputEvent does not prove the exact artifact input "
+                    "identity"
+                ),
             )
         return response
 
@@ -2168,6 +2284,8 @@ class PlanningV2Client:
         idempotency_key: str,
         content_type: Optional[str] = None,
         retain_until: Optional[str] = None,
+        input_origin: Optional[PlanningOriginPayload] = None,
+        required: Optional[bool] = None,
     ) -> PlanningV2Response[PlanningArtifactUploadDTO]:
         """Stream and attach one file without embedding its bytes in JSON."""
 
@@ -2194,6 +2312,91 @@ class PlanningV2Client:
             raise PlanningV2ConfigError(
                 "planning.artifact_position_invalid",
                 detail="Artifact position must be a positive integer.",
+            )
+        if (input_origin is None) != (required is None):
+            raise PlanningV2ConfigError(
+                "planning.artifact_input_contract_incomplete",
+                detail=(
+                    "input_origin and required must be supplied together for "
+                    "a convergent artifact upload."
+                ),
+            )
+        encoded_input_origin: Optional[str] = None
+        if input_origin is not None:
+            if not isinstance(required, bool):
+                raise PlanningV2ConfigError(
+                    "planning.artifact_input_required_invalid"
+                )
+            if not isinstance(input_origin, Mapping):
+                raise PlanningV2ConfigError(
+                    "planning.artifact_input_origin_invalid"
+                )
+            exact_origin = dict(input_origin)
+            origin_fields = {
+                "schemaVersion",
+                "provider",
+                "gatewayInstanceId",
+                "gatewayAccountId",
+                "chatId",
+                "threadId",
+                "messageId",
+                "senderId",
+                "chatType",
+                "sourceTimestamp",
+                "providerEventId",
+            }
+            required_text_fields = origin_fields - {
+                "threadId",
+                "chatType",
+                "sourceTimestamp",
+            }
+            nullable_fields = {"threadId", "chatType", "sourceTimestamp"}
+            if (
+                set(exact_origin) != origin_fields
+                or exact_origin.get("schemaVersion")
+                != PLANNING_V2_ORIGIN_SCHEMA_VERSION
+                or exact_origin.get("gatewayInstanceId") != self.runner_id
+                or not all(
+                    isinstance(exact_origin.get(name), str)
+                    and bool(exact_origin.get(name))
+                    and exact_origin.get(name)
+                    == exact_origin.get(name).strip()
+                    for name in required_text_fields
+                )
+                or any(
+                    exact_origin.get(name) is not None
+                    and (
+                        not isinstance(exact_origin.get(name), str)
+                        or not exact_origin.get(name)
+                        or exact_origin.get(name)
+                        != exact_origin.get(name).strip()
+                    )
+                    for name in nullable_fields
+                )
+                or exact_origin.get("provider")
+                != _text(exact_origin.get("provider")).lower()
+            ):
+                raise PlanningV2ConfigError(
+                    "planning.artifact_input_origin_invalid"
+                )
+            try:
+                source_timestamp = _validate_source_timestamp(
+                    exact_origin["sourceTimestamp"]
+                )
+            except PlanningV2OriginError as exc:
+                raise PlanningV2ConfigError(
+                    "planning.artifact_input_origin_invalid",
+                    detail=exc.detail,
+                ) from exc
+            if source_timestamp != exact_origin["sourceTimestamp"]:
+                raise PlanningV2ConfigError(
+                    "planning.artifact_input_origin_invalid"
+                )
+            canonical_origin = _canonical_json(exact_origin).encode("utf-8")
+            encoded_input_origin = (
+                base64.urlsafe_b64encode(canonical_origin)
+                .decode("ascii")
+                .rstrip("=")
             )
 
         source = Path(str(path))
@@ -2224,16 +2427,21 @@ class PlanningV2Client:
             ),
             content_type=media_type,
             idempotency_key=idempotency_key,
+            planning_input_origin=encoded_input_origin,
+            planning_input_required=required,
             expected_statuses=frozenset({200, 201}),
         )
         return cast(
             PlanningV2Response[PlanningArtifactUploadDTO],
             self._validate_artifact_upload(
                 response,
+                thread_id=thread_id,
                 role=artifact_role,
                 position=artifact_position,
                 size_bytes=size_bytes,
                 content_type=media_type,
+                input_origin=input_origin,
+                required=required,
             ),
         )
 

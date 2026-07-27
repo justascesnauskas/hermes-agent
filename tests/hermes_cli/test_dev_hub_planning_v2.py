@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from io import BytesIO
 import json
@@ -257,11 +258,14 @@ def _artifact_upload_projection(
     disposition: str = "committed",
     role: str = "design_reference",
     position: int = 1,
+    input_origin: dict[str, Any] | None = None,
+    required: bool = True,
+    input_replayed: bool = False,
 ) -> dict[str, Any]:
     checksum = f"sha256:{hashlib.sha256(content).hexdigest()}"
     blob_id = "ablob_0123456789abcdef"
     artifact_ref = f"planning-artifact-v1:{blob_id}"
-    return {
+    projection: dict[str, Any] = {
         "ok": True,
         "storage": {"mode": "local", "reason": "local_fallback"},
         "disposition": disposition,
@@ -290,6 +294,38 @@ def _artifact_upload_projection(
             "releasedAt": None,
         },
     }
+    if input_origin is not None:
+        descriptor = {
+            "schemaVersion": "1.0",
+            "artifactId": blob_id,
+            "artifactRef": artifact_ref,
+            "sourceReference": artifact_ref,
+            "referenceId": "aref_0123456789abcdef",
+            "checksum": checksum,
+            "sizeBytes": len(content),
+            "contentType": "image/png",
+            "role": role,
+            "position": position,
+            "required": required,
+            "filename": "dashboard.png",
+        }
+        projection.update(
+            {
+                "artifactInput": descriptor,
+                "inputStored": True,
+                "inputReplayed": input_replayed,
+                "previewInvalidated": False,
+                "inputEvent": {
+                    "eventId": "input-artifact-1",
+                    "threadId": "thread-1",
+                    "inputKind": "artifact",
+                    "payload": descriptor,
+                    "origin": input_origin,
+                    "causationId": input_origin["providerEventId"],
+                },
+            }
+        )
+    return projection
 
 
 def test_client_exposes_complete_exact_runner_surface() -> None:
@@ -742,15 +778,24 @@ def test_artifact_upload_streams_raw_file_and_replays_lost_response(
     content = b"\x89PNG\r\n\x1a\nraw-binary-evidence\x00\xff"
     source = tmp_path / "dashboard.png"
     source.write_bytes(content)
+    origin = _origin()
+    artifact_origin = derive_artifact_input_origin(
+        origin,
+        runner_id="runner-1",
+        thread_id="thread-1",
+        role="design_reference",
+        position=1,
+    )
     projection = _artifact_upload_projection(
         content,
         disposition="replayed",
+        input_origin=artifact_origin,
+        input_replayed=True,
     )
     transport = _ScriptedTransport(
         TimeoutError("upload response lost after commit"),
         _Response(201, projection),
     )
-    origin = _origin()
     key = derive_artifact_idempotency_key(
         runner_id="runner-1",
         thread_id="thread-1",
@@ -767,6 +812,8 @@ def test_artifact_upload_streams_raw_file_and_replays_lost_response(
         role="design_reference",
         position=1,
         idempotency_key=key,
+        input_origin=artifact_origin,
+        required=True,
     )
 
     assert response.payload == projection
@@ -793,7 +840,107 @@ def test_artifact_upload_streams_raw_file_and_replays_lost_response(
         call["headers"]["x-artifact-filename"] == "dashboard.png"
         for call in transport.calls
     )
+    expected_origin_header = (
+        base64.urlsafe_b64encode(
+            json.dumps(
+                artifact_origin,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    assert all(
+        call["headers"]["x-planning-input-origin"]
+        == expected_origin_header
+        for call in transport.calls
+    )
+    assert all(
+        call["headers"]["x-planning-input-required"] == "true"
+        for call in transport.calls
+    )
+    assert response.payload["inputStored"] is True
+    assert response.payload["inputReplayed"] is True
     assert b"base64" not in transport.calls[0]["body"]
+
+
+def test_artifact_upload_preserves_conflicting_origin_hub_failure(
+    tmp_path,
+) -> None:
+    content = b"exact immutable evidence"
+    source = tmp_path / "dashboard.png"
+    source.write_bytes(content)
+    first_origin = derive_artifact_input_origin(
+        _origin(),
+        runner_id="runner-1",
+        thread_id="thread-1",
+        role="design_reference",
+        position=1,
+    )
+    changed_source = _origin()
+    changed_source["providerEventId"] = "discord-event-conflict"
+    changed_origin = derive_artifact_input_origin(
+        changed_source,
+        runner_id="runner-1",
+        thread_id="thread-1",
+        role="design_reference",
+        position=1,
+    )
+    conflict_payload = {
+        "ok": False,
+        "code": "artifact.ingest_idempotency_conflict",
+        "detail": "ingest key was already committed with another origin",
+    }
+    transport = _ScriptedTransport(
+        _Response(
+            201,
+            _artifact_upload_projection(
+                content,
+                input_origin=first_origin,
+            ),
+        ),
+        error.HTTPError(
+            "https://hub.example.test",
+            409,
+            "Conflict",
+            {},
+            BytesIO(json.dumps(conflict_payload).encode("utf-8")),
+        ),
+    )
+    client = _client(transport)
+    kwargs = {
+        "role": "design_reference",
+        "position": 1,
+        "idempotency_key": "hermes-planning-artifact-v1:stable",
+        "required": True,
+    }
+
+    client.upload_artifact(
+        "thread-1",
+        str(source),
+        input_origin=first_origin,
+        **kwargs,
+    )
+    with pytest.raises(PlanningV2HTTPError) as captured:
+        client.upload_artifact(
+            "thread-1",
+            str(source),
+            input_origin=changed_origin,
+            **kwargs,
+        )
+
+    assert captured.value.status == 409
+    assert (
+        captured.value.code == "artifact.ingest_idempotency_conflict"
+    )
+    assert transport.calls[0]["headers"]["idempotency-key"] == (
+        transport.calls[1]["headers"]["idempotency-key"]
+    )
+    assert transport.calls[0]["headers"]["x-planning-input-origin"] != (
+        transport.calls[1]["headers"]["x-planning-input-origin"]
+    )
 
 
 def test_artifact_upload_rejects_mismatched_success_identity(
@@ -817,6 +964,41 @@ def test_artifact_upload_rejects_mismatched_success_identity(
 
     assert captured.value.code == "planning.hub_response_invalid"
     assert "identity mismatch" in str(captured.value.detail)
+
+
+def test_artifact_upload_rejects_unproven_convergent_input_identity(
+    tmp_path,
+) -> None:
+    content = b"exact evidence"
+    source = tmp_path / "dashboard.png"
+    source.write_bytes(content)
+    artifact_origin = derive_artifact_input_origin(
+        _origin(),
+        runner_id="runner-1",
+        thread_id="thread-1",
+        role="design_reference",
+        position=1,
+    )
+    malformed = _artifact_upload_projection(
+        content,
+        input_origin=artifact_origin,
+    )
+    malformed["artifactInput"]["referenceId"] = "another-reference"
+    transport = _ScriptedTransport(_Response(201, malformed))
+
+    with pytest.raises(PlanningV2ProtocolError) as captured:
+        _client(transport).upload_artifact(
+            "thread-1",
+            str(source),
+            role="design_reference",
+            position=1,
+            idempotency_key="hermes-planning-artifact-v1:stable",
+            input_origin=artifact_origin,
+            required=True,
+        )
+
+    assert captured.value.code == "planning.hub_response_invalid"
+    assert "artifactInput" in str(captured.value.detail)
 
 
 def test_artifact_identity_is_stable_scoped_and_preserves_turn_origin() -> None:

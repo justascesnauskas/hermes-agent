@@ -398,7 +398,7 @@ class _ArtifactClient:
         )
 
 
-def test_artifact_upload_uses_current_origin_and_appends_opaque_input(
+def test_legacy_artifact_upload_falls_back_to_separate_opaque_input(
     monkeypatch,
 ) -> None:
     fake = _ArtifactClient()
@@ -462,6 +462,99 @@ def test_artifact_upload_uses_current_origin_and_appends_opaque_input(
             "thread_id": "planning-thread-1",
         },
     }
+
+
+def test_convergent_artifact_upload_skips_legacy_append(
+    monkeypatch,
+) -> None:
+    class _ConvergentArtifactClient(_ArtifactClient):
+        def upload_artifact(
+            self,
+            thread_id: str,
+            path: str,
+            **kwargs: Any,
+        ) -> PlanningV2Response[dict[str, Any]]:
+            response = super().upload_artifact(thread_id, path, **kwargs)
+            artifact = response.payload["artifact"]
+            reference = response.payload["reference"]
+            descriptor = {
+                "schemaVersion": "1.0",
+                "artifactId": artifact["blobId"],
+                "artifactRef": artifact["artifactRef"],
+                "sourceReference": artifact["artifactRef"],
+                "referenceId": reference["referenceId"],
+                "checksum": artifact["checksum"],
+                "sizeBytes": artifact["sizeBytes"],
+                "contentType": artifact["contentType"],
+                "role": reference["role"],
+                "position": reference["position"],
+                "required": kwargs["required"],
+                "filename": path.rsplit("/", 1)[-1],
+            }
+            response.payload.update(
+                {
+                    "disposition": "replayed",
+                    "artifactInput": descriptor,
+                    "inputStored": True,
+                    "inputReplayed": True,
+                    "previewInvalidated": True,
+                    "inputEvent": {
+                        "eventId": "input-artifact-1",
+                        "threadId": thread_id,
+                        "inputKind": "artifact",
+                        "payload": descriptor,
+                        "origin": kwargs["input_origin"],
+                        "causationId": kwargs["input_origin"][
+                            "providerEventId"
+                        ],
+                    },
+                }
+            )
+            return PlanningV2Response(
+                201,
+                response.payload,
+                transport_attempts=2,
+            )
+
+    fake = _ConvergentArtifactClient()
+    monkeypatch.setattr(
+        planning_tool,
+        "_profile_opted_in",
+        lambda _provider=None: True,
+    )
+    monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
+
+    with scoped_turn_origin(
+        _turn_origin("teams", event_id="convergent-artifact-event")
+    ):
+        result = json.loads(
+            planning_tool._handle_planning_v2(
+                {
+                    "action": "upload_artifact",
+                    "thread_id": "planning-thread-1",
+                    "local_path": "/gateway/cache/research.pdf",
+                    "role": "research_evidence",
+                    "position": 2,
+                    "required": False,
+                    "content_type": "application/pdf",
+                }
+            )
+        )
+
+    upload = fake.upload_calls[0]
+    assert upload["required"] is False
+    assert upload["input_origin"]["provider"] == "teams"
+    assert upload["input_origin"]["providerEventId"].startswith(
+        "hermes-planning-artifact-input-v1:"
+    )
+    assert fake.append_calls == []
+    assert result["inputStored"] is True
+    assert result["inputReplayed"] is True
+    assert result["previewInvalidated"] is True
+    assert result["uploadReplayed"] is True
+    assert result["artifact"]["artifactRef"] == "planning-artifact-v1:blob-2"
+    assert result["artifact"]["role"] == "research_evidence"
+    assert result["artifact"]["required"] is False
 
 
 def test_artifact_retry_identity_uses_ingress_attachment_not_model_labels(

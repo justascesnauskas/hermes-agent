@@ -1082,6 +1082,15 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                 "artifactIdempotencyKey": idempotency_key,
                 "_recoveryArguments": recovery_arguments,
             }
+            artifact_origin = derive_artifact_input_origin(
+                origin,
+                runner_id=client.runner_id,
+                thread_id=thread_id,
+                role=role,
+                position=position,
+                attachment_identity=attachment_identity,
+                ingress_ordinal=ingress_ordinal,
+            )
             upload_response = client.upload_artifact(
                 thread_id,
                 local_path,
@@ -1090,6 +1099,8 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                 idempotency_key=idempotency_key,
                 content_type=content_type,
                 retain_until=retain_until,
+                input_origin=artifact_origin,
+                required=required,
             )
             upload = upload_response.payload
             artifact = upload["artifact"]
@@ -1123,25 +1134,33 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
             )
             if isinstance(filename, str) and filename.strip():
                 descriptor["filename"] = filename
-            artifact_origin = derive_artifact_input_origin(
-                origin,
-                runner_id=client.runner_id,
-                thread_id=thread_id,
-                role=role,
-                position=position,
-                attachment_identity=attachment_identity,
-                ingress_ordinal=ingress_ordinal,
-            )
-            input_response = client.append_thread_input(
-                thread_id,
-                origin=artifact_origin,
-                payload=descriptor,
-                input_kind="artifact",
-            )
+            convergence_fields = {
+                "artifactInput",
+                "inputStored",
+                "inputReplayed",
+                "previewInvalidated",
+                "inputEvent",
+            }
+            convergent_upload = convergence_fields.issubset(upload)
+            if convergent_upload:
+                descriptor = dict(upload["artifactInput"])
+                input_replayed = bool(upload["inputReplayed"])
+                preview_invalidated = bool(upload["previewInvalidated"])
+            else:
+                input_response = client.append_thread_input(
+                    thread_id,
+                    origin=artifact_origin,
+                    payload=descriptor,
+                    input_kind="artifact",
+                )
+                input_replayed = bool(
+                    input_response.payload.get("duplicate")
+                )
+                preview_invalidated = bool(
+                    input_response.payload.get("previewInvalidated")
+                )
             partial["inputStored"] = True
-            partial["inputReplayed"] = bool(
-                input_response.payload.get("duplicate")
-            )
+            partial["inputReplayed"] = input_replayed
             _finish_artifact_recovery(recovery_token)
             return tool_result(
                 {
@@ -1155,12 +1174,8 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                         upload["disposition"] == "replayed"
                     ),
                     "inputStored": True,
-                    "inputReplayed": bool(
-                        input_response.payload.get("duplicate")
-                    ),
-                    "previewInvalidated": bool(
-                        input_response.payload.get("previewInvalidated")
-                    ),
+                    "inputReplayed": input_replayed,
+                    "previewInvalidated": preview_invalidated,
                     "nextStep": (
                         "Upload every remaining attachment with its own role "
                         "and 1-based position. After all artifacts are stored "
