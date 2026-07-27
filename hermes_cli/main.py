@@ -10736,9 +10736,12 @@ def _resolve_update_branch(args) -> str:
     Centralizes the "default to main, accept --branch override, treat empty
     or whitespace-only values as the default" parsing so every consumer of
     ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
-    the same answer.
+    the same answer. Managed distributions may pin their reviewed branch via
+    ``HERMES_UPDATE_BRANCH``; an explicit CLI flag always wins.
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    explicit = (getattr(args, "branch", None) or "").strip()
+    managed = os.getenv("HERMES_UPDATE_BRANCH", "").strip()
+    return explicit or managed or "main"
 
 
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
@@ -12279,6 +12282,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
+                managed_branch = os.getenv("HERMES_UPDATE_BRANCH", "").strip()
+                if managed_branch:
+                    # A managed distribution pins a reviewed fast-forward
+                    # history. Divergence is therefore evidence that this
+                    # checkout needs operator attention, not permission to
+                    # discard local commits. The generic interactive updater
+                    # retains its historical reset fallback below.
+                    print(
+                        "✗ Managed update refused: the local checkout cannot "
+                        f"fast-forward to origin/{branch}."
+                    )
+                    print(
+                        "  Local history was preserved. Ask the distribution "
+                        "operator to inspect this checkout."
+                    )
+                    sys.exit(1)
                 # ff-only failed — local and remote have diverged (e.g. upstream
                 # force-pushed or rebase).  Since local changes are already
                 # stashed, reset to match the remote exactly.
