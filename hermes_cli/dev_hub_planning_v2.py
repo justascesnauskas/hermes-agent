@@ -274,6 +274,12 @@ class PlanningThreadMutation(PlanningThreadProjection, total=False):
     previewInvalidated: bool
 
 
+class PlanningThreadResolution(TypedDict):
+    match: Literal["none", "one", "ambiguous"]
+    matchCount: int
+    threads: list[PlanningThreadDTO]
+
+
 class PlanningEventsProjection(TypedDict):
     threadId: str
     afterSequence: int
@@ -1413,6 +1419,48 @@ class PlanningV2Client:
         return response
 
     @classmethod
+    def _validate_thread_resolution(
+        cls,
+        response: PlanningV2Response[Any],
+    ) -> PlanningV2Response[Any]:
+        payload = cls._require_fields(
+            response,
+            context="planning current thread response",
+            fields={
+                "match": str,
+                "matchCount": int,
+                "threads": list,
+            },
+        )
+        threads = payload["threads"]
+        if any(
+            not isinstance(thread, Mapping)
+            or not _text(thread.get("threadId"))
+            or not _text(thread.get("title"))
+            for thread in threads
+        ):
+            cls._shape_error(
+                response,
+                context="planning current thread response",
+                detail="every thread requires a threadId and title",
+            )
+        count = payload["matchCount"]
+        expected_match = (
+            "none" if count == 0 else "one" if count == 1 else "ambiguous"
+        )
+        if (
+            count < 0
+            or count != len(threads)
+            or payload["match"] != expected_match
+        ):
+            cls._shape_error(
+                response,
+                context="planning current thread response",
+                detail="match, matchCount, and threads are inconsistent",
+            )
+        return response
+
+    @classmethod
     def _validate_run_projection(
         cls,
         response: PlanningV2Response[Any],
@@ -2321,6 +2369,24 @@ class PlanningV2Client:
         return cast(
             PlanningV2Response[PlanningThreadProjection],
             self._validate_thread_projection(response),
+        )
+
+    def resolve_current_thread(
+        self,
+        *,
+        origin: PlanningOriginPayload,
+    ) -> PlanningV2Response[PlanningThreadResolution]:
+        """Resolve the exact active thread set for the current channel origin."""
+
+        response = self._request(
+            "POST",
+            f"{PLANNING_V2_PREFIX}/threads/resolve-current",
+            body={"origin": dict(origin)},
+            retry_safe=True,
+        )
+        return cast(
+            PlanningV2Response[PlanningThreadResolution],
+            self._validate_thread_resolution(response),
         )
 
     def append_thread_input(
@@ -3285,6 +3351,7 @@ __all__ = [
     "PlanningRunDTO",
     "PlanningThreadMutation",
     "PlanningThreadProjection",
+    "PlanningThreadResolution",
     "PlanningV2Client",
     "PlanningV2ClientError",
     "PlanningV2ConfigError",

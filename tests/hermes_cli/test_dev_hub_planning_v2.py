@@ -1402,6 +1402,75 @@ def test_duplicate_provider_webhook_recovers_after_transport_timeout() -> None:
     assert "idempotency-key" not in transport.calls[0]["headers"]
 
 
+def test_current_thread_resolution_preserves_exact_origin_and_all_choices() -> None:
+    choices = [
+        {
+            "threadId": "thread-2",
+            "title": "API migration",
+            "status": "active",
+        },
+        {
+            "threadId": "thread-1",
+            "title": "Dashboard implementation",
+            "status": "waiting",
+        },
+    ]
+    transport = _ScriptedTransport(
+        _Response(
+            200,
+            {
+                "match": "ambiguous",
+                "matchCount": 2,
+                "threads": choices,
+            },
+        )
+    )
+    client = _client(transport)
+    origin = _origin()
+
+    response = client.resolve_current_thread(origin=origin)
+
+    assert response.payload["threads"] == choices
+    assert len(transport.calls) == 1
+    call = transport.calls[0]
+    assert call["method"] == "POST"
+    assert call["url"] == (
+        "https://hub.example.test"
+        f"{PLANNING_V2_PREFIX}/threads/resolve-current"
+    )
+    assert json.loads(call["body"]) == {"origin": origin}
+    assert "idempotency-key" not in call["headers"]
+    assert call["bodyIsStream"] is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"match": "one", "matchCount": 0, "threads": []},
+        {
+            "match": "ambiguous",
+            "matchCount": 1,
+            "threads": [{"threadId": "thread-1", "title": "One"}],
+        },
+        {
+            "match": "one",
+            "matchCount": 1,
+            "threads": [{"threadId": "thread-1"}],
+        },
+    ],
+)
+def test_current_thread_resolution_rejects_inconsistent_or_untitled_choices(
+    payload: dict[str, Any],
+) -> None:
+    transport = _ScriptedTransport(_Response(200, payload))
+
+    with pytest.raises(PlanningV2ProtocolError) as captured:
+        _client(transport).resolve_current_thread(origin=_origin())
+
+    assert captured.value.code == "planning.hub_response_invalid"
+    assert captured.value.status == 200
+
+
 def test_typed_hub_failure_preserves_service_code_status_and_detail() -> None:
     payload = {
         "ok": False,
