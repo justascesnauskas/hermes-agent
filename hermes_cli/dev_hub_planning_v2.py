@@ -16,7 +16,6 @@ opted-in planning action lives in :mod:`tools.dev_hub_planning_tool`.
 
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -56,6 +55,7 @@ DEFAULT_TIMEOUT_SECONDS = 20.0
 DEFAULT_TRANSPORT_RETRIES = 1
 DEFAULT_LEASE_SECONDS = 300
 MAX_PREVIEW_PAGE_SIZE = 200
+DEFAULT_ARTIFACT_CHUNK_BYTES = 8 * 1024 * 1024
 _ARTIFACT_ROLE_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,119}$")
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -389,6 +389,18 @@ class PlanningArtifactUploadDTO(TypedDict):
     inputReplayed: NotRequired[bool]
     previewInvalidated: NotRequired[bool]
     inputEvent: NotRequired[dict[str, Any]]
+
+
+class PlanningArtifactUploadSessionDTO(TypedDict):
+    uploadId: str
+    state: Literal["receiving", "completed"]
+    contractHash: str
+    nextOffset: int
+    totalSizeBytes: int
+    checksum: str
+    contentType: str
+    maxChunkBytes: int
+    canFinalize: bool
 
 
 class PlanningClaimProjection(TypedDict):
@@ -1203,6 +1215,104 @@ class PlanningV2Client:
                 transport_attempts=attempts,
             )
 
+    def _request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: bytes,
+        headers: Mapping[str, str],
+        expected_statuses: frozenset[int],
+        retry_safe: bool,
+    ) -> PlanningV2Response[Any]:
+        """Send one bounded immutable byte range with replay-safe retries."""
+
+        if not isinstance(body, bytes):
+            raise PlanningV2ConfigError(
+                "planning.artifact_chunk_invalid",
+                detail="Artifact chunk body must be immutable bytes.",
+            )
+        request_headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.token}",
+            "User-Agent": (
+                f"hermes-agent/dev-hub-planning-v2-"
+                f"{PLANNING_V2_CLIENT_VERSION}"
+            ),
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(body)),
+        }
+        for raw_name, raw_value in headers.items():
+            name = _text(raw_name)
+            value = str(raw_value)
+            if (
+                not name
+                or "\r" in name
+                or "\n" in name
+                or "\r" in value
+                or "\n" in value
+            ):
+                raise PlanningV2ConfigError(
+                    "planning.artifact_chunk_header_invalid"
+                )
+            request_headers[name] = value
+
+        attempts = 0
+        while True:
+            attempts += 1
+            req = request.Request(
+                f"{self.base_url}{path}",
+                data=body,
+                headers=request_headers,
+                method=method,
+            )
+            response: Any = None
+            try:
+                response = self._transport(req, timeout=self.timeout)
+                raw = response.read()
+                status = int(response.status)
+            except error.HTTPError as exc:
+                response = exc
+                raw = exc.read()
+                status = int(exc.code)
+            except (error.URLError, TimeoutError, OSError) as exc:
+                if retry_safe and attempts <= self.max_transport_retries:
+                    self._sleep(min(0.5, 0.05 * (2 ** (attempts - 1))))
+                    continue
+                code = (
+                    "planning.hub_timeout"
+                    if _is_timeout(exc)
+                    else "planning.hub_unreachable"
+                )
+                raise PlanningV2TransportError(
+                    code,
+                    detail=(
+                        "Dev Hub artifact chunk upload timed out."
+                        if code.endswith("timeout")
+                        else (
+                            "Dev Hub could not be reached for artifact "
+                            "chunk upload."
+                        )
+                    ),
+                    retryable=retry_safe,
+                    ambiguous=method != "GET",
+                    attempts=attempts,
+                ) from exc
+            finally:
+                if response is not None:
+                    close = getattr(response, "close", None)
+                    if callable(close):
+                        close()
+
+            payload = self._decode_payload(raw, status=status)
+            if status not in expected_statuses:
+                self._raise_http_error(status=status, payload=payload)
+            return PlanningV2Response(
+                status=status,
+                payload=payload,
+                transport_attempts=attempts,
+            )
+
     def _request_file(
         self,
         path: str,
@@ -1993,6 +2103,84 @@ class PlanningV2Client:
         return response
 
     @classmethod
+    def _validate_artifact_upload_session(
+        cls,
+        response: PlanningV2Response[Any],
+        *,
+        contract_hash: str,
+        total_size_bytes: int,
+        checksum: str,
+        content_type: str,
+        expected_upload_id: Optional[str] = None,
+    ) -> PlanningV2Response[Any]:
+        payload = cls._require_fields(
+            response,
+            context="planning artifact upload session",
+            fields={
+                "ok": bool,
+                "replayed": bool,
+                "upload": dict,
+            },
+        )
+        upload = payload["upload"]
+        required_fields: dict[str, type] = {
+            "uploadId": str,
+            "state": str,
+            "contractHash": str,
+            "nextOffset": int,
+            "totalSizeBytes": int,
+            "checksum": str,
+            "contentType": str,
+            "maxChunkBytes": int,
+            "canFinalize": bool,
+        }
+        for name, expected_type in required_fields.items():
+            value = upload.get(name)
+            valid = isinstance(value, expected_type)
+            if expected_type is int and isinstance(value, bool):
+                valid = False
+            if not valid:
+                cls._shape_error(
+                    response,
+                    context="planning artifact upload session",
+                    detail=f"upload.{name} has an invalid type",
+                )
+        upload_id = _text(upload["uploadId"])
+        next_offset = upload["nextOffset"]
+        maximum = upload["maxChunkBytes"]
+        if (
+            payload["ok"] is not True
+            or not upload_id
+            or upload["state"] not in {"receiving", "completed"}
+            or upload["contractHash"] != contract_hash
+            or upload["totalSizeBytes"] != total_size_bytes
+            or upload["checksum"] != checksum
+            or upload["contentType"] != content_type
+            or next_offset < 0
+            or next_offset > total_size_bytes
+            or maximum < 1
+            or upload["canFinalize"]
+            is not (next_offset == total_size_bytes)
+            or (
+                upload["state"] == "completed"
+                and next_offset != total_size_bytes
+            )
+            or (
+                expected_upload_id is not None
+                and upload_id != expected_upload_id
+            )
+        ):
+            cls._shape_error(
+                response,
+                context="planning artifact upload session",
+                detail=(
+                    "upload identity, immutable contract, authoritative "
+                    "offset, or continuation budget is inconsistent"
+                ),
+            )
+        return response
+
+    @classmethod
     def _validate_artifact_upload(
         cls,
         response: PlanningV2Response[Any],
@@ -2002,6 +2190,7 @@ class PlanningV2Client:
         position: int,
         size_bytes: int,
         content_type: str,
+        checksum: str,
         input_origin: Optional[PlanningOriginPayload],
         required: Optional[bool],
     ) -> PlanningV2Response[Any]:
@@ -2106,11 +2295,17 @@ class PlanningV2Client:
                 context="planning artifact upload response",
                 detail="artifact and reference identities are inconsistent",
             )
-        if not _SHA256_RE.fullmatch(_text(artifact["checksum"])):
+        if (
+            not _SHA256_RE.fullmatch(_text(artifact["checksum"]))
+            or artifact["checksum"] != checksum
+        ):
             cls._shape_error(
                 response,
                 context="planning artifact upload response",
-                detail="artifact.checksum must be a lowercase sha256 digest",
+                detail=(
+                    "artifact.checksum must equal the exact uploaded "
+                    "lowercase sha256 digest"
+                ),
             )
         if artifact["sizeBytes"] < 0 or not _text(artifact["contentType"]):
             cls._shape_error(
@@ -2589,7 +2784,7 @@ class PlanningV2Client:
                     "a convergent artifact upload."
                 ),
             )
-        encoded_input_origin: Optional[str] = None
+        planning_input: Optional[dict[str, Any]] = None
         if input_origin is not None:
             if not isinstance(required, bool):
                 raise PlanningV2ConfigError(
@@ -2660,56 +2855,261 @@ class PlanningV2Client:
                 raise PlanningV2ConfigError(
                     "planning.artifact_input_origin_invalid"
                 )
-            canonical_origin = _canonical_json(exact_origin).encode("utf-8")
-            encoded_input_origin = (
-                base64.urlsafe_b64encode(canonical_origin)
-                .decode("ascii")
-                .rstrip("=")
-            )
+            planning_input = {
+                "origin": exact_origin,
+                "required": required,
+            }
 
         source = Path(str(path))
+        if not source.is_absolute():
+            raise PlanningV2ConfigError(
+                "planning.artifact_path_invalid",
+                detail=(
+                    "Artifact path must be the exact absolute private "
+                    "gateway snapshot."
+                ),
+            )
         try:
-            size_bytes = source.stat().st_size
+            initial_stat = source.stat()
         except OSError as exc:
             raise PlanningV2ConfigError(
                 "planning.artifact_file_unreadable",
-                detail="The gateway-cached attachment is not readable.",
+                detail="The private gateway attachment snapshot is not readable.",
             ) from exc
+        if not source.is_file():
+            raise PlanningV2ConfigError(
+                "planning.artifact_path_invalid",
+                detail="Artifact path must identify a regular file.",
+            )
+        size_bytes = initial_stat.st_size
         media_type = (
             _text(content_type).split(";", 1)[0].strip().lower()
             or mimetypes.guess_type(source.name)[0]
             or "application/octet-stream"
         )
-        query_values: dict[str, Any] = {
+        if (
+            "/" not in media_type
+            or len(media_type) > 255
+            or "\r" in media_type
+            or "\n" in media_type
+        ):
+            raise PlanningV2ConfigError(
+                "planning.artifact_content_type_invalid"
+            )
+        filename: Optional[str] = source.name
+        if (
+            not filename
+            or len(filename) > 255
+            or "/" in filename
+            or "\\" in filename
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in filename
+            )
+        ):
+            raise PlanningV2ConfigError(
+                "planning.artifact_filename_invalid"
+            )
+
+        def unchanged(candidate: os.stat_result) -> bool:
+            initial_mtime = getattr(
+                initial_stat,
+                "st_mtime_ns",
+                int(initial_stat.st_mtime * 1e9),
+            )
+            candidate_mtime = getattr(
+                candidate,
+                "st_mtime_ns",
+                int(candidate.st_mtime * 1e9),
+            )
+            return (
+                candidate.st_dev == initial_stat.st_dev
+                and candidate.st_ino == initial_stat.st_ino
+                and candidate.st_size == initial_stat.st_size
+                and candidate_mtime == initial_mtime
+            )
+
+        digest = hashlib.sha256()
+        try:
+            with source.open("rb") as stream:
+                while True:
+                    block = stream.read(1024 * 1024)
+                    if not block:
+                        break
+                    digest.update(block)
+            after_hash = source.stat()
+        except OSError as exc:
+            raise PlanningV2ConfigError(
+                "planning.artifact_file_unreadable",
+                detail="The private gateway attachment snapshot is not readable.",
+            ) from exc
+        if not unchanged(after_hash):
+            raise PlanningV2ConfigError(
+                "planning.artifact_file_changed",
+                detail=(
+                    "The private attachment snapshot changed while Hermes "
+                    "prepared its resumable upload."
+                ),
+            )
+        checksum = f"sha256:{digest.hexdigest()}"
+        upload_contract: dict[str, Any] = {
+            "schemaVersion": "1.0",
+            "totalSizeBytes": size_bytes,
+            "checksum": checksum,
+            "contentType": media_type,
+            "filename": filename,
             "role": artifact_role,
             "position": artifact_position,
         }
         if retain_until is not None:
-            query_values["retainUntil"] = str(retain_until)
-        query = parse.urlencode(query_values)
-        response = self._request_file(
-            str(path),
-            request_path=(
-                f"{PLANNING_V2_PREFIX}/threads/"
-                f"{self._quoted(thread_id)}/artifacts?{query}"
-            ),
-            content_type=media_type,
+            upload_contract["retainUntil"] = str(retain_until)
+        if planning_input is not None:
+            upload_contract["planningInput"] = planning_input
+        contract_hash = "sha256:" + hashlib.sha256(
+            _canonical_json(upload_contract).encode("utf-8")
+        ).hexdigest()
+        thread_path = (
+            f"{PLANNING_V2_PREFIX}/threads/{self._quoted(thread_id)}"
+        )
+        initiation = self._request(
+            "POST",
+            f"{thread_path}/artifact-uploads",
+            body=upload_contract,
             idempotency_key=idempotency_key,
-            planning_input_origin=encoded_input_origin,
-            planning_input_required=required,
             expected_statuses=frozenset({200, 201}),
+            retry_safe=True,
+        )
+        initiation = self._validate_artifact_upload_session(
+            initiation,
+            contract_hash=contract_hash,
+            total_size_bytes=size_bytes,
+            checksum=checksum,
+            content_type=media_type,
+        )
+        upload = initiation.payload["upload"]
+        upload_id = str(upload["uploadId"])
+        next_offset = int(upload["nextOffset"])
+        maximum = int(upload["maxChunkBytes"])
+        attempts = initiation.transport_attempts
+
+        while next_offset < size_bytes:
+            try:
+                current_stat = source.stat()
+                if not unchanged(current_stat):
+                    raise PlanningV2ConfigError(
+                        "planning.artifact_file_changed",
+                        detail=(
+                            "The private attachment snapshot changed while "
+                            "its upload was in progress."
+                        ),
+                    )
+                chunk_size = min(
+                    maximum,
+                    DEFAULT_ARTIFACT_CHUNK_BYTES,
+                    size_bytes - next_offset,
+                )
+                with source.open("rb") as stream:
+                    stream.seek(next_offset)
+                    chunk = stream.read(chunk_size)
+            except PlanningV2ClientError:
+                raise
+            except OSError as exc:
+                raise PlanningV2ConfigError(
+                    "planning.artifact_file_unreadable",
+                    detail=(
+                        "The private gateway attachment snapshot is not readable."
+                    ),
+                ) from exc
+            if len(chunk) != chunk_size or not chunk:
+                raise PlanningV2ConfigError(
+                    "planning.artifact_file_changed",
+                    detail=(
+                        "The private attachment snapshot no longer contains "
+                        "the exact expected byte range."
+                    ),
+                )
+            chunk_checksum = "sha256:" + hashlib.sha256(chunk).hexdigest()
+            chunk_response = self._request_bytes(
+                "PUT",
+                (
+                    f"{thread_path}/artifact-uploads/"
+                    f"{self._quoted(upload_id)}/chunks/{next_offset}"
+                ),
+                body=chunk,
+                headers={"X-Chunk-SHA256": chunk_checksum},
+                expected_statuses=frozenset({200, 201}),
+                retry_safe=True,
+            )
+            attempts += chunk_response.transport_attempts
+            chunk_response = self._validate_artifact_upload_session(
+                chunk_response,
+                contract_hash=contract_hash,
+                total_size_bytes=size_bytes,
+                checksum=checksum,
+                content_type=media_type,
+                expected_upload_id=upload_id,
+            )
+            committed_offset = int(
+                chunk_response.payload["upload"]["nextOffset"]
+            )
+            if committed_offset != next_offset + len(chunk):
+                self._shape_error(
+                    chunk_response,
+                    context="planning artifact upload session",
+                    detail=(
+                        "a successful chunk response did not advance exactly "
+                        "over the submitted immutable byte range"
+                    ),
+                )
+            next_offset = committed_offset
+            maximum = int(
+                chunk_response.payload["upload"]["maxChunkBytes"]
+            )
+
+        try:
+            if not unchanged(source.stat()):
+                raise PlanningV2ConfigError(
+                    "planning.artifact_file_changed",
+                    detail=(
+                        "The private attachment snapshot changed before "
+                        "upload finalization."
+                    ),
+                )
+        except PlanningV2ClientError:
+            raise
+        except OSError as exc:
+            raise PlanningV2ConfigError(
+                "planning.artifact_file_unreadable",
+                detail="The private gateway attachment snapshot is not readable.",
+            ) from exc
+
+        finalized = self._request(
+            "POST",
+            (
+                f"{thread_path}/artifact-uploads/"
+                f"{self._quoted(upload_id)}/finalize"
+            ),
+            expected_statuses=frozenset({200, 201}),
+            retry_safe=True,
+        )
+        attempts += finalized.transport_attempts
+        validated = self._validate_artifact_upload(
+            finalized,
+            thread_id=thread_id,
+            role=artifact_role,
+            position=artifact_position,
+            size_bytes=size_bytes,
+            content_type=media_type,
+            checksum=checksum,
+            input_origin=input_origin,
+            required=required,
         )
         return cast(
             PlanningV2Response[PlanningArtifactUploadDTO],
-            self._validate_artifact_upload(
-                response,
-                thread_id=thread_id,
-                role=artifact_role,
-                position=artifact_position,
-                size_bytes=size_bytes,
-                content_type=media_type,
-                input_origin=input_origin,
-                required=required,
+            PlanningV2Response(
+                status=validated.status,
+                payload=validated.payload,
+                transport_attempts=attempts,
             ),
         )
 
@@ -3457,6 +3857,7 @@ class PlanningV2Client:
 
 
 __all__ = [
+    "DEFAULT_ARTIFACT_CHUNK_BYTES",
     "DEFAULT_LEASE_SECONDS",
     "MAX_PREVIEW_PAGE_SIZE",
     "PLANNING_V2_PREFIX",
@@ -3469,6 +3870,7 @@ __all__ = [
     "PlanningInputsPage",
     "PlanningArtifactDTO",
     "PlanningArtifactReferenceDTO",
+    "PlanningArtifactUploadSessionDTO",
     "PlanningArtifactUploadDTO",
     "PlanningOriginPayload",
     "PlanningApplyDTO",

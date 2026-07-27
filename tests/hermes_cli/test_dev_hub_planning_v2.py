@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
 from io import BytesIO
 import json
@@ -375,6 +374,66 @@ def _artifact_upload_projection(
             }
         )
     return projection
+
+
+def _artifact_upload_contract(
+    content: bytes,
+    *,
+    role: str = "design_reference",
+    position: int = 1,
+    input_origin: dict[str, Any] | None = None,
+    required: bool = True,
+    filename: str = "dashboard.png",
+    content_type: str = "image/png",
+) -> dict[str, Any]:
+    contract: dict[str, Any] = {
+        "schemaVersion": "1.0",
+        "totalSizeBytes": len(content),
+        "checksum": f"sha256:{hashlib.sha256(content).hexdigest()}",
+        "contentType": content_type,
+        "filename": filename,
+        "role": role,
+        "position": position,
+    }
+    if input_origin is not None:
+        contract["planningInput"] = {
+            "origin": input_origin,
+            "required": required,
+        }
+    return contract
+
+
+def _artifact_upload_session_projection(
+    contract: dict[str, Any],
+    *,
+    next_offset: int,
+    max_chunk_bytes: int = 8 * 1024 * 1024,
+    replayed: bool = False,
+    state: str = "receiving",
+) -> dict[str, Any]:
+    contract_hash = "sha256:" + hashlib.sha256(
+        json.dumps(
+            contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "ok": True,
+        "replayed": replayed,
+        "upload": {
+            "uploadId": "aupload_0123456789abcdef",
+            "state": state,
+            "contractHash": contract_hash,
+            "nextOffset": next_offset,
+            "totalSizeBytes": contract["totalSizeBytes"],
+            "checksum": contract["checksum"],
+            "contentType": contract["contentType"],
+            "maxChunkBytes": max_chunk_bytes,
+            "canFinalize": next_offset == contract["totalSizeBytes"],
+        },
+    }
 
 
 def test_client_exposes_complete_exact_runner_surface() -> None:
@@ -844,7 +903,7 @@ def test_preview_schema_rejects_early_review_completion_or_wrong_page_digest(
         assert detail in str(captured.value.detail)
 
 
-def test_artifact_upload_streams_raw_file_and_replays_lost_response(
+def test_artifact_upload_resumes_raw_chunk_after_lost_response(
     tmp_path,
 ) -> None:
     content = b"\x89PNG\r\n\x1a\nraw-binary-evidence\x00\xff"
@@ -864,8 +923,29 @@ def test_artifact_upload_streams_raw_file_and_replays_lost_response(
         input_origin=artifact_origin,
         input_replayed=True,
     )
+    contract = _artifact_upload_contract(
+        content,
+        input_origin=artifact_origin,
+    )
     transport = _ScriptedTransport(
-        TimeoutError("upload response lost after commit"),
+        _Response(
+            201,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=0,
+                max_chunk_bytes=len(content),
+            ),
+        ),
+        TimeoutError("chunk response lost after commit"),
+        _Response(
+            200,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=len(content),
+                max_chunk_bytes=len(content),
+                replayed=True,
+            ),
+        ),
         _Response(201, projection),
     )
     key = derive_artifact_idempotency_key(
@@ -889,53 +969,174 @@ def test_artifact_upload_streams_raw_file_and_replays_lost_response(
     )
 
     assert response.payload == projection
-    assert response.transport_attempts == 2
-    assert [call["body"] for call in transport.calls] == [content, content]
-    assert all(call["bodyIsStream"] for call in transport.calls)
+    assert response.transport_attempts == 4
+    assert json.loads(transport.calls[0]["body"]) == contract
+    assert [call["body"] for call in transport.calls[1:3]] == [
+        content,
+        content,
+    ]
+    assert not any(call["bodyIsStream"] for call in transport.calls)
     assert transport.calls[0]["url"] == (
         f"https://hub.example.test{PLANNING_V2_PREFIX}/threads/thread-1"
-        "/artifacts?role=design_reference&position=1"
+        "/artifact-uploads"
     )
-    assert all(
-        call["headers"]["idempotency-key"] == key
-        for call in transport.calls
+    assert transport.calls[1]["url"].endswith(
+        "/artifact-uploads/aupload_0123456789abcdef/chunks/0"
     )
-    assert all(
-        call["headers"]["content-type"] == "image/png"
-        for call in transport.calls
+    assert transport.calls[3]["url"].endswith(
+        "/artifact-uploads/aupload_0123456789abcdef/finalize"
+    )
+    assert transport.calls[0]["headers"]["idempotency-key"] == key
+    assert transport.calls[0]["headers"]["content-type"] == (
+        "application/json"
     )
     assert all(
         call["headers"]["content-length"] == str(len(content))
-        for call in transport.calls
+        for call in transport.calls[1:3]
+    )
+    expected_chunk_checksum = (
+        f"sha256:{hashlib.sha256(content).hexdigest()}"
     )
     assert all(
-        call["headers"]["x-artifact-filename"] == "dashboard.png"
-        for call in transport.calls
-    )
-    expected_origin_header = (
-        base64.urlsafe_b64encode(
-            json.dumps(
-                artifact_origin,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
-        .decode("ascii")
-        .rstrip("=")
-    )
-    assert all(
-        call["headers"]["x-planning-input-origin"]
-        == expected_origin_header
-        for call in transport.calls
-    )
-    assert all(
-        call["headers"]["x-planning-input-required"] == "true"
-        for call in transport.calls
+        call["headers"]["x-chunk-sha256"] == expected_chunk_checksum
+        for call in transport.calls[1:3]
     )
     assert response.payload["inputStored"] is True
     assert response.payload["inputReplayed"] is True
-    assert b"base64" not in transport.calls[0]["body"]
+    assert contract["planningInput"]["origin"] == artifact_origin
+
+
+def test_artifact_upload_resumes_from_server_offset_and_honors_chunk_budget(
+    tmp_path,
+) -> None:
+    content = b"0123456789"
+    source = tmp_path / "dashboard.png"
+    source.write_bytes(content)
+    contract = _artifact_upload_contract(content)
+    transport = _ScriptedTransport(
+        _Response(
+            200,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=4,
+                max_chunk_bytes=3,
+                replayed=True,
+            ),
+        ),
+        _Response(
+            201,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=7,
+                max_chunk_bytes=3,
+            ),
+        ),
+        _Response(
+            201,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=10,
+                max_chunk_bytes=3,
+            ),
+        ),
+        _Response(201, _artifact_upload_projection(content)),
+    )
+
+    result = _client(transport).upload_artifact(
+        "thread-1",
+        str(source),
+        role="design_reference",
+        position=1,
+        idempotency_key="hermes-planning-artifact-v1:resume",
+    )
+
+    assert result.payload["artifact"]["sizeBytes"] == len(content)
+    assert [call["body"] for call in transport.calls[1:3]] == [
+        content[4:7],
+        content[7:10],
+    ]
+    assert transport.calls[1]["url"].endswith("/chunks/4")
+    assert transport.calls[2]["url"].endswith("/chunks/7")
+    assert content[:4] not in [
+        call["body"] for call in transport.calls[1:3]
+    ]
+
+
+def test_artifact_upload_completed_init_replays_finalize_without_chunks(
+    tmp_path,
+) -> None:
+    content = b"already committed bytes"
+    source = tmp_path / "dashboard.png"
+    source.write_bytes(content)
+    contract = _artifact_upload_contract(content)
+    projection = _artifact_upload_projection(
+        content,
+        disposition="replayed",
+    )
+    projection["sessionReplayed"] = True
+    transport = _ScriptedTransport(
+        _Response(
+            200,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=len(content),
+                max_chunk_bytes=4,
+                replayed=True,
+                state="completed",
+            ),
+        ),
+        TimeoutError("finalize response lost"),
+        _Response(200, projection),
+    )
+
+    result = _client(transport).upload_artifact(
+        "thread-1",
+        str(source),
+        role="design_reference",
+        position=1,
+        idempotency_key="hermes-planning-artifact-v1:finalize-replay",
+    )
+
+    assert result.payload["sessionReplayed"] is True
+    assert result.transport_attempts == 3
+    assert len(transport.calls) == 3
+    assert all(call["body"] is None for call in transport.calls[1:])
+    assert all(
+        call["url"].endswith(
+            "/artifact-uploads/aupload_0123456789abcdef/finalize"
+        )
+        for call in transport.calls[1:]
+    )
+
+
+def test_zero_byte_artifact_finalizes_without_empty_chunk(tmp_path) -> None:
+    content = b""
+    source = tmp_path / "dashboard.png"
+    source.write_bytes(content)
+    contract = _artifact_upload_contract(content)
+    transport = _ScriptedTransport(
+        _Response(
+            201,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=0,
+                max_chunk_bytes=5,
+            ),
+        ),
+        _Response(201, _artifact_upload_projection(content)),
+    )
+
+    result = _client(transport).upload_artifact(
+        "thread-1",
+        str(source),
+        role="design_reference",
+        position=1,
+        idempotency_key="hermes-planning-artifact-v1:empty",
+    )
+
+    assert result.payload["artifact"]["sizeBytes"] == 0
+    assert len(transport.calls) == 2
+    assert transport.calls[1]["url"].endswith("/finalize")
 
 
 def test_artifact_upload_preserves_conflicting_origin_hub_failure(
@@ -962,10 +1163,30 @@ def test_artifact_upload_preserves_conflicting_origin_hub_failure(
     )
     conflict_payload = {
         "ok": False,
-        "code": "artifact.ingest_idempotency_conflict",
-        "detail": "ingest key was already committed with another origin",
+        "code": "planning.artifact_upload_contract_conflict",
+        "detail": "upload key was already initialized with another origin",
     }
+    first_contract = _artifact_upload_contract(
+        content,
+        input_origin=first_origin,
+    )
     transport = _ScriptedTransport(
+        _Response(
+            201,
+            _artifact_upload_session_projection(
+                first_contract,
+                next_offset=0,
+                max_chunk_bytes=len(content),
+            ),
+        ),
+        _Response(
+            201,
+            _artifact_upload_session_projection(
+                first_contract,
+                next_offset=len(content),
+                max_chunk_bytes=len(content),
+            ),
+        ),
         _Response(
             201,
             _artifact_upload_projection(
@@ -1005,13 +1226,13 @@ def test_artifact_upload_preserves_conflicting_origin_hub_failure(
 
     assert captured.value.status == 409
     assert (
-        captured.value.code == "artifact.ingest_idempotency_conflict"
+        captured.value.code == "planning.artifact_upload_contract_conflict"
     )
     assert transport.calls[0]["headers"]["idempotency-key"] == (
-        transport.calls[1]["headers"]["idempotency-key"]
+        transport.calls[3]["headers"]["idempotency-key"]
     )
-    assert transport.calls[0]["headers"]["x-planning-input-origin"] != (
-        transport.calls[1]["headers"]["x-planning-input-origin"]
+    assert json.loads(transport.calls[0]["body"])["planningInput"] != (
+        json.loads(transport.calls[3]["body"])["planningInput"]
     )
 
 
@@ -1023,7 +1244,26 @@ def test_artifact_upload_rejects_mismatched_success_identity(
     source.write_bytes(content)
     malformed = _artifact_upload_projection(content)
     malformed["reference"]["position"] = 2
-    transport = _ScriptedTransport(_Response(201, malformed))
+    contract = _artifact_upload_contract(content)
+    transport = _ScriptedTransport(
+        _Response(
+            201,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=0,
+                max_chunk_bytes=len(content),
+            ),
+        ),
+        _Response(
+            201,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=len(content),
+                max_chunk_bytes=len(content),
+            ),
+        ),
+        _Response(201, malformed),
+    )
 
     with pytest.raises(PlanningV2ProtocolError) as captured:
         _client(transport).upload_artifact(
@@ -1056,7 +1296,29 @@ def test_artifact_upload_rejects_unproven_convergent_input_identity(
         input_origin=artifact_origin,
     )
     malformed["artifactInput"]["referenceId"] = "another-reference"
-    transport = _ScriptedTransport(_Response(201, malformed))
+    contract = _artifact_upload_contract(
+        content,
+        input_origin=artifact_origin,
+    )
+    transport = _ScriptedTransport(
+        _Response(
+            201,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=0,
+                max_chunk_bytes=len(content),
+            ),
+        ),
+        _Response(
+            201,
+            _artifact_upload_session_projection(
+                contract,
+                next_offset=len(content),
+                max_chunk_bytes=len(content),
+            ),
+        ),
+        _Response(201, malformed),
+    )
 
     with pytest.raises(PlanningV2ProtocolError) as captured:
         _client(transport).upload_artifact(
