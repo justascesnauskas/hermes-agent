@@ -17,6 +17,7 @@ import time
 from typing import Any, Mapping, Optional
 
 from hermes_cli.dev_hub_planning_v2 import (
+    PlanningInputIdentity,
     PlanningOriginPayload,
     PlanningRunDTO,
     PlanningThreadProjection,
@@ -57,6 +58,13 @@ class _ArtifactRecovery:
     retain_until: Optional[str]
     attachment_identity: Optional[str]
     ingress_ordinal: Optional[int]
+
+
+@dataclass(frozen=True, slots=True)
+class _RunAdmission:
+    idempotency_key: str
+    expected_basis_input_sequence: Optional[int]
+    expected_input_digest: Optional[str]
 
 
 _artifact_recoveries: OrderedDict[str, _ArtifactRecovery] = OrderedDict()
@@ -397,18 +405,25 @@ def _semantic_result(
     return result
 
 
-def _run_key(
+def _run_admission(
     args: Mapping[str, Any],
     *,
     client: PlanningV2Client,
     thread_id: str,
     origin: Optional[PlanningOriginPayload],
-) -> str:
+) -> _RunAdmission:
     explicit = str(args.get("idempotency_key") or "").strip()
     if explicit:
-        return explicit
+        expected_basis, expected_digest = _run_input_precondition(args)
+        return _RunAdmission(
+            idempotency_key=explicit,
+            expected_basis_input_sequence=expected_basis,
+            expected_input_digest=expected_digest,
+        )
     resolved_origin = origin or client.current_origin()
-    input_identity = client.get_thread_input_identity(thread_id)
+    input_identity: PlanningInputIdentity = (
+        client.get_thread_input_identity(thread_id)
+    )
     run_policy = _mapping(args, "run_policy")
     route_policy = _mapping(args, "route_policy")
     correlation_id = (
@@ -416,31 +431,84 @@ def _run_key(
         if args.get("correlation_id") is not None
         else None
     )
-    return derive_run_idempotency_key(
-        runner_id=client.runner_id,
-        thread_id=thread_id,
-        provider=resolved_origin["provider"],
-        gateway_account_id=resolved_origin["gatewayAccountId"],
-        provider_event_id=resolved_origin["providerEventId"],
-        basis_input_sequence=input_identity["basisInputSequence"],
-        input_digest=input_identity["inputDigest"],
-        policy=run_policy,
-        route_policy=route_policy,
-        correlation_id=correlation_id,
+    return _RunAdmission(
+        idempotency_key=derive_run_idempotency_key(
+            runner_id=client.runner_id,
+            thread_id=thread_id,
+            provider=resolved_origin["provider"],
+            gateway_account_id=resolved_origin["gatewayAccountId"],
+            provider_event_id=resolved_origin["providerEventId"],
+            basis_input_sequence=input_identity["basisInputSequence"],
+            input_digest=input_identity["inputDigest"],
+            policy=run_policy,
+            route_policy=route_policy,
+            correlation_id=correlation_id,
+        ),
+        expected_basis_input_sequence=input_identity["basisInputSequence"],
+        expected_input_digest=input_identity["inputDigest"],
     )
+
+
+def _run_input_precondition(
+    args: Mapping[str, Any],
+) -> tuple[Optional[int], Optional[str]]:
+    basis_value = args.get("expected_basis_input_sequence")
+    digest_value = args.get("expected_input_digest")
+    has_basis = basis_value is not None
+    has_digest = digest_value is not None
+    if has_basis != has_digest:
+        raise PlanningV2ConfigError(
+            "planning.run_input_precondition_incomplete",
+            detail=(
+                "expected_basis_input_sequence and expected_input_digest must "
+                "be supplied together."
+            ),
+        )
+    if not has_basis:
+        return None, None
+    if isinstance(basis_value, bool):
+        raise PlanningV2ConfigError(
+            "planning.run_input_basis_invalid",
+            detail=(
+                "expected_basis_input_sequence must be a positive integer."
+            ),
+        )
+    try:
+        basis = int(basis_value)
+    except (TypeError, ValueError) as exc:
+        raise PlanningV2ConfigError(
+            "planning.run_input_basis_invalid",
+            detail=(
+                "expected_basis_input_sequence must be a positive integer."
+            ),
+        ) from exc
+    if basis < 1:
+        raise PlanningV2ConfigError(
+            "planning.run_input_basis_invalid",
+            detail=(
+                "expected_basis_input_sequence must be a positive integer."
+            ),
+        )
+    return basis, str(digest_value)
 
 
 def _run_recovery_arguments(
     args: Mapping[str, Any],
     *,
     thread_id: str,
-    idempotency_key: str,
+    admission: _RunAdmission,
 ) -> dict[str, Any]:
     recovery: dict[str, Any] = {
         "action": "start_run",
         "thread_id": thread_id,
-        "idempotency_key": idempotency_key,
+        "idempotency_key": admission.idempotency_key,
     }
+    if admission.expected_basis_input_sequence is not None:
+        recovery["expected_basis_input_sequence"] = (
+            admission.expected_basis_input_sequence
+        )
+    if admission.expected_input_digest is not None:
+        recovery["expected_input_digest"] = admission.expected_input_digest
     for source, target in (
         ("run_policy", "run_policy"),
         ("route_policy", "route_policy"),
@@ -726,19 +794,17 @@ def _start_run(
     *,
     thread_id: str,
     origin: Optional[PlanningOriginPayload],
-    idempotency_key: Optional[str] = None,
+    admission: Optional[_RunAdmission] = None,
 ):
+    resolved_admission = admission or _run_admission(
+        args,
+        client=client,
+        thread_id=thread_id,
+        origin=origin,
+    )
     return client.create_run(
         thread_id,
-        idempotency_key=(
-            idempotency_key
-            or _run_key(
-                args,
-                client=client,
-                thread_id=thread_id,
-                origin=origin,
-            )
-        ),
+        idempotency_key=resolved_admission.idempotency_key,
         policy=_mapping(args, "run_policy"),
         route_policy=_mapping(args, "route_policy"),
         correlation_id=(
@@ -746,6 +812,10 @@ def _start_run(
             if args.get("correlation_id") is not None
             else None
         ),
+        expected_basis_input_sequence=(
+            resolved_admission.expected_basis_input_sequence
+        ),
+        expected_input_digest=resolved_admission.expected_input_digest,
     )
 
 
@@ -820,24 +890,26 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
             }
             run_response = None
             if _should_start_run(args):
-                run_idempotency_key = _run_key(
+                run_admission = _run_admission(
                     args,
                     client=client,
                     thread_id=thread_id,
                     origin=origin,
                 )
-                partial["runIdempotencyKey"] = run_idempotency_key
+                partial["runIdempotencyKey"] = (
+                    run_admission.idempotency_key
+                )
                 partial["_recoveryArguments"] = _run_recovery_arguments(
                     args,
                     thread_id=thread_id,
-                    idempotency_key=run_idempotency_key,
+                    admission=run_admission,
                 )
                 run_response = _start_run(
                     client,
                     args,
                     thread_id=thread_id,
                     origin=origin,
-                    idempotency_key=run_idempotency_key,
+                    admission=run_admission,
                 )
             return tool_result(
                 _semantic_result(
@@ -876,24 +948,26 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
             }
             run_response = None
             if _should_start_run(args):
-                run_idempotency_key = _run_key(
+                run_admission = _run_admission(
                     args,
                     client=client,
                     thread_id=thread_id,
                     origin=origin,
                 )
-                partial["runIdempotencyKey"] = run_idempotency_key
+                partial["runIdempotencyKey"] = (
+                    run_admission.idempotency_key
+                )
                 partial["_recoveryArguments"] = _run_recovery_arguments(
                     args,
                     thread_id=thread_id,
-                    idempotency_key=run_idempotency_key,
+                    admission=run_admission,
                 )
                 run_response = _start_run(
                     client,
                     args,
                     thread_id=thread_id,
                     origin=origin,
-                    idempotency_key=run_idempotency_key,
+                    admission=run_admission,
                 )
             return tool_result(
                 _semantic_result(
@@ -1253,7 +1327,7 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
 
         if action == "start_run":
             thread_id = _required_id(args, "thread_id")
-            run_idempotency_key = _run_key(
+            run_admission = _run_admission(
                 args,
                 client=client,
                 thread_id=thread_id,
@@ -1261,11 +1335,11 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
             )
             partial = {
                 "threadId": thread_id,
-                "runIdempotencyKey": run_idempotency_key,
+                "runIdempotencyKey": run_admission.idempotency_key,
                 "_recoveryArguments": _run_recovery_arguments(
                     args,
                     thread_id=thread_id,
-                    idempotency_key=run_idempotency_key,
+                    admission=run_admission,
                 ),
             }
             run_response = _start_run(
@@ -1273,7 +1347,7 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                 args,
                 thread_id=thread_id,
                 origin=None,
-                idempotency_key=run_idempotency_key,
+                admission=run_admission,
             )
             partial.update(
                 {
@@ -1594,6 +1668,24 @@ PLANNING_V2_SCHEMA = {
                     "route policies, correlation mode, and scoped provider "
                     "event. Approval additionally binds the exact preview. "
                     "Message text is never an identity key."
+                ),
+            },
+            "expected_basis_input_sequence": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Hermes-generated immutable thread input head for an exact "
+                    "start_run replay. Supply only with expected_input_digest; "
+                    "do not invent or edit it."
+                ),
+            },
+            "expected_input_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "description": (
+                    "Hermes-generated digest of the immutable thread inputs "
+                    "for an exact start_run replay. Supply only with "
+                    "expected_basis_input_sequence; do not invent or edit it."
                 ),
             },
             "start_run": {

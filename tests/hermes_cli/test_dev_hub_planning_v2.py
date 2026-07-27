@@ -291,6 +291,8 @@ def test_client_exposes_complete_exact_runner_surface() -> None:
         policy={"quality": "premium"},
         route_policy={"provider": "automatic"},
         correlation_id="correlation-1",
+        expected_basis_input_sequence=2,
+        expected_input_digest="sha256:" + "a" * 64,
     )
     client.get_run("run-1")
     no_work = client.claim_work(
@@ -387,6 +389,13 @@ def test_client_exposes_complete_exact_runner_surface() -> None:
         for call in transport.calls
     )
     assert transport.calls[6]["headers"]["idempotency-key"] == "run-key-1"
+    assert json.loads(transport.calls[6]["body"]) == {
+        "correlationId": "correlation-1",
+        "expectedBasisInputSequence": 2,
+        "expectedInputDigest": "sha256:" + "a" * 64,
+        "policy": {"quality": "premium"},
+        "routePolicy": {"provider": "automatic"},
+    }
     assert all(
         "idempotency-key" not in call["headers"]
         for index, call in enumerate(transport.calls)
@@ -1070,6 +1079,50 @@ def test_invalid_idempotency_header_is_rejected_before_transport() -> None:
         )
 
     assert captured.value.code == "planning.idempotency_key_invalid"
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "code"),
+    [
+        (
+            {"expected_basis_input_sequence": 1},
+            "planning.run_input_precondition_incomplete",
+        ),
+        (
+            {"expected_input_digest": "sha256:" + "a" * 64},
+            "planning.run_input_precondition_incomplete",
+        ),
+        (
+            {
+                "expected_basis_input_sequence": 0,
+                "expected_input_digest": "sha256:" + "a" * 64,
+            },
+            "planning.run_input_basis_invalid",
+        ),
+        (
+            {
+                "expected_basis_input_sequence": 1,
+                "expected_input_digest": "sha256:NOT-A-DIGEST",
+            },
+            "planning.run_input_digest_invalid",
+        ),
+    ],
+)
+def test_run_input_precondition_is_validated_before_transport(
+    kwargs: dict[str, Any],
+    code: str,
+) -> None:
+    transport = _ScriptedTransport()
+
+    with pytest.raises(PlanningV2ConfigError) as captured:
+        _client(transport).create_run(
+            "thread-1",
+            idempotency_key="stable-key",
+            **kwargs,
+        )
+
+    assert captured.value.code == code
     assert transport.calls == []
 
 

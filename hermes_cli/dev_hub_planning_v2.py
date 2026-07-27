@@ -2284,18 +2284,71 @@ class PlanningV2Client:
         policy: Optional[dict[str, Any]] = None,
         route_policy: Optional[dict[str, Any]] = None,
         correlation_id: Optional[str] = None,
+        expected_basis_input_sequence: Optional[int] = None,
+        expected_input_digest: Optional[str] = None,
     ) -> PlanningV2Response[PlanningRunDTO]:
+        has_expected_basis = expected_basis_input_sequence is not None
+        has_expected_digest = expected_input_digest is not None
+        if has_expected_basis != has_expected_digest:
+            raise PlanningV2ConfigError(
+                "planning.run_input_precondition_incomplete",
+                detail=(
+                    "expected_basis_input_sequence and expected_input_digest "
+                    "must be supplied together."
+                ),
+            )
+
+        body: dict[str, Any] = {
+            "policy": policy or {},
+            "routePolicy": route_policy or {},
+            "correlationId": correlation_id,
+        }
+        if has_expected_basis:
+            if isinstance(expected_basis_input_sequence, bool):
+                raise PlanningV2ConfigError(
+                    "planning.run_input_basis_invalid",
+                    detail=(
+                        "expected_basis_input_sequence must be a positive "
+                        "integer."
+                    ),
+                )
+            try:
+                expected_basis = int(expected_basis_input_sequence)
+            except (TypeError, ValueError) as exc:
+                raise PlanningV2ConfigError(
+                    "planning.run_input_basis_invalid",
+                    detail=(
+                        "expected_basis_input_sequence must be a positive "
+                        "integer."
+                    ),
+                ) from exc
+            if expected_basis < 1:
+                raise PlanningV2ConfigError(
+                    "planning.run_input_basis_invalid",
+                    detail=(
+                        "expected_basis_input_sequence must be a positive "
+                        "integer."
+                    ),
+                )
+            expected_digest = _text(expected_input_digest)
+            if not _SHA256_RE.fullmatch(expected_digest):
+                raise PlanningV2ConfigError(
+                    "planning.run_input_digest_invalid",
+                    detail=(
+                        "expected_input_digest must be a sha256:<64 lowercase "
+                        "hex> digest."
+                    ),
+                )
+            body["expectedBasisInputSequence"] = expected_basis
+            body["expectedInputDigest"] = expected_digest
+
         response = self._request(
             "POST",
             (
                 f"{PLANNING_V2_PREFIX}/threads/"
                 f"{self._quoted(thread_id)}/runs"
             ),
-            body={
-                "policy": policy or {},
-                "routePolicy": route_policy or {},
-                "correlationId": correlation_id,
-            },
+            body=body,
             expected_statuses=frozenset({200, 201}),
             idempotency_key=idempotency_key,
             retry_safe=True,

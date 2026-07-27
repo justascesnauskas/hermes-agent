@@ -1035,6 +1035,8 @@ def test_lost_run_response_returns_replay_safe_recovery_action(
     assert recovery["action"] == "start_run"
     assert recovery["thread_id"] == "planning-thread-1"
     assert recovery["idempotency_key"] == fake.run_keys[0]
+    assert recovery["expected_basis_input_sequence"] == 1
+    assert recovery["expected_input_digest"] == "sha256:" + "1" * 64
 
     recovered = json.loads(planning_tool._handle_planning_v2(recovery))
     assert recovered["runId"] == "replayed-run"
@@ -1044,6 +1046,10 @@ def test_lost_run_response_returns_replay_safe_recovery_action(
         recovery["idempotency_key"],
     ]
     assert fake.run_calls[0] == fake.run_calls[1]
+    assert fake.run_calls[0]["expected_basis_input_sequence"] == 1
+    assert fake.run_calls[0]["expected_input_digest"] == (
+        "sha256:" + "1" * 64
+    )
     assert recovery["run_policy"] == {"quality": "maximum"}
     assert recovery["route_policy"] == {"model": "frontier"}
     assert recovery["correlation_id"] == "correlation-exact"
