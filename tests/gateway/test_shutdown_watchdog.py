@@ -136,6 +136,37 @@ async def test_loop_heartbeat_rewrites_until_cancelled(tmp_path):
             await task
 
 
+@pytest.mark.asyncio
+async def test_loop_heartbeat_tracks_live_startup_phase(tmp_path):
+    phase = {"value": "booting"}
+    path = get_loop_heartbeat_path(tmp_path)
+    task = asyncio.create_task(
+        loop_heartbeat_forever(
+            interval_s=0.01,
+            start_time=12.0,
+            home=tmp_path,
+            extra_fn=lambda: {"phase": phase["value"]},
+        )
+    )
+    try:
+        for _ in range(50):
+            if path.is_file():
+                break
+            await asyncio.sleep(0.02)
+        assert json.loads(path.read_text(encoding="utf-8"))["phase"] == "booting"
+
+        phase["value"] = "running"
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if json.loads(path.read_text(encoding="utf-8"))["phase"] == "running":
+                break
+        assert json.loads(path.read_text(encoding="utf-8"))["phase"] == "running"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 def test_gateway_runner_exposes_shutdown_watchdog_state():
     """Attrs used by stop()/start() exist after normal construction hooks."""
     from gateway.run import GatewayRunner

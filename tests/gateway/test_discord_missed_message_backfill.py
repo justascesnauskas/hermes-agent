@@ -274,6 +274,35 @@ async def test_run_backfill_counts_only_messages_that_reach_dispatch(adapter, mo
 
 
 @pytest.mark.asyncio
+async def test_backfill_collapses_repeated_outage_retries(adapter, monkeypatch):
+    created = datetime.now(timezone.utc)
+    messages = [
+        make_message(message_id=1, content="Tvirtinu"),
+        make_message(message_id=2, content="  TVIRTINU  "),
+        make_message(message_id=3, content="Tvirtinu"),
+    ]
+    for offset, message in enumerate(messages):
+        message.created_at = created + dt.timedelta(seconds=offset * 30)
+
+    async def candidates(_channels):
+        for message in messages:
+            yield message
+
+    dispatch = AsyncMock(return_value=True)
+    monkeypatch.setattr(adapter, "_iter_missed_message_backfill_candidates", candidates)
+    monkeypatch.setattr(adapter, "_should_backfill_discord_message", AsyncMock(return_value=True))
+    monkeypatch.setattr(adapter, "_dispatch_recovered_message", dispatch)
+    monkeypatch.setattr(adapter, "_missed_message_backfill_channels", lambda: {"123"})
+    monkeypatch.setattr(adapter, "_missed_message_backfill_max_dispatches", lambda: 10)
+
+    await adapter._run_missed_message_backfill()
+
+    dispatch.assert_awaited_once_with(messages[0])
+    assert adapter._discord_message_is_persistently_complete("2") is True
+    assert adapter._discord_message_is_persistently_complete("3") is True
+
+
+@pytest.mark.asyncio
 async def test_recovery_aborts_when_durable_ledger_is_unavailable(adapter, monkeypatch):
     dispatch = AsyncMock()
     monkeypatch.setattr(adapter, "_dispatch_recovered_message", dispatch)
