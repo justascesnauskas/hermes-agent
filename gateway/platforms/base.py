@@ -6,6 +6,7 @@ and implement the required methods.
 """
 
 import asyncio
+import hashlib
 import inspect
 import ipaddress
 import logging
@@ -2008,6 +2009,12 @@ class SendResult:
     # made up the full payload, in send order.  Empty tuple for the common
     # single-message case.
     continuation_message_ids: tuple = ()
+    # Base retry/fallback paths fill these fields with the exact bytes they
+    # actually handed to the successful provider send. ``False`` means a
+    # fallback truncated or transformed the requested content and therefore
+    # cannot prove delivery of an exact higher-level payload.
+    delivered_content_digest: Optional[str] = None
+    delivered_content_complete: Optional[bool] = None
     # Machine-readable failure category (set only when ``success`` is False).
     # ``error`` stays the human-readable detail string; ``error_kind`` lets
     # consumers branch deterministically instead of substring-matching the raw
@@ -4414,6 +4421,10 @@ class BasePlatformAdapter(ABC):
         )
 
         if result.success:
+            result.delivered_content_digest = (
+                "sha256:" + hashlib.sha256(content.encode()).hexdigest()
+            )
+            result.delivered_content_complete = True
             return result
 
         error_str = result.error or ""
@@ -4448,6 +4459,11 @@ class BasePlatformAdapter(ABC):
                 )
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
+                    result.delivered_content_digest = (
+                        "sha256:"
+                        + hashlib.sha256(content.encode()).hexdigest()
+                    )
+                    result.delivered_content_complete = True
                     return result
                 error_str = result.error or ""
                 if result.retry_after is not None:
@@ -4469,12 +4485,24 @@ class BasePlatformAdapter(ABC):
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
+        fallback_content = (
+            "(Response formatting failed, plain text:)\n\n"
+            f"{content[:3500]}"
+        )
         fallback_result = await self.send(
             chat_id=chat_id,
-            content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
+            content=fallback_content,
             reply_to=reply_to,
             metadata=metadata,
         )
+        if fallback_result.success:
+            fallback_result.delivered_content_digest = (
+                "sha256:"
+                + hashlib.sha256(fallback_content.encode()).hexdigest()
+            )
+            fallback_result.delivered_content_complete = (
+                fallback_content == content
+            )
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
@@ -5294,6 +5322,31 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _preview_delivery_generation = getattr(
+                    interrupt_event,
+                    "_hermes_run_generation",
+                    None,
+                )
+                try:
+                    from hermes_cli.planning_preview_delivery import (
+                        has_preview_delivery_intent,
+                        prepare_preview_delivery_content,
+                    )
+
+                    _preview_delivery_pending = (
+                        has_preview_delivery_intent(
+                            session_key,
+                            _preview_delivery_generation,
+                        )
+                    )
+                    if text_content and _preview_delivery_pending:
+                        text_content = prepare_preview_delivery_content(
+                            session_key,
+                            _preview_delivery_generation,
+                            text_content,
+                        )
+                except Exception:
+                    _preview_delivery_pending = False
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -5303,7 +5356,8 @@ class BasePlatformAdapter(ABC):
                 if (self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
                         and text_content
-                        and not media_files):
+                        and not media_files
+                        and not _preview_delivery_pending):
                     try:
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
                         if check_tts_requirements():
@@ -5406,6 +5460,25 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    if _preview_delivery_pending:
+                        try:
+                            from datetime import UTC as _UTC, datetime as _datetime
+                            from hermes_cli.planning_preview_delivery import (
+                                complete_preview_delivery,
+                            )
+
+                            await complete_preview_delivery(
+                                session_key,
+                                _preview_delivery_generation,
+                                delivered_content=text_content,
+                                result=result,
+                                delivered_at=_datetime.now(_UTC).isoformat(),
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Planning preview delivery receipt failed closed",
+                                exc_info=True,
+                            )
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
@@ -5680,6 +5753,17 @@ class BasePlatformAdapter(ABC):
                         )
                 except (asyncio.TimeoutError, Exception):
                     pass
+            try:
+                from hermes_cli.planning_preview_delivery import (
+                    discard_preview_delivery_intent,
+                )
+
+                discard_preview_delivery_intent(
+                    session_key,
+                    _callback_generation,
+                )
+            except Exception:
+                pass
             # Some adapters keep platform-level typing tasks.  If callback
             # work or a late refresh recreated one, make one final bounded stop
             # before releasing the session guard.

@@ -36,6 +36,10 @@ from hermes_cli.turn_origin import (
     get_current_turn_user_text,
     turn_attachment_path_fingerprint,
 )
+from hermes_cli.planning_preview_delivery import (
+    ProviderDeliveryReceipt,
+    register_preview_delivery_intent,
+)
 from tools.registry import registry, tool_error, tool_result
 
 
@@ -1251,13 +1255,23 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                 "returned": preview["returned"],
                 "tasks": preview["tasks"],
                 "pageDigest": preview["pageDigest"],
+                "deliveryPayloadDigest": preview[
+                    "deliveryPayloadDigest"
+                ],
+                "deliveryContentDigest": preview[
+                    "deliveryContentDigest"
+                ],
                 "hasMore": preview["hasMore"],
                 "nextOffset": preview["nextOffset"],
+                "reviewStatus": preview["reviewStatus"],
+                "pageReviewed": False,
+                "deliveryReceiptPending": True,
             }
-            # Freeze the exact validated page representation before recording
-            # a receipt. The acknowledgment can therefore never cover tasks
-            # other than those this tool result is about to expose.
-            result = json.loads(tool_result(result))
+            # Fetching is never review. Freeze the exact Hub-signed payload and
+            # register a generation-fenced delivery intent. The callback can
+            # write a receipt only after the provider returns SendResult.success.
+            origin = client.current_origin()
+            delivery_nonce = "preview-delivery-" + secrets.token_urlsafe(24)
             receipt_key = derive_preview_review_idempotency_key(
                 runner_id=client.runner_id,
                 thread_id=thread_id,
@@ -1266,46 +1280,92 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                 offset=preview["offset"],
                 count=preview["returned"],
                 page_digest=preview["pageDigest"],
+                delivery_nonce=delivery_nonce,
             )
-            partial = {
-                "threadId": thread_id,
-                "previewResultId": preview_result_id,
-                "pageFetched": True,
-                "_recoveryArguments": {
-                    "action": "preview",
-                    "thread_id": thread_id,
-                    "preview_result_id": preview_result_id,
+
+            def _acknowledge_after_delivery(
+                receipt: ProviderDeliveryReceipt,
+            ) -> Any:
+                delivery_proof = {
+                    "schemaVersion": (
+                        "planning.preview-delivery-proof.v1"
+                    ),
+                    "deliveryNonce": receipt.delivery_nonce,
+                    "provider": origin["provider"],
+                    "gatewayInstanceId": origin[
+                        "gatewayInstanceId"
+                    ],
+                    "gatewayAccountId": origin[
+                        "gatewayAccountId"
+                    ],
+                    "chatId": origin["chatId"],
+                    "providerMessageId": receipt.provider_message_id,
+                    "providerMessageIds": list(
+                        receipt.provider_message_ids
+                    ),
+                    "deliveredAt": receipt.delivered_at,
+                    "previewResultId": preview_result_id,
+                    "previewResultHash": preview[
+                        "previewResultHash"
+                    ],
                     "offset": preview["offset"],
-                    "limit": preview["limit"],
-                },
-            }
-            review_response = client.acknowledge_preview_page(
-                thread_id,
-                preview_result_id,
-                idempotency_key=receipt_key,
-                expected_preview_hash=preview["previewResultHash"],
+                    "count": preview["returned"],
+                    "pageDigest": preview["pageDigest"],
+                    "deliveryPayloadDigest": (
+                        receipt.delivery_payload_digest
+                    ),
+                    "deliveryContentDigest": (
+                        receipt.delivery_content_digest
+                    ),
+                }
+                return client.acknowledge_preview_page(
+                    thread_id,
+                    preview_result_id,
+                    idempotency_key=receipt_key,
+                    expected_preview_hash=preview[
+                        "previewResultHash"
+                    ],
+                    offset=preview["offset"],
+                    count=preview["returned"],
+                    page_digest=preview["pageDigest"],
+                    origin=origin,
+                    delivery_proof=delivery_proof,
+                )
+
+            registered = register_preview_delivery_intent(
+                thread_id=thread_id,
+                preview_result_id=preview_result_id,
+                preview_result_hash=preview["previewResultHash"],
                 offset=preview["offset"],
                 count=preview["returned"],
                 page_digest=preview["pageDigest"],
+                delivery_payload=preview["deliveryPayload"],
+                delivery_payload_digest=preview[
+                    "deliveryPayloadDigest"
+                ],
+                delivery_content=preview["deliveryContent"],
+                delivery_content_digest=preview[
+                    "deliveryContentDigest"
+                ],
+                delivery_nonce=delivery_nonce,
+                acknowledge=_acknowledge_after_delivery,
             )
-            review = review_response.payload
-            result["pageReviewed"] = True
-            result["reviewReceipt"] = review["receipt"]
-            result["reviewStatus"] = review["reviewStatus"]
-            result["approvalEligible"] = review["approvalEligible"]
-            if not review["reviewStatus"]["complete"]:
-                first_missing = review["reviewStatus"]["missingRanges"][0]
-                result["nextAction"] = {
+            result["deliveryReceiptPending"] = registered
+            if not registered:
+                result["deliveryReceiptUnavailable"] = True
+                result["deliveryReceiptReason"] = (
+                    "This surface has no generation-fenced provider delivery "
+                    "callback. The page remains unreviewed."
+                )
+            if preview["hasMore"]:
+                result["nextActionAfterDelivery"] = {
                     "tool": PLANNING_V2_TOOL_NAME,
                     "arguments": {
                         "action": "preview",
                         "thread_id": thread_id,
                         "preview_result_id": preview_result_id,
-                        "offset": first_missing["offset"],
-                        "limit": min(
-                            preview["limit"],
-                            first_missing["count"],
-                        ),
+                        "offset": preview["nextOffset"],
+                        "limit": preview["limit"],
                     },
                 }
             return tool_result(result)

@@ -13101,6 +13101,17 @@ class GatewayRunner(
                     )
                 elif _stale_adapter and hasattr(_stale_adapter, "_post_delivery_callbacks"):
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
+                try:
+                    from hermes_cli.planning_preview_delivery import (
+                        discard_preview_delivery_intent,
+                    )
+
+                    discard_preview_delivery_intent(
+                        _quick_key,
+                        run_generation,
+                    )
+                except Exception:
+                    pass
                 return None
 
             response = agent_result.get("final_response") or ""
@@ -21043,6 +21054,15 @@ class GatewayRunner(
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
+            from hermes_cli.planning_preview_delivery import (
+                bind_preview_delivery_generation,
+                reset_preview_delivery_generation,
+            )
+
+            _preview_delivery_token = bind_preview_delivery_generation(
+                _approval_session_key,
+                run_generation,
+            )
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
@@ -21114,6 +21134,9 @@ class GatewayRunner(
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
+                reset_preview_delivery_generation(
+                    _preview_delivery_token
+                )
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
                 # completion, gateway shutdown).  Idempotent.
@@ -22034,6 +22057,18 @@ class GatewayRunner(
                         first_response,
                         previewed=_previewed,
                     )
+                    try:
+                        from hermes_cli.planning_preview_delivery import (
+                            has_preview_delivery_intent,
+                        )
+
+                        if has_preview_delivery_intent(
+                            session_key or "",
+                            run_generation,
+                        ):
+                            _already_streamed = False
+                    except Exception:
+                        pass
                     # Apply the same predicate as the normal completed-turn path.
                     # This direct queued-send branch predates intentional-silence
                     # filtering, so without this check it leaks the literal marker.
@@ -22055,10 +22090,28 @@ class GatewayRunner(
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
+                            from hermes_cli.planning_preview_delivery import (
+                                complete_preview_delivery,
+                                prepare_preview_delivery_content,
+                            )
+                            from datetime import UTC as _UTC, datetime as _datetime
+
+                            _queued_content = prepare_preview_delivery_content(
+                                session_key or "",
+                                run_generation,
                                 first_response,
+                            )
+                            _queued_send_result = await adapter.send(
+                                source.chat_id,
+                                _queued_content,
                                 metadata=_status_thread_metadata,
+                            )
+                            await complete_preview_delivery(
+                                session_key or "",
+                                run_generation,
+                                delivered_content=_queued_content,
+                                result=_queued_send_result,
+                                delivered_at=_datetime.now(_UTC).isoformat(),
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
@@ -22284,7 +22337,23 @@ class GatewayRunner(
                 _final,
                 previewed=_previewed,
             )
-            if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
+            try:
+                from hermes_cli.planning_preview_delivery import (
+                    has_preview_delivery_intent,
+                )
+
+                _preview_delivery_pending = has_preview_delivery_intent(
+                    session_key or "",
+                    run_generation,
+                )
+            except Exception:
+                _preview_delivery_pending = False
+            if (
+                not _is_empty_sentinel
+                and not _transformed
+                and not _preview_delivery_pending
+                and (_streamed or _content_delivered)
+            ):
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",

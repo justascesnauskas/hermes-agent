@@ -318,6 +318,10 @@ class PlanningPreviewPage(TypedDict):
     coverage: dict[str, Any]
     acceptedAt: str
     approvalEligible: bool
+    deliveryPayload: dict[str, Any]
+    deliveryPayloadDigest: str
+    deliveryContent: str
+    deliveryContentDigest: str
 
 
 class PlanningPreviewReviewReceiptDTO(TypedDict):
@@ -726,6 +730,7 @@ def derive_preview_review_idempotency_key(
     offset: int,
     count: int,
     page_digest: str,
+    delivery_nonce: str,
 ) -> str:
     """Derive an exact replay key for one validated preview page."""
 
@@ -749,6 +754,7 @@ def derive_preview_review_idempotency_key(
         "offset": page_offset,
         "count": page_count,
         "pageDigest": _text(page_digest),
+        "deliveryNonce": _text(delivery_nonce),
     }
     if (
         not identity["runnerId"]
@@ -758,6 +764,7 @@ def derive_preview_review_idempotency_key(
         or page_offset < 0
         or page_count < 1
         or not _SHA256_RE.fullmatch(identity["pageDigest"])
+        or not identity["deliveryNonce"]
     ):
         raise PlanningV2OriginError(
             "planning.preview_review_identity_incomplete",
@@ -1601,6 +1608,10 @@ class PlanningV2Client:
                 "coverage": dict,
                 "acceptedAt": str,
                 "approvalEligible": bool,
+                "deliveryPayload": dict,
+                "deliveryPayloadDigest": str,
+                "deliveryContent": str,
+                "deliveryContentDigest": str,
             },
         )
         expected = {
@@ -1646,6 +1657,34 @@ class PlanningV2Client:
                 detail=(
                     "basisInputSequence and returned must be non-negative; "
                     "taskCount must be positive"
+                ),
+            )
+        expected_content_digest = "sha256:" + hashlib.sha256(
+            payload["deliveryContent"].encode("utf-8")
+        ).hexdigest()
+        if (
+            not payload["deliveryContent"].strip()
+            or payload["deliveryContentDigest"]
+            != expected_content_digest
+            or any(
+                identity
+                and identity in payload["deliveryContent"]
+                for identity in (
+                    payload["threadId"],
+                    payload["runId"],
+                    payload["previewResultHash"],
+                    payload["planHash"],
+                )
+            )
+            or '"threadId"' in payload["deliveryContent"]
+            or '"previewResultHash"' in payload["deliveryContent"]
+        ):
+            cls._shape_error(
+                response,
+                context="planning preview page",
+                detail=(
+                    "deliveryContent must be exact human review Markdown "
+                    "without internal planning identities"
                 ),
             )
         if payload["offset"] < 0 or payload["limit"] < 1:
@@ -1709,6 +1748,43 @@ class PlanningV2Client:
                 response,
                 context="planning preview page",
                 detail="pageDigest does not bind the exact returned tasks",
+            )
+        expected_delivery_payload = {
+            "schemaVersion": "planning.preview-delivery-payload.v1",
+            "threadId": payload["threadId"],
+            "runId": payload["runId"],
+            "previewResultId": payload["previewResultId"],
+            "previewResultHash": payload["previewResultHash"],
+            "planHash": payload["planHash"],
+            "basisInputSequence": payload["basisInputSequence"],
+            "title": payload["title"],
+            "objective": payload["objective"],
+            "summary": payload["summary"],
+            "decisions": payload["decisions"],
+            "coverage": payload["coverage"],
+            "taskCount": payload["taskCount"],
+            "offset": payload["offset"],
+            "count": payload["returned"],
+            "tasks": payload["tasks"],
+            "pageDigest": payload["pageDigest"],
+            "hasMore": payload["hasMore"],
+            "nextOffset": payload.get("nextOffset"),
+        }
+        expected_delivery_digest = "sha256:" + hashlib.sha256(
+            _canonical_json(expected_delivery_payload).encode("utf-8")
+        ).hexdigest()
+        if (
+            payload["deliveryPayload"] != expected_delivery_payload
+            or payload["deliveryPayloadDigest"]
+            != expected_delivery_digest
+        ):
+            cls._shape_error(
+                response,
+                context="planning preview page",
+                detail=(
+                    "deliveryPayload must bind the exact canonical page "
+                    "returned by Dev Hub"
+                ),
             )
         review_status = cls._validate_review_status(
             response,
@@ -2714,6 +2790,8 @@ class PlanningV2Client:
         offset: int,
         count: int,
         page_digest: str,
+        origin: PlanningOriginPayload,
+        delivery_proof: dict[str, Any],
     ) -> PlanningV2Response[PlanningPreviewReviewMutation]:
         if isinstance(offset, bool) or isinstance(count, bool):
             raise PlanningV2ConfigError(
@@ -2743,6 +2821,13 @@ class PlanningV2Client:
                     "required."
                 ),
             )
+        if not isinstance(origin, Mapping) or not isinstance(
+            delivery_proof,
+            Mapping,
+        ):
+            raise PlanningV2ConfigError(
+                "planning.preview_delivery_proof_invalid"
+            )
         response = self._request(
             "POST",
             (
@@ -2751,6 +2836,8 @@ class PlanningV2Client:
                 f"{self._quoted(preview_result_id)}/review-receipts"
             ),
             body={
+                "origin": dict(origin),
+                "deliveryProof": dict(delivery_proof),
                 "expectedPreviewHash": preview_hash,
                 "offset": page_offset,
                 "count": page_count,

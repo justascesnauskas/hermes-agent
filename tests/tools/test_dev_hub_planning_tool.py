@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 from hermes_cli.dev_hub_planning_v2 import (
@@ -20,6 +22,12 @@ from hermes_cli.turn_origin import (
     scoped_turn_origin,
     scoped_turn_user_text,
     turn_attachment_path_fingerprint,
+)
+from hermes_cli.planning_preview_delivery import (
+    bind_preview_delivery_generation,
+    complete_preview_delivery,
+    prepare_preview_delivery_content,
+    reset_preview_delivery_generation,
 )
 from tools import dev_hub_planning_tool as planning_tool
 from toolsets import resolve_toolset, validate_toolset
@@ -1307,6 +1315,48 @@ class _PreviewClient:
                 separators=(",", ":"),
             ).encode()
         ).hexdigest()
+        delivery_payload = {
+            "schemaVersion": "planning.preview-delivery-payload.v1",
+            "threadId": thread_id,
+            "runId": "run-1",
+            "previewResultId": preview_result_id,
+            "previewResultHash": preview_hash,
+            "planHash": "1" * 64,
+            "basisInputSequence": 4,
+            "title": "Planning V2 delivery",
+            "objective": "Ship the accepted implementation chain",
+            "summary": "Review all tasks before approval.",
+            "decisions": [{"code": "ready_for_approval"}],
+            "coverage": {"ready": True, "findings": []},
+            "taskCount": 137,
+            "offset": offset,
+            "count": limit,
+            "tasks": tasks,
+            "pageDigest": page_digest,
+            "hasMore": True,
+            "nextOffset": offset + limit,
+        }
+        delivery_payload_digest = "sha256:" + hashlib.sha256(
+            json.dumps(
+                delivery_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        delivery_content = "\n\n".join(
+            [
+                "## Planning V2 delivery",
+                "Ship the accepted implementation chain",
+                *[
+                    f"### {index + 1}. Task {index + 1}"
+                    for index, _task in enumerate(tasks, start=offset)
+                ],
+            ]
+        )
+        delivery_content_digest = "sha256:" + hashlib.sha256(
+            delivery_content.encode()
+        ).hexdigest()
         return PlanningV2Response(
             200,
             {
@@ -1338,8 +1388,27 @@ class _PreviewClient:
                 "coverage": {"ready": True, "findings": []},
                 "acceptedAt": "2026-07-27T12:30:00Z",
                 "approvalEligible": False,
+                "deliveryPayload": delivery_payload,
+                "deliveryPayloadDigest": delivery_payload_digest,
+                "deliveryContent": delivery_content,
+                "deliveryContentDigest": delivery_content_digest,
             },
         )
+
+    def current_origin(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": "1.0",
+            "provider": "discord",
+            "gatewayInstanceId": "runner-1",
+            "gatewayAccountId": "discord-account",
+            "chatId": "discord-chat",
+            "threadId": None,
+            "messageId": "discord-inbound-message",
+            "senderId": "discord-user",
+            "chatType": "direct",
+            "sourceTimestamp": "2026-07-27T12:30:00Z",
+            "providerEventId": "discord-event",
+        }
 
     def acknowledge_preview_page(
         self,
@@ -1382,7 +1451,7 @@ class _PreviewClient:
         )
 
 
-def test_preview_returns_exact_hashes_page_and_next_action_without_origin(
+def test_preview_fetch_is_read_only_until_exact_provider_delivery(
     monkeypatch,
 ) -> None:
     fake = _PreviewClient()
@@ -1393,17 +1462,21 @@ def test_preview_returns_exact_hashes_page_and_next_action_without_origin(
     )
     monkeypatch.setattr(planning_tool, "PlanningV2Client", lambda: fake)
 
-    result = json.loads(
-        planning_tool._handle_planning_v2(
-            {
-                "action": "preview",
-                "thread_id": "planning-thread-1",
-                "preview_result_id": "preview-1",
-                "offset": 0,
-                "limit": 50,
-            }
+    token = bind_preview_delivery_generation("session-1", 7)
+    try:
+        result = json.loads(
+            planning_tool._handle_planning_v2(
+                {
+                    "action": "preview",
+                    "thread_id": "planning-thread-1",
+                    "preview_result_id": "preview-1",
+                    "offset": 0,
+                    "limit": 50,
+                }
+            )
         )
-    )
+    finally:
+        reset_preview_delivery_generation(token)
 
     assert fake.calls == [
         {
@@ -1417,12 +1490,12 @@ def test_preview_returns_exact_hashes_page_and_next_action_without_origin(
     assert result["planHash"] == "1" * 64
     assert result["taskCount"] == 137
     assert len(result["tasks"]) == 50
-    assert result["pageReviewed"] is True
-    assert result["reviewStatus"]["coveredTaskCount"] == 50
+    assert result["pageReviewed"] is False
+    assert result["deliveryReceiptPending"] is True
+    assert result["reviewStatus"]["coveredTaskCount"] == 0
     assert result["approvalEligible"] is False
-    assert len(fake.review_calls) == 1
-    assert fake.review_calls[0]["page_digest"] == result["pageDigest"]
-    assert result["nextAction"] == {
+    assert fake.review_calls == []
+    assert result["nextActionAfterDelivery"] == {
         "tool": planning_tool.PLANNING_V2_TOOL_NAME,
         "arguments": {
             "action": "preview",
@@ -1432,6 +1505,43 @@ def test_preview_returns_exact_hashes_page_and_next_action_without_origin(
             "limit": 50,
         },
     }
+    outbound = prepare_preview_delivery_content(
+        "session-1",
+        7,
+        "Here is the page.",
+    )
+    exact_content = fake.get_preview_page(
+        "planning-thread-1",
+        "preview-1",
+        offset=0,
+        limit=50,
+    ).payload["deliveryContent"]
+    assert exact_content in outbound
+    assert "planning-thread-1" not in outbound
+    assert '"threadId"' not in outbound
+    completed = asyncio.run(
+        complete_preview_delivery(
+            "session-1",
+            7,
+            delivered_content=outbound,
+            result=SimpleNamespace(
+                success=True,
+                message_id="discord-outbound-final",
+                continuation_message_ids=(
+                    "discord-outbound-first",
+                    "discord-outbound-final",
+                ),
+            ),
+            delivered_at="2026-07-27T12:30:00+00:00",
+        )
+    )
+    assert completed is True
+    assert len(fake.review_calls) == 1
+    proof = fake.review_calls[0]["delivery_proof"]
+    assert proof["providerMessageIds"] == [
+        "discord-outbound-first",
+        "discord-outbound-final",
+    ]
 
 
 def test_lost_preview_receipt_response_replays_exact_page_before_progressing(
@@ -1441,6 +1551,7 @@ def test_lost_preview_receipt_response_replays_exact_page_before_progressing(
         def __init__(self) -> None:
             super().__init__()
             self.receipt_keys: list[str] = []
+            self.delivery_proofs: list[dict[str, Any]] = []
             self.lose_first_response = True
 
         def acknowledge_preview_page(
@@ -1450,6 +1561,7 @@ def test_lost_preview_receipt_response_replays_exact_page_before_progressing(
             **kwargs: Any,
         ) -> PlanningV2Response[dict[str, Any]]:
             self.receipt_keys.append(kwargs["idempotency_key"])
+            self.delivery_proofs.append(kwargs["delivery_proof"])
             if self.lose_first_response:
                 self.lose_first_response = False
                 raise PlanningV2TransportError(
@@ -1480,21 +1592,36 @@ def test_lost_preview_receipt_response_replays_exact_page_before_progressing(
         "limit": 50,
     }
 
-    failure = json.loads(planning_tool._handle_planning_v2(arguments))
-    assert failure["outcomeAmbiguous"] is True
-    assert failure["recovery"]["pageFetched"] is True
-    recovery = failure["recovery"]["nextAction"]["arguments"]
-    assert recovery == arguments
-
-    recovered = json.loads(
-        planning_tool._handle_planning_v2(recovery)
+    token = bind_preview_delivery_generation("session-lost-ack", 11)
+    try:
+        page = json.loads(planning_tool._handle_planning_v2(arguments))
+    finally:
+        reset_preview_delivery_generation(token)
+    outbound = prepare_preview_delivery_content(
+        "session-lost-ack",
+        11,
+        "Exact preview follows.",
     )
-    assert recovered["pageReviewed"] is True
-    assert recovered["approvalEligible"] is False
+    completed = asyncio.run(
+        complete_preview_delivery(
+            "session-lost-ack",
+            11,
+            delivered_content=outbound,
+            result=SimpleNamespace(
+                success=True,
+                message_id="discord-outbound-1",
+                continuation_message_ids=(),
+            ),
+            delivered_at="2026-07-27T12:30:00+00:00",
+        )
+    )
+    assert page["pageReviewed"] is False
+    assert completed is True
     assert fake.receipt_keys[0] == fake.receipt_keys[1]
     assert fake.receipt_keys[0].startswith(
         "hermes-planning-preview-review-v1:"
     )
+    assert fake.delivery_proofs[0] == fake.delivery_proofs[1]
 
 
 def test_preview_tool_schema_requires_review_before_approval() -> None:

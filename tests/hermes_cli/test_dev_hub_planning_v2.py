@@ -219,6 +219,54 @@ def _preview_page(
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
+    delivery_payload = {
+        "schemaVersion": "planning.preview-delivery-payload.v1",
+        "threadId": payload["threadId"],
+        "runId": payload["runId"],
+        "previewResultId": payload["previewResultId"],
+        "previewResultHash": payload["previewResultHash"],
+        "planHash": payload["planHash"],
+        "basisInputSequence": payload["basisInputSequence"],
+        "title": payload["title"],
+        "objective": payload["objective"],
+        "summary": payload["summary"],
+        "decisions": payload["decisions"],
+        "coverage": payload["coverage"],
+        "taskCount": payload["taskCount"],
+        "offset": payload["offset"],
+        "count": payload["returned"],
+        "tasks": payload["tasks"],
+        "pageDigest": payload["pageDigest"],
+        "hasMore": payload["hasMore"],
+        "nextOffset": payload["nextOffset"],
+    }
+    payload["deliveryPayload"] = delivery_payload
+    payload["deliveryPayloadDigest"] = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                delivery_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    )
+    delivery_content = "\n\n".join(
+        [
+            "## Planning V2 delivery",
+            "Ship the accepted implementation chain",
+            *[
+                f"### {offset + index + 1}. Task {offset + index + 1}"
+                for index, _task in enumerate(tasks)
+            ],
+        ]
+    )
+    payload["deliveryContent"] = delivery_content
+    payload["deliveryContentDigest"] = (
+        "sha256:"
+        + hashlib.sha256(delivery_content.encode()).hexdigest()
+    )
     return payload
 
 
@@ -639,6 +687,25 @@ def test_preview_review_receipt_wire_replays_exact_page_after_lost_response(
     )
     client = _client(transport)
     key = "hermes-planning-preview-review-v1:" + "b" * 64
+    origin = _origin()
+    proof = {
+        "schemaVersion": "planning.preview-delivery-proof.v1",
+        "deliveryNonce": "preview-delivery-nonce-0001",
+        "provider": origin["provider"],
+        "gatewayInstanceId": origin["gatewayInstanceId"],
+        "gatewayAccountId": origin["gatewayAccountId"],
+        "chatId": origin["chatId"],
+        "providerMessageId": "discord-outbound-1",
+        "providerMessageIds": ["discord-outbound-1"],
+        "deliveredAt": "2026-07-27T12:30:00Z",
+        "previewResultId": page["previewResultId"],
+        "previewResultHash": page["previewResultHash"],
+        "offset": page["offset"],
+        "count": page["returned"],
+        "pageDigest": page["pageDigest"],
+        "deliveryPayloadDigest": page["deliveryPayloadDigest"],
+        "deliveryContentDigest": page["deliveryContentDigest"],
+    }
 
     response = client.acknowledge_preview_page(
         "thread-1",
@@ -648,6 +715,8 @@ def test_preview_review_receipt_wire_replays_exact_page_after_lost_response(
         offset=page["offset"],
         count=page["returned"],
         page_digest=page["pageDigest"],
+        origin=origin,
+        delivery_proof=proof,
     )
 
     assert response.payload["replayed"] is True
@@ -659,6 +728,8 @@ def test_preview_review_receipt_wire_replays_exact_page_after_lost_response(
         "/threads/thread-1/previews/preview-1/review-receipts"
     )
     assert json.loads(transport.calls[0]["body"]) == {
+        "origin": origin,
+        "deliveryProof": proof,
         "expectedPreviewHash": page["previewResultHash"],
         "offset": 0,
         "count": 1,
