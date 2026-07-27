@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+import hermes_state
 from hermes_state import SessionDB
 
 
@@ -97,6 +98,94 @@ def test_non_expired_lock_is_held(db: SessionDB) -> None:
     db.try_acquire_compression_lock("sess1", "holder1", ttl_seconds=60)
     # Immediately after, still held
     assert db.try_acquire_compression_lock("sess1", "holder2") is False
+
+
+def test_pid_stamped_holder_liveness_parser(monkeypatch) -> None:
+    seen: list[tuple[int, int]] = []
+    scope = ("test-boot", 7001)
+
+    def _dead_process(pid: int, signal: int) -> None:
+        seen.append((pid, signal))
+        raise ProcessLookupError
+
+    monkeypatch.setattr(hermes_state.os, "kill", _dead_process)
+    monkeypatch.setattr(
+        hermes_state,
+        "_compression_lock_process_scope",
+        lambda: scope,
+    )
+
+    assert (
+        hermes_state._compression_lock_holder_process_alive(
+            "background:boot=test-boot:pidns=7001:pid=424242:generation:nonce"
+        )
+        is False
+    )
+    assert seen == [(424242, 0)]
+    assert (
+        hermes_state._compression_lock_holder_process_alive("legacy_holder")
+        is None
+    )
+    assert (
+        hermes_state._compression_lock_holder_process_alive(
+            "boot=test-boot:pidns=7002:pid=424242"
+        )
+        is None
+    )
+    assert (
+        hermes_state._compression_lock_holder_process_alive(
+            "boot=prior-boot:pidns=7001:pid=424242"
+        )
+        is False
+    )
+
+
+def test_non_expired_lock_from_dead_process_is_reclaimed_immediately(
+    db: SessionDB,
+    monkeypatch,
+) -> None:
+    """A gateway restart must not inherit the old process's full lock TTL."""
+    dead_holder = (
+        "boot=test-boot:pidns=7001:pid=424242:"
+        "tid=7:agent=abc:nonce=deadbeef"
+    )
+    fresh_holder = (
+        "boot=test-boot:pidns=7001:pid=434343:"
+        "tid=8:agent=def:nonce=fresh123"
+    )
+    assert db.try_acquire_compression_lock(
+        "sess1", dead_holder, ttl_seconds=300
+    ) is True
+    monkeypatch.setattr(
+        hermes_state,
+        "_compression_lock_holder_process_alive",
+        lambda holder: False if holder == dead_holder else True,
+    )
+
+    assert db.try_acquire_compression_lock(
+        "sess1", fresh_holder, ttl_seconds=300
+    ) is True
+    assert db.get_compression_lock_holder("sess1") == fresh_holder
+
+
+def test_unknown_holder_keeps_ttl_only_recovery(
+    db: SessionDB,
+    monkeypatch,
+) -> None:
+    """Legacy/external holders cannot be declared dead without a PID stamp."""
+    assert db.try_acquire_compression_lock(
+        "sess1", "legacy_holder", ttl_seconds=60
+    ) is True
+    monkeypatch.setattr(
+        hermes_state,
+        "_compression_lock_holder_process_alive",
+        lambda _holder: None,
+    )
+
+    assert db.try_acquire_compression_lock(
+        "sess1", "pid=434343:nonce=fresh", ttl_seconds=60
+    ) is False
+    assert db.get_compression_lock_holder("sess1") == "legacy_holder"
 
 
 # ----------------------------------------------------------------------

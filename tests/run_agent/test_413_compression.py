@@ -782,10 +782,10 @@ class TestPreflightCompression:
         )
         assert result["completed"] is True
         assert result["final_response"] == "After preflight"
-        assert any(
-            ev == "lifecycle" and "Preflight compression" in msg
-            for ev, msg in status_messages
+        assert "Preflight compression" in (
+            mock_compress.call_args_list[0].kwargs["status_message"]
         )
+        assert status_messages == []
         touch_activity.assert_any_call(
             "compacting earlier conversation before continuing"
         )

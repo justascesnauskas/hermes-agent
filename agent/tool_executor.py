@@ -90,6 +90,39 @@ def _budget_for_agent(agent) -> BudgetConfig:
     except Exception:
         return DEFAULT_BUDGET
 
+
+def _batch_result_persistence(
+    config: BudgetConfig,
+    tool_name: str,
+    batch_size: int,
+) -> tuple[int | float, BudgetConfig]:
+    """Return a crash-safe per-result cap for a known tool-call batch.
+
+    Aggregate enforcement runs after a batch finishes, but every individual
+    result is flushed to SessionDB immediately for crash/restart durability.
+    Without an up-front fair-share cap, many medium results can therefore be
+    persisted in full before the aggregate pass shrinks only the in-memory
+    copies. A restarted gateway then reloads the unbounded originals.
+
+    Split the turn budget across the known call count so each result is already
+    bounded before its incremental DB flush. Pinned infinite thresholds (most
+    importantly ``read_file``) stay infinite to avoid persist/read loops.
+    """
+    threshold = config.resolve_threshold(tool_name)
+    if threshold == float("inf"):
+        return threshold, config
+
+    fair_share = max(1, config.turn_budget // max(1, batch_size))
+    preview_size = min(config.preview_size, max(64, fair_share // 2))
+    batch_config = BudgetConfig(
+        default_result_size=config.default_result_size,
+        turn_budget=config.turn_budget,
+        preview_size=preview_size,
+        tool_overrides=config.tool_overrides,
+    )
+    return min(threshold, fair_share), batch_config
+
+
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
@@ -346,7 +379,16 @@ def _run_agent_tool_execution_middleware(
     return result, observed_args
 
 
-def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_concurrent(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+    batch_size: int | None = None,
+) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
     Results are collected in the original tool-call order and appended to
@@ -358,6 +400,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     """
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
+    persistence_batch_size = batch_size or num_tools
 
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
@@ -973,12 +1016,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
 
+        _result_threshold, _result_budget = _batch_result_persistence(
+            _tool_budget,
+            name,
+            persistence_batch_size,
+        )
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=name,
             tool_use_id=tc.id,
             env=get_active_env(effective_task_id),
-            config=_tool_budget,
+            config=_result_budget,
+            threshold=_result_threshold,
         ) if not _is_multimodal_tool_result(function_result) else function_result
 
         subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
@@ -1049,7 +1098,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_sequential(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+    batch_size: int | None = None,
+) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
     ``finalize=False`` skips the end-of-batch aggregate budget enforcement
@@ -1058,6 +1116,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    persistence_batch_size = batch_size or len(assistant_message.tool_calls)
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
@@ -1669,12 +1728,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
 
+        _result_threshold, _result_budget = _batch_result_persistence(
+            _tool_budget,
+            function_name,
+            persistence_batch_size,
+        )
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=function_name,
             tool_use_id=tool_call.id,
             env=get_active_env(effective_task_id),
-            config=_tool_budget,
+            config=_result_budget,
+            threshold=_result_threshold,
         ) if not _is_multimodal_tool_result(function_result) else function_result
 
         # Discover subdirectory context files from tool arguments
@@ -1793,21 +1858,23 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
+    total_tools = len(assistant_message.tool_calls)
     for kind, calls in segments:
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                batch_size=total_tools,
             )
         else:
             execute_tool_calls_sequential(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                batch_size=total_tools,
             )
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
-    total_tools = len(assistant_message.tool_calls)
     if total_tools > 0:
         _tool_budget = _budget_for_agent(agent)
         enforce_turn_budget(

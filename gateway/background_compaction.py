@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+from hermes_state import compression_lock_holder_process_prefix
 
 
 logger = logging.getLogger(__name__)
@@ -444,7 +445,8 @@ class GatewayBackgroundCompactionMixin:
                     return
 
             lock_holder = (
-                f"background:{os.getpid()}:{generation}:{time.monotonic_ns()}"
+                f"background:{compression_lock_holder_process_prefix()}:"
+                f"{generation}:{time.monotonic_ns()}"
             )
             lock_acquired = False
             try:

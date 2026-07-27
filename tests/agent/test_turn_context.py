@@ -432,8 +432,11 @@ def test_preflight_still_runs_for_other_session_with_same_db(tmp_path):
         ctx = _build(agent)
 
     assert isinstance(ctx, TurnContext)
-    agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
+    assert "Preflight compression" in (
+        agent._compress_context.call_args.kwargs["status_message"]
+    )
+    agent._emit_status.assert_not_called()
 
 
 def test_expired_cooldown_allows_preflight(tmp_path):
@@ -448,6 +451,8 @@ def test_expired_cooldown_allows_preflight(tmp_path):
         ctx = _build(agent)
 
     assert isinstance(ctx, TurnContext)
-    agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
-
+    assert "Preflight compression" in (
+        agent._compress_context.call_args.kwargs["status_message"]
+    )
+    agent._emit_status.assert_not_called()
