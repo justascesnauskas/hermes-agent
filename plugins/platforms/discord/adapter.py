@@ -5956,21 +5956,50 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         return (len(self._skill_entries), self._skill_group_hidden_count)
 
-    def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
-        """Build a MessageEvent from a Discord slash command interaction."""
-        interaction_id = str(interaction.id)
+    @staticmethod
+    def _interaction_origin_fields(
+        interaction: discord.Interaction,
+    ) -> tuple[str | None, int | None, dt.datetime | None]:
+        """Return the durable identity fields available on an interaction."""
+        raw_interaction_id = getattr(interaction, "id", None)
+        interaction_id = (
+            str(raw_interaction_id).strip()
+            if raw_interaction_id is not None
+            else None
+        ) or None
+        try:
+            interaction_update_id = (
+                int(interaction_id) if interaction_id is not None else None
+            )
+        except (TypeError, ValueError):
+            interaction_update_id = None
+
         interaction_created_at = getattr(interaction, "created_at", None)
         if not isinstance(interaction_created_at, dt.datetime):
+            interaction_created_at = None
+        if interaction_created_at is None and interaction_update_id is not None:
             # Discord interaction ids are snowflakes. Recover their provider
             # timestamp without consulting the local clock so a redelivery
             # after process death receives the exact same TurnOrigin.
             snowflake_ms = (
-                (int(interaction_id) >> 22) + 1420070400000
+                (interaction_update_id >> 22) + 1420070400000
             )
-            interaction_created_at = dt.datetime.fromtimestamp(
-                snowflake_ms / 1000,
-                tz=dt.timezone.utc,
-            )
+            try:
+                interaction_created_at = dt.datetime.fromtimestamp(
+                    snowflake_ms / 1000,
+                    tz=dt.timezone.utc,
+                )
+            except (OSError, OverflowError, ValueError):
+                interaction_created_at = None
+        return interaction_id, interaction_update_id, interaction_created_at
+
+    def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
+        """Build a MessageEvent from a Discord slash command interaction."""
+        (
+            interaction_id,
+            interaction_update_id,
+            interaction_created_at,
+        ) = self._interaction_origin_fields(interaction)
         is_dm = isinstance(interaction.channel, discord.DMChannel)
         is_thread = isinstance(interaction.channel, discord.Thread)
         thread_id = None
@@ -6013,12 +6042,18 @@ class DiscordAdapter(BasePlatformAdapter):
             source=source,
             raw_message=interaction,
             message_id=interaction_id,
-            platform_update_id=int(interaction_id),
-            timestamp=interaction_created_at,
-            event_id=f"discord-interaction:{interaction_id}",
-            metadata={
-                "provider_source_timestamp": interaction_created_at,
-            },
+            platform_update_id=interaction_update_id,
+            timestamp=interaction_created_at or dt.datetime.now(),
+            event_id=(
+                f"discord-interaction:{interaction_id}"
+                if interaction_id is not None
+                else None
+            ),
+            metadata=(
+                {"provider_source_timestamp": interaction_created_at}
+                if interaction_created_at is not None
+                else {}
+            ),
             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
         )
 
@@ -6094,6 +6129,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # Inherit forum topic when the thread was created inside a forum channel.
         _chan = getattr(interaction, "channel", None)
         chat_topic = self._get_effective_topic(_chan, is_thread=True) if _chan else None
+        (
+            interaction_id,
+            interaction_update_id,
+            interaction_created_at,
+        ) = self._interaction_origin_fields(interaction)
 
         source = self.build_source(
             chat_id=thread_id,
@@ -6103,7 +6143,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
-            message_id=str(interaction.id),
+            message_id=interaction_id,
         )
 
         _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
@@ -6115,41 +6155,19 @@ class DiscordAdapter(BasePlatformAdapter):
             message_type=MessageType.TEXT,
             source=source,
             raw_message=interaction,
-            message_id=str(interaction.id),
-            platform_update_id=int(interaction.id),
-            timestamp=(
-                interaction.created_at
-                if isinstance(
-                    getattr(interaction, "created_at", None),
-                    dt.datetime,
-                )
-                else dt.datetime.fromtimestamp(
-                    (
-                        (int(interaction.id) >> 22)
-                        + 1420070400000
-                    )
-                    / 1000,
-                    tz=dt.timezone.utc,
-                )
+            message_id=interaction_id,
+            platform_update_id=interaction_update_id,
+            timestamp=interaction_created_at or dt.datetime.now(),
+            event_id=(
+                f"discord-interaction:{interaction_id}"
+                if interaction_id is not None
+                else None
             ),
-            event_id=f"discord-interaction:{interaction.id}",
-            metadata={
-                "provider_source_timestamp": (
-                    interaction.created_at
-                    if isinstance(
-                        getattr(interaction, "created_at", None),
-                        dt.datetime,
-                    )
-                    else dt.datetime.fromtimestamp(
-                        (
-                            (int(interaction.id) >> 22)
-                            + 1420070400000
-                        )
-                        / 1000,
-                        tz=dt.timezone.utc,
-                    )
-                )
-            },
+            metadata=(
+                {"provider_source_timestamp": interaction_created_at}
+                if interaction_created_at is not None
+                else {}
+            ),
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
         )

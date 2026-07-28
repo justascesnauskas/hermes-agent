@@ -11405,7 +11405,18 @@ class GatewayRunner(
                 )
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    self._enqueue_fifo(_quick_key, event, adapter)
+                    if (
+                        self._durable_turn_queue_enabled()
+                        or self._busy_input_mode == "queue"
+                    ):
+                        self._enqueue_fifo(_quick_key, event, adapter)
+                    else:
+                        merge_pending_message_event(
+                            adapter._pending_messages,
+                            _quick_key,
+                            event,
+                            merge_text=True,
+                        )
                 return None
 
             running_agent = self._running_agents.get(_quick_key)
