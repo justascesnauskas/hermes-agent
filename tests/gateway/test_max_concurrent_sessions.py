@@ -10,6 +10,11 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionSource, build_session_key
+from hermes_cli.admission_queue import (
+    acknowledge_message_event,
+    admission_queue_depth,
+    pop_next_message_event,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -99,11 +104,14 @@ def _silence_global_gateway_hooks(monkeypatch):
     monkeypatch.setattr("tools.approval.has_blocking_approval", lambda *args, **kwargs: False)
 
 
-def test_new_session_gets_clean_error_at_active_session_limit(monkeypatch):
+def test_new_session_gets_immediate_durable_queue_ack_at_active_session_limit(
+    monkeypatch,
+):
     _silence_global_gateway_hooks(monkeypatch)
     runner = _make_runner(max_concurrent_sessions=1)
     _occupy_session(runner, "busy")
     event = _make_event(chat_id="new")
+    event.source.delivered_via_upstream_relay = True
     new_key = build_session_key(event.source)
 
     async def fail_if_agent_runs(self_inner, ev, src, qk, generation):
@@ -113,11 +121,21 @@ def test_new_session_gets_clean_error_at_active_session_limit(monkeypatch):
         result = asyncio.run(runner._handle_message(event))
 
     assert result == (
-        "Hermes is at the active session limit (1/1). "
-        "Try again when another session finishes."
+        "⏳ Your message is queued (1/1). "
+        "Hermes will start it automatically when a session slot is free."
     )
     assert new_key not in runner._running_agents
     runner.session_store.get_or_create_session.assert_not_called()
+    assert admission_queue_depth() == 1
+    queued = pop_next_message_event()
+    assert queued is not None
+    _item_id, replay = queued
+    assert replay.text == "hello"
+    assert replay.source.chat_id == "new"
+    assert replay.source.platform == Platform.TELEGRAM
+    assert replay.source.delivered_via_upstream_relay is True
+    assert getattr(replay, "_hermes_admission_replay") is True
+    assert acknowledge_message_event(_item_id) is True
 
 
 def test_existing_active_session_uses_busy_handling_at_limit(monkeypatch):
@@ -172,7 +190,7 @@ def test_status_command_bypasses_active_session_limit(monkeypatch):
     runner._handle_status_command.assert_awaited_once()
 
 
-def test_skill_command_that_would_start_agent_is_blocked_at_limit(monkeypatch):
+def test_skill_command_that_would_start_agent_is_queued_at_limit(monkeypatch):
     _silence_global_gateway_hooks(monkeypatch)
     runner = _make_runner(max_concurrent_sessions=1)
     _occupy_session(runner, "busy")
@@ -203,6 +221,49 @@ def test_skill_command_that_would_start_agent_is_blocked_at_limit(monkeypatch):
         )
 
     assert result == (
-        "Hermes is at the active session limit (1/1). "
-        "Try again when another session finishes."
+        "⏳ Your message is queued (1/1). "
+        "Hermes will start it automatically when a session slot is free."
     )
+
+
+def test_waiting_messages_from_one_chat_coalesce_without_losing_text(monkeypatch):
+    _silence_global_gateway_hooks(monkeypatch)
+    runner = _make_runner(max_concurrent_sessions=1)
+    _occupy_session(runner, "busy")
+
+    first = asyncio.run(runner._handle_message(_make_event("Patvirtinu", "new")))
+    second = asyncio.run(runner._handle_message(_make_event("ar gyvas", "new")))
+
+    assert "queued (1/1)" in first
+    assert "queued (1/1)" in second
+    assert admission_queue_depth() == 1
+    queued = pop_next_message_event()
+    assert queued is not None
+    assert queued[1].text == "Patvirtinu\n\nar gyvas"
+    assert acknowledge_message_event(queued[0]) is True
+
+
+def test_durable_queue_replays_through_normal_adapter_ingress(monkeypatch):
+    _silence_global_gateway_hooks(monkeypatch)
+    runner = _make_runner(max_concurrent_sessions=1)
+    busy_key = _occupy_session(runner, "busy")
+    event = _make_event("queued work", "new")
+    runner._enqueue_at_active_session_limit(event, build_session_key(event.source), "")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter._session_tasks = {}
+
+    async def accept_ingress(replay):
+        adapter._session_tasks[build_session_key(replay.source)] = MagicMock()
+
+    adapter.handle_message = AsyncMock(side_effect=accept_ingress)
+    runner._running_agents.pop(busy_key)
+    runner._running_agents_ts.pop(busy_key)
+
+    drained = asyncio.run(runner._drain_global_admission_queue())
+
+    assert drained == 1
+    adapter.handle_message.assert_awaited_once()
+    replay = adapter.handle_message.await_args.args[0]
+    assert replay.text == "queued work"
+    assert getattr(replay, "_hermes_admission_replay") is True
+    assert admission_queue_depth() == 0

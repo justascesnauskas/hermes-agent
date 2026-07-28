@@ -11,6 +11,11 @@ from agent.i18n import t
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.restart import DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
 from gateway.session import SessionEntry, build_session_key
+from hermes_cli.admission_queue import (
+    acknowledge_message_event,
+    admission_queue_depth,
+    pop_next_message_event,
+)
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
@@ -48,7 +53,7 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
 
 
 @pytest.mark.asyncio
-async def test_drain_queue_mode_queues_follow_up_without_interrupt():
+async def test_drain_queue_mode_durably_queues_follow_up_without_interrupt():
     runner, adapter = make_restart_runner()
     runner._draining = True
     runner._restart_requested = True
@@ -65,14 +70,17 @@ async def test_drain_queue_mode_queues_follow_up_without_interrupt():
 
     await adapter.handle_message(event)
 
-    assert session_key in adapter._pending_messages
-    assert adapter._pending_messages[session_key].text == "follow up"
+    assert admission_queue_depth() == 1
+    queued = pop_next_message_event()
+    assert queued is not None
+    assert queued[1].text == "follow up"
+    assert acknowledge_message_event(queued[0]) is True
     assert not adapter._active_sessions[session_key].is_set()
-    assert any("queued for the next turn" in message for message in adapter.sent)
+    assert any("start it automatically" in message for message in adapter.sent)
 
 
 @pytest.mark.asyncio
-async def test_draining_rejects_new_session_messages():
+async def test_draining_durably_queues_new_session_messages():
     runner, _adapter = make_restart_runner()
     runner._draining = True
     runner._restart_requested = True
@@ -86,7 +94,10 @@ async def test_draining_rejects_new_session_messages():
 
     result = await runner._handle_message(event)
 
-    assert result == "⏳ Gateway is restarting and is not accepting new work right now."
+    assert result == (
+        "⏳ Gateway is restarting. Your message is queued (1/1). "
+        "Hermes will start it automatically after the gateway returns."
+    )
 
 
 def test_load_busy_input_mode_prefers_env_then_config_then_default(tmp_path, monkeypatch):

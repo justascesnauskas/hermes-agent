@@ -1800,15 +1800,21 @@ and messaging gateway:
 max_concurrent_sessions: null  # null/0 = unlimited; positive integer = active session cap
 ```
 
-When the cap is reached, Hermes returns a direct limit message for new sessions.
-Existing active sessions keep their normal behavior.
+When the cap is reached, messaging-gateway arrivals for other chats are written
+to a durable FIFO and receive an immediate queue-position acknowledgement. They
+start automatically as slots become free, and the FIFO survives a gateway
+restart or maintenance drain. Repeated arrivals from the same waiting chat are
+coalesced without losing their text. Interactive CLI/TUI session creation still
+returns a direct limit message because those clients own their live terminal
+connection. Existing active sessions keep their normal busy-input behavior.
 
 The canonical key is top-level `max_concurrent_sessions`. Hermes also accepts
 `gateway.max_concurrent_sessions` as a fallback, but the top-level key wins when
 both are set.
 
-The cap is enforced with a local runtime lease file and is best-effort: Hermes
-fails open if the registry cannot be read or locked so users are not stranded.
+The cap is enforced with a local runtime lease file. Messaging admission uses
+`runtime/admission_queue.json`; a queue persistence failure returns a direct
+limit message instead of pretending the message was accepted.
 It is intended for a single host/profile runtime, not a shared `$HERMES_HOME`
 mounted across multiple machines.
 
