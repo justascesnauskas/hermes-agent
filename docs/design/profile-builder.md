@@ -143,4 +143,4 @@ Nothing writes to disk until ⑤.
   the builtin skills enabled, and a spawned PID for the hub skill. Negative:
   a bad MCP entry must not 500 the create.
 - `cd web && npm run build` (no JS test suite in web/).
-- Targeted: `pytest tests/<web_server profile tests> -k profile_create`.
+- Targeted: `scripts/run_tests.sh tests/<web_server profile tests> -k profile_create`.
