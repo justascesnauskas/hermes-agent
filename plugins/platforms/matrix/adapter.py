@@ -52,12 +52,14 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import inspect
 import logging
 import mimetypes
 import os
 import re
 import time
+import unicodedata
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from dataclasses import dataclass, field
 
@@ -121,6 +123,12 @@ except ImportError:
     TrustState = _TrustStateStub  # type: ignore[misc,assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    provider_protocol_rejection_evidence,
+    provider_rejection_evidence,
+    provider_rejection_error,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -842,6 +850,21 @@ class MatrixAdapter(BasePlatformAdapter):
     # overrides both from _resolve_max_message_length().
     max_message_length = DEFAULT_MAX_MESSAGE_LENGTH
     _split_threshold = DEFAULT_MAX_MESSAGE_LENGTH - 100
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="matrix",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="matrix-logical-v1",
+        max_logical_units=400,
+        length_semantics="unicode_codepoints",
+        wire_encoding="matrix-m-room-message-html-v1",
+    )
+
+    async def send_semantic_exact_attempt(self, request):
+        from gateway.semantic_exact_attempt import (
+            semantic_exact_attempt_via_send,
+        )
+
+        return await semantic_exact_attempt_via_send(self, request)
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.MATRIX)
@@ -1647,30 +1670,195 @@ class MatrixAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a message to a Matrix room."""
 
+        semantic_contract = str(
+            (metadata or {}).get("semantic_delivery_contract") or ""
+        ).strip()
+        semantic_delivery_id = str(
+            (metadata or {}).get("semantic_delivery_id") or ""
+        ).strip()
+        if bool(semantic_contract) != bool(semantic_delivery_id):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_identity_incomplete",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if semantic_contract:
+            from hermes_cli.semantic_delivery import (
+                SEMANTIC_DELIVERY_CONTRACT,
+            )
+
+            if semantic_contract != SEMANTIC_DELIVERY_CONTRACT:
+                return SendResult(
+                    success=False,
+                    error="semantic_delivery_contract_unsupported",
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                    },
+                )
+
         if not content:
+            if semantic_contract:
+                return SendResult(
+                    success=False,
+                    error="semantic_delivery_message_empty",
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                    },
+                )
             return SendResult(success=True)
+        if not self._client:
+            return SendResult(
+                success=False,
+                error="Not connected",
+                retryable=True,
+                raw_response=(
+                    {
+                        "provider_write_attempted": False,
+                        "provider_retryable": True,
+                    }
+                    if semantic_contract
+                    else None
+                ),
+            )
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.max_message_length)
+        if semantic_contract and len(chunks) != 1:
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_requires_multiple_writes",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
 
         last_event_id = None
+        event_ids: list[str] = []
         for i, chunk in enumerate(chunks):
             msg_content = self._build_text_message_content(chunk)
+            txn_id = None
+            if semantic_delivery_id:
+                from hermes_cli.semantic_delivery import (
+                    provider_delivery_token,
+                )
+
+                semantic_target = str(
+                    (metadata or {}).get("semantic_delivery_target")
+                    or f"matrix:{chat_id}"
+                )
+                semantic_unit = (
+                    (metadata or {}).get("semantic_delivery_unit", 0)
+                )
+                txn_id = provider_delivery_token(
+                    semantic_delivery_id,
+                    provider="matrix",
+                    target=semantic_target,
+                    unit=f"{semantic_unit}:{i}",
+                )
 
             self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
 
             try:
+                send_kwargs = {"txn_id": txn_id} if txn_id else {}
                 event_id = await asyncio.wait_for(
                     self._client.send_message_event(
                         RoomID(chat_id),
                         EventType.ROOM_MESSAGE,
                         msg_content,
+                        **send_kwargs,
                     ),
                     timeout=45,
                 )
-                last_event_id = str(event_id)
+                if semantic_contract:
+                    from hermes_cli.semantic_delivery import (
+                        exact_provider_message_id,
+                    )
+
+                    last_event_id = exact_provider_message_id(event_id)
+                    if (
+                        last_event_id is None
+                        or len(last_event_id) < 2
+                        or not last_event_id.startswith("$")
+                        or any(
+                            character.isspace()
+                            for character in last_event_id
+                        )
+                    ):
+                        rejection = provider_protocol_rejection_evidence(
+                            provider="Matrix",
+                            protocol="matrix-sdk",
+                            response={
+                                "outcome": "invalid_event_id",
+                                "event_id_type": type(event_id).__name__,
+                                "event_id": event_id,
+                            },
+                        )
+                        return SendResult(
+                            success=False,
+                            error=provider_rejection_error(rejection),
+                            raw_response={
+                                "provider_rejection": rejection,
+                            },
+                        )
+                else:
+                    last_event_id = str(event_id)
+                event_ids.append(last_event_id)
                 logger.info("Matrix: sent event %s to %s", last_event_id, chat_id)
             except Exception as exc:
+                if semantic_contract:
+                    status = int(
+                        getattr(exc, "status", None)
+                        or getattr(exc, "status_code", None)
+                        or 0
+                    )
+                    raw_response: dict[str, Any] = {}
+                    retryable = False
+                    retry_after = None
+                    rejection = provider_protocol_rejection_evidence(
+                        provider="Matrix",
+                        protocol="matrix-sdk",
+                        response={
+                            "exception_type": type(exc).__name__,
+                            "message": str(exc),
+                            "status": status or None,
+                            "retry_after": getattr(
+                                exc,
+                                "retry_after",
+                                None,
+                            ),
+                        },
+                    )
+                    if status == 429:
+                        raw_response = {
+                            "provider_write_attempted": False,
+                            "provider_retryable": True,
+                            "provider_rejection": rejection,
+                        }
+                        retryable = True
+                        retry_after = getattr(exc, "retry_after", None)
+                    elif 400 <= status < 500:
+                        raw_response = {
+                            "provider_write_attempted": False,
+                            "provider_retryable": False,
+                            "provider_rejection": rejection,
+                        }
+                    else:
+                        raw_response = {
+                            "provider_rejection": rejection,
+                        }
+                    return SendResult(
+                        success=False,
+                        error=provider_rejection_error(rejection),
+                        retryable=retryable,
+                        retry_after=retry_after,
+                        raw_response=raw_response,
+                    )
                 # On E2EE errors, retry after sharing keys.
                 if self._encryption and getattr(self._client, "crypto", None):
                     try:
@@ -1680,10 +1868,12 @@ class MatrixAdapter(BasePlatformAdapter):
                                 RoomID(chat_id),
                                 EventType.ROOM_MESSAGE,
                                 msg_content,
+                                **send_kwargs,
                             ),
                             timeout=45,
                         )
                         last_event_id = str(event_id)
+                        event_ids.append(last_event_id)
                         logger.info(
                             "Matrix: sent event %s to %s (after key share)",
                             last_event_id,
@@ -1700,7 +1890,11 @@ class MatrixAdapter(BasePlatformAdapter):
                 logger.error("Matrix: failed to send to %s: %s", chat_id, exc)
                 return SendResult(success=False, error=str(exc))
 
-        return SendResult(success=True, message_id=last_event_id)
+        return SendResult(
+            success=True,
+            message_id=last_event_id,
+            continuation_message_ids=tuple(event_ids),
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return room name and type (dm/group)."""
@@ -2916,6 +3110,18 @@ class MatrixAdapter(BasePlatformAdapter):
             raw_message=source_content,
             message_id=event_id,
             reply_to_message_id=reply_to,
+            timestamp=(
+                datetime.fromtimestamp(event_ts, tz=timezone.utc)
+                if event_ts
+                else datetime.now(timezone.utc)
+            ),
+            metadata={
+                "provider_source_timestamp": (
+                    datetime.fromtimestamp(event_ts, tz=timezone.utc)
+                    if event_ts
+                    else None
+                )
+            },
         )
 
         if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
@@ -3123,6 +3329,18 @@ class MatrixAdapter(BasePlatformAdapter):
             message_id=event_id,
             media_urls=media_urls,
             media_types=media_types,
+            timestamp=(
+                datetime.fromtimestamp(event_ts, tz=timezone.utc)
+                if event_ts
+                else datetime.now(timezone.utc)
+            ),
+            metadata={
+                "provider_source_timestamp": (
+                    datetime.fromtimestamp(event_ts, tz=timezone.utc)
+                    if event_ts
+                    else None
+                )
+            },
         )
 
         await self.handle_message(msg_event)
@@ -4559,6 +4777,11 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    delivery_contract=None,
+    delivery_id=None,
+    delivery_target=None,
+    delivery_unit=0,
+    semantic_exact_attempt=False,
 ):
     """Out-of-process Matrix delivery via the Client-Server API.
 
@@ -4569,16 +4792,67 @@ async def _standalone_send(
     """
     extra = getattr(pconfig, "extra", {}) or {}
     token = getattr(pconfig, "token", None)
+    semantic_delivery = bool(delivery_contract)
     try:
         import aiohttp
     except ImportError:
-        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+        return {
+            "error": "aiohttp not installed. Run: pip install aiohttp",
+            "provider_write_attempted": False,
+            "provider_retryable": True,
+        }
     try:
         homeserver = (extra.get("homeserver") or os.getenv("MATRIX_HOMESERVER", "")).rstrip("/")
         token = token or os.getenv("MATRIX_ACCESS_TOKEN", "")
         if not homeserver or not token:
-            return {"error": "Matrix not configured (MATRIX_HOMESERVER, MATRIX_ACCESS_TOKEN required)"}
-        txn_id = f"hermes_{int(time.time() * 1000)}_{os.urandom(4).hex()}"
+            return {
+                "error": (
+                    "Matrix not configured (MATRIX_HOMESERVER, "
+                    "MATRIX_ACCESS_TOKEN required)"
+                ),
+                "provider_write_attempted": False,
+                "provider_retryable": True,
+            }
+        delivery_contract = str(delivery_contract or "").strip()
+        delivery_id = str(delivery_id or "").strip()
+        if bool(delivery_contract) != bool(delivery_id):
+            return {
+                "error": "semantic_delivery_identity_incomplete",
+                "provider_write_attempted": False,
+                "provider_retryable": False,
+            }
+        semantic_delivery = bool(delivery_contract)
+        if semantic_delivery:
+            from hermes_cli.semantic_delivery import (
+                SEMANTIC_DELIVERY_CONTRACT,
+                provider_delivery_token,
+            )
+
+            if (
+                delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+                or not semantic_exact_attempt
+            ):
+                return {
+                    "error": "semantic_delivery_contract_unsupported",
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                }
+            if media_files:
+                return {
+                    "error": "semantic_delivery_media_shape_unsupported",
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                }
+            txn_id = provider_delivery_token(
+                delivery_id,
+                provider="matrix",
+                target=str(delivery_target or f"matrix:{chat_id}"),
+                unit=delivery_unit,
+            )
+        else:
+            txn_id = (
+                f"hermes_{int(time.time() * 1000)}_{os.urandom(4).hex()}"
+            )
         from urllib.parse import quote
         encoded_room = quote(chat_id, safe="")
         url = f"{homeserver}/_matrix/client/v3/rooms/{encoded_room}/send/m.room.message/{txn_id}"
@@ -4595,13 +4869,141 @@ async def _standalone_send(
             pass
 
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.put(url, headers=headers, json=payload) as resp:
-                if resp.status not in {200, 201}:
+            async with session.put(
+                url,
+                headers=headers,
+                json=payload,
+                **(
+                    {"allow_redirects": False}
+                    if semantic_delivery
+                    else {}
+                ),
+            ) as resp:
+                status = int(getattr(resp, "status", 0) or 0)
+                if status not in {200, 201}:
+                    if semantic_delivery:
+                        try:
+                            body = await resp.text()
+                        except Exception as body_error:
+                            body = {
+                                "body_read_error_type": (
+                                    type(body_error).__name__
+                                ),
+                                "body_read_error": str(body_error),
+                            }
+                        rejection = provider_rejection_evidence(
+                            provider="Matrix",
+                            status=status,
+                            body=body,
+                        )
+                        result = {
+                            "error": provider_rejection_error(rejection),
+                            "provider_retryable": False,
+                            "provider_rejection": rejection,
+                        }
+                        if status == 429:
+                            result.update(
+                                {
+                                    "provider_write_attempted": False,
+                                    "provider_retryable": True,
+                                }
+                            )
+                        elif (
+                            400 <= status < 500
+                            and status != 408
+                        ):
+                            result["provider_write_attempted"] = False
+                        return result
                     body = await resp.text()
-                    return {"error": f"Matrix API error ({resp.status}): {body}"}
-                data = await resp.json()
-        return {"success": True, "platform": "matrix", "chat_id": chat_id, "message_id": data.get("event_id")}
+                    return {
+                        "error": f"Matrix API error ({status}): {body}"
+                    }
+                try:
+                    data = await resp.json()
+                except Exception as json_error:
+                    if not semantic_delivery:
+                        raise
+                    try:
+                        body = await resp.text()
+                    except Exception as body_error:
+                        body = {
+                            "json_error_type": type(json_error).__name__,
+                            "body_read_error_type": (
+                                type(body_error).__name__
+                            ),
+                            "body_read_error": str(body_error),
+                        }
+                    rejection = provider_rejection_evidence(
+                        provider="Matrix",
+                        status=status,
+                        body=body,
+                    )
+                    return {
+                        "error": "semantic_delivery_provider_receipt_invalid",
+                        "provider_retryable": False,
+                        "provider_rejection": rejection,
+                    }
+                if semantic_delivery:
+                    event_id = (
+                        data.get("event_id")
+                        if isinstance(data, dict)
+                        else None
+                    )
+                    if (
+                        type(event_id) is not str
+                        or len(event_id) < 2
+                        or not event_id.startswith("$")
+                        or any(
+                            character.isspace()
+                            or unicodedata.category(character) == "Cc"
+                            or 0xD800 <= ord(character) <= 0xDFFF
+                            for character in event_id
+                        )
+                    ):
+                        try:
+                            body = await resp.text()
+                        except Exception as body_error:
+                            body = {
+                                "body_read_error_type": (
+                                    type(body_error).__name__
+                                ),
+                                "body_read_error": str(body_error),
+                            }
+                        rejection = provider_rejection_evidence(
+                            provider="Matrix",
+                            status=status,
+                            body=body,
+                        )
+                        return {
+                            "error": (
+                                "semantic_delivery_provider_receipt_invalid"
+                            ),
+                            "provider_retryable": False,
+                            "provider_rejection": rejection,
+                        }
+                else:
+                    event_id = data.get("event_id")
+                return {
+                    "success": True,
+                    "platform": "matrix",
+                    "chat_id": chat_id,
+                    "message_id": event_id,
+                }
     except Exception as e:
+        if semantic_delivery:
+            rejection = provider_protocol_rejection_evidence(
+                provider="Matrix",
+                protocol="matrix-client-server-http",
+                response={
+                    "exception_type": type(e).__name__,
+                    "message": str(e),
+                },
+            )
+            return {
+                "error": provider_rejection_error(rejection),
+                "provider_retryable": False,
+                "provider_rejection": rejection,
+            }
         return {"error": f"Matrix send failed: {e}"}
 
 
@@ -4789,6 +5191,9 @@ def register(ctx) -> None:
         allow_all_env="MATRIX_ALLOW_ALL_USERS",
         cron_deliver_env_var="MATRIX_HOME_ROOM",
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=True,
+        standalone_semantic_exact_attempt_fn=_standalone_send,
+        live_semantic_exact_attempt=True,
         max_message_length=DEFAULT_MAX_MESSAGE_LENGTH,
         emoji="🔐",
         allow_update_command=True,

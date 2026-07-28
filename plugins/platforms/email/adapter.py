@@ -17,6 +17,7 @@ Environment variables:
 
 import asyncio
 import email as email_lib
+import hashlib
 import imaplib
 import logging
 import os
@@ -43,6 +44,11 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from gateway.config import Platform, PlatformConfig
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    semantic_exact_attempt_encoding_contract,
+)
 from utils import env_int, env_bool
 
 logger = logging.getLogger(__name__)
@@ -65,6 +71,21 @@ _AUTOMATED_HEADERS = {
 MAX_MESSAGE_LENGTH = 50_000
 
 SMTP_CONNECT_TIMEOUT = 30
+
+
+class _SemanticSMTPError(RuntimeError):
+    """Preserve whether SMTP DATA could have started across the executor."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_write_attempted: bool | None,
+        retryable: bool = False,
+    ):
+        super().__init__(message)
+        self.provider_write_attempted = provider_write_attempted
+        self.retryable = retryable
 
 
 def _create_ipv4_connection(
@@ -421,6 +442,15 @@ def _extract_attachments(
 
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
+
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="email",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="email-logical-v1",
+        max_logical_units=50_000,
+        length_semantics="unicode_codepoints",
+        wire_encoding="smtp-mime-text-utf8-v1",
+    )
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.EMAIL)
@@ -908,6 +938,252 @@ class EmailAdapter(BasePlatformAdapter):
             logger.error("[Email] Send failed to %s: %s", chat_id, e)
             return SendResult(success=False, error=str(e))
 
+    @staticmethod
+    def _semantic_email_address_valid(value: str) -> bool:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 320
+            or value.count("@") != 1
+            or any(
+                ord(character) < 33 or ord(character) == 127
+                for character in value
+            )
+        ):
+            return False
+        local, domain = value.rsplit("@", 1)
+        if not local or not domain or domain.startswith(".") or domain.endswith("."):
+            return False
+        try:
+            value.encode("ascii", errors="strict")
+        except UnicodeEncodeError:
+            return False
+        return True
+
+    def _connect_smtp_semantic_exact(self) -> smtplib.SMTP:
+        """Open one SMTP connection without the ordinary IPv4 retry path."""
+
+        ctx = ssl.create_default_context()
+        if self._smtp_port == 465:
+            return smtplib.SMTP_SSL(
+                self._smtp_host,
+                self._smtp_port,
+                timeout=SMTP_CONNECT_TIMEOUT,
+                context=ctx,
+            )
+        smtp = smtplib.SMTP(
+            self._smtp_host,
+            self._smtp_port,
+            timeout=SMTP_CONNECT_TIMEOUT,
+        )
+        try:
+            smtp.starttls(context=ctx)
+        except Exception:
+            smtp.close()
+            raise
+        return smtp
+
+    def _send_semantic_exact_email_sync(
+        self,
+        *,
+        to_addr: str,
+        body: str,
+        reply_to_msg_id: Optional[str],
+        delivery_id: str,
+        delivery_unit: int,
+    ) -> tuple[str, Dict[str, Any]]:
+        """Run one deterministic MIME body through exactly one SMTP DATA."""
+
+        message = MIMEText(body, "plain", "utf-8")
+        message["From"] = self._address
+        message["To"] = to_addr
+        message["Subject"] = "Hermes Agent"
+        if reply_to_msg_id:
+            message["In-Reply-To"] = reply_to_msg_id
+            message["References"] = reply_to_msg_id
+        receipt_hash = hashlib.sha256(
+            (
+                f"email:{delivery_id}:{delivery_unit}:{to_addr}"
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        message_id = (
+            f"<hermes-semantic-{receipt_hash}@{self._message_id_domain()}>"
+        )
+        message["Message-ID"] = message_id
+
+        smtp: Optional[smtplib.SMTP] = None
+        try:
+            try:
+                smtp = self._connect_smtp_semantic_exact()
+                smtp.login(self._address, self._password)
+            except smtplib.SMTPAuthenticationError as exc:
+                raise _SemanticSMTPError(
+                    f"SMTP authentication rejected: {exc}",
+                    provider_write_attempted=False,
+                    retryable=False,
+                ) from exc
+            except (
+                socket.timeout,
+                TimeoutError,
+                ConnectionError,
+                OSError,
+                smtplib.SMTPServerDisconnected,
+            ) as exc:
+                raise _SemanticSMTPError(
+                    f"SMTP pre-DATA transport failed: {exc}",
+                    provider_write_attempted=False,
+                    retryable=True,
+                ) from exc
+            except smtplib.SMTPException as exc:
+                raise _SemanticSMTPError(
+                    f"SMTP pre-DATA command failed: {exc}",
+                    provider_write_attempted=False,
+                    retryable=False,
+                ) from exc
+
+            try:
+                refused = smtp.send_message(message)
+            except smtplib.SMTPRecipientsRefused as exc:
+                codes = [
+                    int(detail[0])
+                    for detail in exc.recipients.values()
+                    if isinstance(detail, tuple)
+                    and detail
+                    and str(detail[0]).isdigit()
+                ]
+                retryable = bool(codes and all(400 <= code < 500 for code in codes))
+                raise _SemanticSMTPError(
+                    f"SMTP recipients rejected: {exc}",
+                    provider_write_attempted=False,
+                    retryable=retryable,
+                ) from exc
+            except Exception as exc:
+                raise _SemanticSMTPError(
+                    f"SMTP DATA outcome unknown: {exc}",
+                    provider_write_attempted=None,
+                    retryable=False,
+                ) from exc
+            if not isinstance(refused, dict):
+                raise _SemanticSMTPError(
+                    "SMTP DATA receipt malformed",
+                    provider_write_attempted=None,
+                    retryable=False,
+                )
+            if refused:
+                raise _SemanticSMTPError(
+                    f"SMTP recipient acceptance incomplete: {refused}",
+                    provider_write_attempted=None,
+                    retryable=False,
+                )
+            return message_id, {
+                "gateway_acceptance": True,
+                "smtp_data_accepted": True,
+            }
+        finally:
+            if smtp is not None:
+                try:
+                    smtp.quit()
+                except Exception:
+                    try:
+                        smtp.close()
+                    except Exception:
+                        pass
+
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Send one deterministic MIME body through one SMTP DATA command."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        reply_id = request.reply_to or request.thread_id
+        try:
+            request.content.encode("utf-8", errors="strict")
+            content_is_utf8 = True
+        except (AttributeError, UnicodeEncodeError):
+            content_is_utf8 = False
+        reply_invalid = bool(
+            reply_id is not None
+            and (
+                not isinstance(reply_id, str)
+                or not reply_id
+                or len(reply_id) > 998
+                or "\r" in reply_id
+                or "\n" in reply_id
+            )
+        )
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or not request.delivery_id
+            or not request.delivery_target
+            or not self._semantic_email_address_valid(request.chat_id)
+            or not self._semantic_email_address_valid(self._address)
+            or not self._password
+            or not self._smtp_host
+            or not isinstance(request.content, str)
+            or not content_is_utf8
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+            or reply_invalid
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        try:
+            loop = asyncio.get_running_loop()
+            message_id, receipt = await loop.run_in_executor(
+                None,
+                lambda: self._send_semantic_exact_email_sync(
+                    to_addr=request.chat_id,
+                    body=request.content,
+                    reply_to_msg_id=reply_id,
+                    delivery_id=request.delivery_id,
+                    delivery_unit=request.delivery_unit,
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except _SemanticSMTPError as exc:
+            raw_response: Dict[str, Any] = {}
+            if exc.provider_write_attempted is False:
+                raw_response = {
+                    "provider_write_attempted": False,
+                    "provider_retryable": exc.retryable,
+                }
+            return SendResult(
+                success=False,
+                error=str(exc),
+                retryable=exc.retryable,
+                raw_response=raw_response or None,
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"SMTP semantic transport failed: {exc}",
+            )
+        return SendResult(
+            success=True,
+            message_id=message_id,
+            raw_response=receipt,
+        )
+
     def _message_id_domain(self) -> str:
         """Domain part for generated Message-IDs.
 
@@ -1266,6 +1542,8 @@ def register(ctx) -> None:
         allow_all_env="EMAIL_ALLOW_ALL_USERS",
         cron_deliver_env_var="EMAIL_HOME_ADDRESS",
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=True,
         max_message_length=50_000,
         pii_safe=True,
         emoji="📧",

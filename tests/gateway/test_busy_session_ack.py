@@ -4,7 +4,7 @@ Verifies that users get an immediate status response instead of total silence
 when the agent is working on a task. See PR fix for the @Lonely__MH report.
 """
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -241,7 +241,7 @@ class TestBusySessionAck:
 
     @pytest.mark.asyncio
     async def test_busy_text_mode_queue_delegates_to_adapter_handle_message(self):
-        """busy_text_mode=queue lets the adapter debounce text silently."""
+        """Queue-mode text is admitted by the runner, never Base RAM merge."""
         runner, sentinel = _make_runner()
         runner._busy_input_mode = "interrupt"
         runner._busy_text_mode = "queue"
@@ -255,12 +255,17 @@ class TestBusySessionAck:
         runner._running_agents[sk] = agent
         runner.adapters[first.source.platform] = adapter
         runner.adapters[second.source.platform] = adapter
+        runner._queue_or_replace_pending_event = MagicMock()
 
         result1 = await runner._handle_active_session_busy_message(first, sk)
         result2 = await runner._handle_active_session_busy_message(second, sk)
 
-        assert result1 is False
-        assert result2 is False
+        assert result1 is True
+        assert result2 is True
+        assert runner._queue_or_replace_pending_event.call_args_list == [
+            call(sk, first),
+            call(sk, second),
+        ]
         assert sk not in adapter._pending_messages
         agent.interrupt.assert_not_called()
         adapter._send_with_retry.assert_not_called()

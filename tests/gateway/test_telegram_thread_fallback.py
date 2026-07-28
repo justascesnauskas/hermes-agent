@@ -11,7 +11,7 @@ avoid retrying with a partial topic route that can render outside the lane.
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -114,6 +114,16 @@ def _inject_fake_telegram(monkeypatch):
     monkeypatch.setitem(sys.modules, "telegram.constants", _fake_telegram_constants)
     monkeypatch.setitem(sys.modules, "telegram.ext", _fake_telegram_ext)
     monkeypatch.setitem(sys.modules, "telegram.request", _fake_telegram_request)
+    # The plugin registry can import the adapter during collection, before
+    # this fixture installs the fake SDK. Rebind the already-loaded module so
+    # this test file remains deterministic in the complete gateway suite.
+    import plugins.platforms.telegram.adapter as telegram_mod
+
+    monkeypatch.setattr(
+        telegram_mod,
+        "ChatType",
+        _fake_telegram_constants.ChatType,
+    )
 
 
 def _make_adapter():
@@ -1528,3 +1538,319 @@ async def test_send_retries_retry_after_errors():
     assert result.success is True
     assert result.message_id == "300"
     assert attempt[0] == 2
+
+
+class _SemanticTelegramResponse:
+    def __init__(
+        self,
+        payload=None,
+        *,
+        status=200,
+        json_error=None,
+        text="",
+    ):
+        self.payload = payload
+        self.status = status
+        self.json_error = json_error
+        self.response_text = text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def json(self):
+        if self.json_error is not None:
+            raise self.json_error
+        return self.payload
+
+    async def text(self):
+        return self.response_text
+
+
+class _SemanticTelegramSession:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.posts = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    def post(self, *args, **kwargs):
+        self.posts.append((args, kwargs))
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def _semantic_telegram_metadata():
+    from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+    return {
+        "semantic_delivery_contract": SEMANTIC_DELIVERY_CONTRACT,
+        "semantic_delivery_id": "delivery-telegram-live-exact",
+        "semantic_delivery_target": (
+            "telegram:preview-target-v1:chat-123"
+        ),
+        "semantic_delivery_unit": 0,
+    }
+
+
+class TestTelegramLiveSemanticExactSend:
+    @pytest.mark.asyncio
+    async def test_success_is_one_direct_http_write(self, monkeypatch):
+        import aiohttp
+
+        adapter = _make_adapter()
+        adapter._bot = SimpleNamespace(send_message=AsyncMock())
+        session = _SemanticTelegramSession(
+            response=_SemanticTelegramResponse(
+                {"ok": True, "result": {"message_id": 431}}
+            )
+        )
+        monkeypatch.setattr(
+            aiohttp,
+            "ClientSession",
+            lambda **_kwargs: session,
+        )
+
+        result = await adapter.send(
+            "123",
+            "Exact preview",
+            metadata=_semantic_telegram_metadata(),
+        )
+
+        assert result.success is True
+        assert result.message_id == "431"
+        assert len(session.posts) == 1
+        adapter._bot.send_message.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("receipt_id", "accepted"),
+        [
+            (10**2_047, True),
+            ("431", False),
+            (True, False),
+            (0, False),
+            (-1, False),
+            ("431\t", False),
+            ("\ud800", False),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_provider_receipt_requires_positive_non_bool_integer(
+        self,
+        receipt_id,
+        accepted,
+        monkeypatch,
+    ):
+        import aiohttp
+
+        adapter = _make_adapter()
+        adapter._bot = SimpleNamespace(send_message=AsyncMock())
+        session = _SemanticTelegramSession(
+            response=_SemanticTelegramResponse(
+                {
+                    "ok": True,
+                    "result": {"message_id": receipt_id},
+                }
+            )
+        )
+        monkeypatch.setattr(
+            aiohttp,
+            "ClientSession",
+            lambda **_kwargs: session,
+        )
+
+        result = await adapter.send(
+            "123",
+            "Exact preview",
+            metadata=_semantic_telegram_metadata(),
+        )
+
+        assert result.success is accepted
+        if accepted:
+            assert result.message_id == str(receipt_id)
+        else:
+            rejection = result.raw_response["provider_rejection"]
+            assert rejection["provider"] == "Telegram"
+            assert rejection["status"] == 200
+            assert rejection["body_sha256"] in result.error
+        assert len(session.posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_permanent_rejection_is_one_write(self, monkeypatch):
+        import aiohttp
+
+        adapter = _make_adapter()
+        adapter._bot = SimpleNamespace(send_message=AsyncMock())
+        session = _SemanticTelegramSession(
+            response=_SemanticTelegramResponse(
+                {
+                    "ok": False,
+                    "error_code": 403,
+                    "description": "Forbidden",
+                },
+                status=403,
+            )
+        )
+        monkeypatch.setattr(
+            aiohttp,
+            "ClientSession",
+            lambda **_kwargs: session,
+        )
+
+        result = await adapter.send(
+            "123",
+            "Exact preview",
+            metadata=_semantic_telegram_metadata(),
+        )
+
+        assert result.success is False
+        assert result.raw_response["provider_write_attempted"] is False
+        assert result.raw_response["provider_retryable"] is False
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["provider"] == "Telegram"
+        assert rejection["status"] == 403
+        assert rejection["body_sha256"] in result.error
+        assert len(session.posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_malformed_success_preserves_redacted_bounded_body_evidence(
+        self,
+        monkeypatch,
+    ):
+        import aiohttp
+
+        adapter = _make_adapter()
+        adapter._bot = SimpleNamespace(send_message=AsyncMock())
+        secret = "super-secret-provider-token-" + ("x" * 5_000)
+        body = f"Authorization: Bearer {secret}"
+        session = _SemanticTelegramSession(
+            response=_SemanticTelegramResponse(
+                status=200,
+                json_error=ValueError("invalid JSON"),
+                text=body,
+            )
+        )
+        monkeypatch.setattr(
+            aiohttp,
+            "ClientSession",
+            lambda **_kwargs: session,
+        )
+
+        result = await adapter.send(
+            "123",
+            "Exact preview",
+            metadata=_semantic_telegram_metadata(),
+        )
+
+        assert result.success is False
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["provider"] == "Telegram"
+        assert rejection["status"] == 200
+        assert rejection["body_sha256"] in result.error
+        assert rejection["truncated"] is True
+        assert rejection["redacted"] is True
+        assert secret not in rejection["body_preview"]
+        assert secret not in result.error
+        assert len(session.posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_is_one_write_and_retryable(self, monkeypatch):
+        import aiohttp
+
+        adapter = _make_adapter()
+        adapter._bot = SimpleNamespace(send_message=AsyncMock())
+        session = _SemanticTelegramSession(
+            response=_SemanticTelegramResponse(
+                {
+                    "ok": False,
+                    "error_code": 429,
+                    "description": "Too Many Requests",
+                    "parameters": {"retry_after": 6},
+                },
+                status=429,
+            )
+        )
+        monkeypatch.setattr(
+            aiohttp,
+            "ClientSession",
+            lambda **_kwargs: session,
+        )
+
+        result = await adapter.send(
+            "123",
+            "Exact preview",
+            metadata=_semantic_telegram_metadata(),
+        )
+
+        assert result.success is False
+        assert result.retry_after == 6
+        assert result.raw_response["provider_write_attempted"] is False
+        assert result.raw_response["provider_retryable"] is True
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["provider"] == "Telegram"
+        assert rejection["status"] == 429
+        assert rejection["body_sha256"] in result.error
+        assert len(session.posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_transport_loss_is_one_write_and_ambiguous(
+        self,
+        monkeypatch,
+    ):
+        import aiohttp
+
+        adapter = _make_adapter()
+        adapter._bot = SimpleNamespace(send_message=AsyncMock())
+        session = _SemanticTelegramSession(
+            error=ConnectionResetError("lost after write")
+        )
+        monkeypatch.setattr(
+            aiohttp,
+            "ClientSession",
+            lambda **_kwargs: session,
+        )
+
+        result = await adapter.send(
+            "123",
+            "Exact preview",
+            metadata=_semantic_telegram_metadata(),
+        )
+
+        assert result.success is False
+        assert result.raw_response == {}
+        assert len(session.posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_oversized_payload_is_zero_writes(self, monkeypatch):
+        import aiohttp
+
+        adapter = _make_adapter()
+        adapter._bot = SimpleNamespace(send_message=AsyncMock())
+        adapter.MAX_MESSAGE_LENGTH = 20
+        session_factory = MagicMock()
+        monkeypatch.setattr(
+            aiohttp,
+            "ClientSession",
+            session_factory,
+        )
+
+        result = await adapter.send(
+            "123",
+            "A" * 200,
+            metadata=_semantic_telegram_metadata(),
+        )
+
+        assert result.success is False
+        assert result.raw_response == {
+            "provider_write_attempted": False,
+            "provider_retryable": False,
+        }
+        session_factory.assert_not_called()

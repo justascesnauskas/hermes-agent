@@ -70,6 +70,23 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
+from gateway.platform_registry import declare_semantic_exact_attempt
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    live_semantic_exact_attempt_provider_route_mapping,
+    provider_rejection_error,
+    provider_rejection_evidence,
+    semantic_exact_attempt_encoding_contract,
+)
+
+
+declare_semantic_exact_attempt(
+    "qqbot",
+    standalone=False,
+    live=True,
+    owner=__name__,
+)
 from gateway.platforms.helpers import strip_markdown
 
 logger = logging.getLogger(__name__)
@@ -157,6 +174,14 @@ class QQAdapter(BasePlatformAdapter):
     # QQ Bot API does not support editing sent messages.
     SUPPORTS_MESSAGE_EDITING = False
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="qqbot",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="qqbot-logical-v1",
+        max_logical_units=4_000,
+        length_semantics="unicode_codepoints",
+        wire_encoding="qqbot-routed-message-json-v1",
+    )
     _TYPING_INPUT_SECONDS = 60  # input_notify duration reported to QQ
     _TYPING_DEBOUNCE_SECONDS = 50  # refresh before it expires
 
@@ -2325,6 +2350,237 @@ class QQAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Outbound messaging — REST API
     # ------------------------------------------------------------------
+
+    def bind_semantic_exact_attempt_provider_route(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str | None = None,
+        reply_to: str | None = None,
+    ) -> Dict[str, str]:
+        """Freeze QQ's otherwise process-local route before staging."""
+
+        del reply_to
+        if thread_id is not None:
+            raise ValueError("QQ semantic delivery does not support threads")
+        chat_type = self._chat_type_map.get(chat_id)
+        if chat_type not in {"c2c", "group", "guild"}:
+            raise LookupError("QQ semantic delivery route unavailable")
+        return {
+            "chat_type": chat_type,
+            "message_mode": (
+                "markdown" if self._markdown_support else "text"
+            ),
+        }
+
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Perform one exact QQ REST write without reconnect/retry/fallback."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+            provider_route = (
+                live_semantic_exact_attempt_provider_route_mapping(
+                    request.provider_route
+                )
+            )
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+            exact_provider_message_id,
+            provider_delivery_token,
+        )
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        chat_type = provider_route.get("chat_type")
+        message_mode = provider_route.get("message_mode")
+        if message_mode == "markdown":
+            formatted = request.content
+        elif message_mode == "text":
+            formatted = strip_markdown(request.content)
+        else:
+            formatted = ""
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or chat_type not in {"c2c", "group", "guild"}
+            or set(provider_route) != {"chat_type", "message_mode"}
+            or not request.chat_id
+            or request.thread_id is not None
+            or not isinstance(request.content, str)
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+            or not formatted.strip()
+            or len(formatted) > self.MAX_MESSAGE_LENGTH
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if (
+            not self._http_client
+            or not self._access_token
+            or time.time() >= self._token_expires_at
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_transport_unavailable",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+
+        token = provider_delivery_token(
+            request.delivery_id,
+            provider="qqbot",
+            target=request.delivery_target,
+            unit=request.delivery_unit,
+        )
+        msg_seq = int(token.removeprefix("dh_")[:8], 16) % 65_536
+        if chat_type == "guild":
+            path = f"/channels/{request.chat_id}/messages"
+            body: Dict[str, Any] = {"content": formatted}
+        else:
+            path = (
+                f"/v2/users/{request.chat_id}/messages"
+                if chat_type == "c2c"
+                else f"/v2/groups/{request.chat_id}/messages"
+            )
+            if message_mode == "markdown":
+                body = {
+                    "markdown": {"content": formatted},
+                    "msg_type": MSG_TYPE_MARKDOWN,
+                    "msg_seq": msg_seq,
+                }
+            else:
+                body = {
+                    "content": formatted,
+                    "msg_type": MSG_TYPE_TEXT,
+                    "msg_seq": msg_seq,
+                }
+                if request.reply_to:
+                    body["message_reference"] = {
+                        "message_id": request.reply_to
+                    }
+        if request.reply_to:
+            body["msg_id"] = request.reply_to
+        headers = {
+            "Authorization": f"QQBot {self._access_token}",
+            "Content-Type": "application/json",
+            "User-Agent": build_user_agent(),
+        }
+        try:
+            response = await self._http_client.request(
+                "POST",
+                f"{API_BASE}{path}",
+                headers=headers,
+                json=body,
+                timeout=DEFAULT_API_TIMEOUT,
+                follow_redirects=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"QQ semantic transport failed: {exc}",
+            )
+
+        status = int(response.status_code)
+        response_body = getattr(response, "content", None)
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+        if not isinstance(response_body, (bytes, str)):
+            response_body = data
+        if 200 <= status < 300:
+            message_id = exact_provider_message_id(
+                data.get("id") if isinstance(data, dict) else None
+            )
+            if not message_id:
+                rejection = provider_rejection_evidence(
+                    provider="QQ Bot",
+                    status=status,
+                    body=response_body,
+                )
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    raw_response={
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            return SendResult(
+                success=True,
+                message_id=message_id,
+                raw_response=data,
+            )
+        if status == 429:
+            rejection = provider_rejection_evidence(
+                provider="QQ Bot",
+                status=status,
+                body=response_body,
+            )
+            retry_after = (getattr(response, "headers", {}) or {}).get(
+                "Retry-After"
+            )
+            try:
+                retry_after_value = float(retry_after)
+            except (TypeError, ValueError):
+                retry_after_value = None
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                retryable=True,
+                retry_after=retry_after_value,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                    "retry_after": retry_after_value,
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        rejection = provider_rejection_evidence(
+            provider="QQ Bot",
+            status=status,
+            body=response_body,
+        )
+        if status == 408 or status >= 500:
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        return SendResult(
+            success=False,
+            error=provider_rejection_error(rejection),
+            raw_response={
+                "provider_write_attempted": False,
+                "provider_retryable": False,
+                "status": status,
+                "provider_rejection": rejection,
+            },
+        )
 
     async def _api_request(
             self,

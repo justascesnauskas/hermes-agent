@@ -16,6 +16,8 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import platform
@@ -274,7 +276,48 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_url,
 )
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    live_semantic_exact_attempt_provider_route_mapping,
+    provider_rejection_error,
+    provider_rejection_evidence,
+    semantic_exact_attempt_encoding_contract,
+)
 from utils import env_int
+
+
+_WHATSAPP_SEMANTIC_EXACT_ENCODING = "whatsapp-baileys-text-json-v1"
+_WHATSAPP_EXACT_JID_RE = re.compile(
+    r"^[A-Za-z0-9_.:-]+@(s\.whatsapp\.net|g\.us|lid)$"
+)
+
+
+def _whatsapp_semantic_exact_message_id(
+    *,
+    chat_id: str,
+    content: str,
+    delivery_id: str,
+) -> str:
+    """Match the pinned bridge's deterministic Baileys message key."""
+
+    canonical = json.dumps(
+        {
+            "chatId": chat_id,
+            "deliveryId": delivery_id,
+            "encodingContract": _WHATSAPP_SEMANTIC_EXACT_ENCODING,
+            "message": content,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest().upper()
+    return "3EB0" + digest[:18]
+
+
+def _utf16_code_units(value: str) -> int:
+    return len(value.encode("utf-16-le", errors="strict")) // 2
 
 
 def _is_allowed_bridge_path(url: str) -> bool:
@@ -388,6 +431,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     # Default bridge location resolved via shared helper
     _DEFAULT_BRIDGE_DIR = None  # resolved in __init__
     splits_long_messages = True  # send() chunks via truncate_message()
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="whatsapp",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="whatsapp-baileys-logical-v1",
+        max_logical_units=4096,
+        length_semantics="utf16_code_units",
+        wire_encoding=_WHATSAPP_SEMANTIC_EXACT_ENCODING,
+    )
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WHATSAPP)
@@ -829,7 +880,211 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._bridge_process = None
         self._close_bridge_log()
         print(f"[{self.name}] Disconnected")
-    
+
+    def bind_semantic_exact_attempt_provider_route(
+        self,
+        *,
+        chat_id: str,
+        thread_id: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Freeze the bridge's no-format, no-quote text route."""
+
+        normalized_chat_id = to_whatsapp_jid(chat_id)
+        if (
+            not normalized_chat_id
+            or len(normalized_chat_id) > 240
+            or _WHATSAPP_EXACT_JID_RE.fullmatch(normalized_chat_id) is None
+            or not self._running
+            or self._http_session is None
+            or bool(getattr(self._http_session, "closed", False))
+        ):
+            raise ValueError("WhatsApp semantic delivery route unavailable")
+        return {
+            "message_mode": "flat",
+            "transport": "baileys_send_exact",
+        }
+
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Call `/send-exact` once and require the frozen Baileys key ID."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+            exact_provider_message_id,
+        )
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        route = live_semantic_exact_attempt_provider_route_mapping(
+            request.provider_route
+        )
+        normalized_chat_id = to_whatsapp_jid(request.chat_id)
+        try:
+            content_units = _utf16_code_units(request.content)
+            request.content.encode("utf-8", errors="strict")
+            content_is_valid = True
+        except (AttributeError, UnicodeEncodeError):
+            content_units = capability.max_logical_units + 1
+            content_is_valid = False
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or not request.delivery_id
+            or not request.delivery_target
+            or not normalized_chat_id
+            or len(normalized_chat_id) > 240
+            or _WHATSAPP_EXACT_JID_RE.fullmatch(normalized_chat_id) is None
+            or not isinstance(request.content, str)
+            or not content_is_valid
+            or not request.content.strip()
+            or content_units > capability.max_logical_units
+            or route
+            != {
+                "message_mode": "flat",
+                "transport": "baileys_send_exact",
+            }
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        session = self._http_session
+        if (
+            not self._running
+            or session is None
+            or bool(getattr(session, "closed", False))
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_route_unavailable",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+
+        expected_message_id = _whatsapp_semantic_exact_message_id(
+            chat_id=normalized_chat_id,
+            content=request.content,
+            delivery_id=request.delivery_id,
+        )
+        payload = {
+            "chatId": normalized_chat_id,
+            "deliveryId": request.delivery_id,
+            "encodingContract": _WHATSAPP_SEMANTIC_EXACT_ENCODING,
+            "message": request.content,
+        }
+        try:
+            import aiohttp
+
+            async with session.post(
+                f"http://127.0.0.1:{self._bridge_port}/send-exact",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+                allow_redirects=False,
+            ) as response:
+                status = int(response.status)
+                try:
+                    data = await response.json()
+                except Exception:
+                    data = None
+        except asyncio.CancelledError:
+            raise
+        except aiohttp.ClientConnectorError as exc:
+            return SendResult(
+                success=False,
+                error=f"WhatsApp exact bridge unavailable: {exc}",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"WhatsApp semantic transport failed: {exc}",
+            )
+
+        if 200 <= status < 300:
+            message_id = None
+            if isinstance(data, dict) and data.get("success") is True:
+                message_id = exact_provider_message_id(
+                    data.get("messageId")
+                )
+            if message_id != expected_message_id:
+                rejection = provider_rejection_evidence(
+                    provider="WhatsApp bridge",
+                    status=status,
+                    body=data,
+                )
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    raw_response={
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            return SendResult(
+                success=True,
+                message_id=message_id,
+                raw_response={
+                    "provider_message_id": message_id,
+                    "transport": "baileys_send_exact",
+                },
+            )
+        if (
+            isinstance(data, dict)
+            and data.get("providerWriteAttempted") is False
+        ):
+            retryable = data.get("retryable") is True
+            rejection = provider_rejection_evidence(
+                provider="WhatsApp bridge",
+                status=status,
+                body=data,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                retryable=retryable,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": retryable,
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        rejection = provider_rejection_evidence(
+            provider="WhatsApp bridge",
+            status=status,
+            body=data,
+        )
+        return SendResult(
+            success=False,
+            error=provider_rejection_error(rejection),
+            raw_response={
+                "status": status,
+                "provider_rejection": rejection,
+            },
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -1789,6 +2044,8 @@ def register(ctx) -> None:
         allow_all_env="WHATSAPP_ALLOW_ALL_USERS",
         cron_deliver_env_var="WHATSAPP_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=True,
         max_message_length=4096,
         emoji="💬",
         allow_update_command=True,

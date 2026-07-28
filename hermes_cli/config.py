@@ -6609,6 +6609,36 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         else:
             print("  Set later with: hermes config set <key> <value>")
 
+    # Stable semantic-delivery account identities are a config lifecycle
+    # migration, not a send/discovery side effect. Run this even when the
+    # numeric schema version was already current: a messaging provider can be
+    # enabled later (including through a profile-local .env file).
+    try:
+        from hermes_cli.delivery_account_provisioning import (
+            run_lifecycle_provisioning,
+        )
+
+        delivery_result = run_lifecycle_provisioning(quiet=quiet)
+        delivery_summary = delivery_result.get("summary") or {}
+        delivery_applied = int(delivery_summary.get("applied", 0))
+        if delivery_applied:
+            results["config_added"].append(
+                f"semantic delivery account ids ({delivery_applied})"
+            )
+        if not delivery_result.get("ok"):
+            results["warnings"].append(
+                "Semantic delivery account provisioning failed: "
+                f"{delivery_result.get('error', 'unknown_error')}"
+            )
+    except Exception as _delivery_provisioning_error:
+        logger.debug(
+            "semantic delivery account provisioning skipped: %s",
+            _delivery_provisioning_error,
+        )
+        results["warnings"].append(
+            "Semantic delivery account provisioning could not run"
+        )
+
     return results
 
 
@@ -9017,6 +9047,11 @@ def config_command(args):
     
     elif subcmd == "env-path":
         print(get_env_path())
+
+    elif subcmd == "provision-delivery-accounts":
+        from hermes_cli.delivery_account_provisioning import run_config_command
+
+        return run_config_command(args)
     
     elif subcmd == "migrate":
         print()
@@ -9029,6 +9064,24 @@ def config_command(args):
         current_ver, latest_ver = check_config_version()
         
         if not missing_env and not missing_config and current_ver >= latest_ver:
+            # Account provisioning is intentionally independent of
+            # ``_config_version``. A provider may have been enabled since the
+            # last migration, including via a profile-local .env.
+            from hermes_cli.delivery_account_provisioning import (
+                run_lifecycle_provisioning,
+            )
+
+            delivery_result = run_lifecycle_provisioning(quiet=False)
+            if not delivery_result.get("ok"):
+                print(
+                    color(
+                        "⚠ Configuration schema is current, but semantic "
+                        "delivery account provisioning needs attention.",
+                        Colors.YELLOW,
+                    )
+                )
+                print()
+                return
             print(color("✓ Configuration is up to date!", Colors.GREEN))
             print()
             return

@@ -8,7 +8,8 @@ preview delivery, and approves only a later fully-reviewed immutable preview.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from itertools import chain
 import json
 import logging
 import re
@@ -17,17 +18,22 @@ from typing import Any, Optional
 from agent.auxiliary_client import get_runtime_main_route
 from hermes_constants import get_hermes_home
 from hermes_cli.dev_hub_planning_v2 import (
+    DEFAULT_CURRENT_THREAD_PAGE_SIZE,
     PlanningOriginPayload,
     PlanningThreadDTO,
     PlanningV2Client,
     PlanningV2ClientError,
     PlanningV2ConfigError,
+    PlanningV2ProtocolError,
     derive_artifact_idempotency_key,
     derive_thread_id_from_origin,
 )
 from hermes_cli.planning_artifact_spool import (
     list_artifact_recoveries,
     register_artifact_recovery,
+)
+from hermes_cli.planning_gateway_admission import (
+    current_planning_gateway_admission,
 )
 from hermes_cli.turn_origin import (
     TurnAttachmentOriginV1,
@@ -39,12 +45,33 @@ from hermes_cli.turn_origin import (
 FACADE_PROTOCOL = "agent-ops-planning-v2-facade/1"
 _PLAN_TOOL = "agent_ops_task_plan"
 _APPROVAL_TOOL = "agent_ops_task_approve_apply"
+_INTERNAL_PLAN_TOOL = "agent_ops_planning_v2"
 _PLAN_SCHEMA = "agent-ops-task-plan-natural/1"
 _APPROVAL_SCHEMA = "agent-ops-task-approve-natural/1"
+_INTERNAL_ACTION_PUBLIC_INTENT = {
+    "create": "retry",
+    "continue": "retry",
+    "start_run": "retry",
+    "upload_artifact": "retry",
+    "approve_apply": "resume",
+    "preview": "show",
+    "status": "resume",
+    "events": "resume",
+}
 _PLAN_INTENTS = frozenset(
-    {"new", "revise", "retry", "resume", "status", "show", "cancel"}
+    {
+        "new",
+        "revise",
+        "retry",
+        "resume",
+        "status",
+        "show",
+        "cancel",
+        "resolve_delivery",
+    }
 )
 _ACTIVE_RUN_STATES = frozenset({"queued", "running", "waiting"})
+_ACTIONABLE_APPLY_STATES = frozenset({"automatic_resume", "revise"})
 _PRIVATE_RESULT_FIELDS = frozenset(
     {
         "local_path",
@@ -73,6 +100,8 @@ def get_facade_capabilities() -> Mapping[str, Any]:
         "legacyFallback": False,
         "artifactContinuation": "profile-local-durable-spool",
         "previewDelivery": "provider-confirmed-all-pages",
+        "deliveryRecovery": "bound-turn-explicit-v1",
+        "applyRecovery": "bound-turn-self-service-v1",
     }
 
 
@@ -128,6 +157,31 @@ def _public_value(
         else private_paths
     )
     if isinstance(value, Mapping):
+        if value.get("tool") == _INTERNAL_PLAN_TOOL:
+            raw_arguments = value.get("arguments")
+            internal_arguments = (
+                raw_arguments
+                if isinstance(raw_arguments, Mapping)
+                else {}
+            )
+            internal_action = str(
+                internal_arguments.get("action") or ""
+            ).strip()
+            public_arguments: dict[str, str] = {
+                "intent": _INTERNAL_ACTION_PUBLIC_INTENT.get(
+                    internal_action,
+                    "resume",
+                )
+            }
+            thread_id = internal_arguments.get("thread_id")
+            if not isinstance(thread_id, str) or not thread_id.strip():
+                thread_id = internal_arguments.get("threadId")
+            if isinstance(thread_id, str) and thread_id.strip():
+                public_arguments["threadId"] = thread_id.strip()
+            return {
+                "tool": _PLAN_TOOL,
+                "arguments": public_arguments,
+            }
         return {
             str(key): _public_value(child, private_paths=paths)
             for key, child in value.items()
@@ -334,48 +388,182 @@ def _thread_choices(
     ]
 
 
-def _selected_thread(
-    threads: list[PlanningThreadDTO],
+def _thread_selection_rank(
+    thread: PlanningThreadDTO,
     selected_option: Any,
-) -> Optional[PlanningThreadDTO]:
+) -> Optional[int]:
     if not isinstance(selected_option, str) or not selected_option:
         return None
     selected = selected_option
-    exact_id = [
-        thread
-        for thread in threads
-        if str(thread.get("threadId") or "") == selected
-    ]
-    if len(exact_id) == 1:
-        return exact_id[0]
-    exact_label = [
-        thread for thread in threads if _choice_label(thread) == selected
-    ]
-    if len(exact_label) == 1:
-        return exact_label[0]
-    title_matches = [
-        thread
-        for thread in threads
-        if _display_title(thread) == selected
-    ]
-    if len(title_matches) == 1:
-        return title_matches[0]
+    if str(thread.get("threadId") or "") == selected:
+        return 0
+    if _choice_label(thread) == selected:
+        return 1
+    if _display_title(thread) == selected:
+        return 2
     return None
+
+
+def _current_thread_pages(
+    client: PlanningV2Client,
+) -> Iterator[Mapping[str, Any]]:
+    """Stream one bounded, stable current-thread page at a time."""
+
+    origin = client.current_origin()
+    cursor: Optional[str] = None
+    expected_count: Optional[int] = None
+    expected_match: Optional[str] = None
+    traversed = 0
+    while True:
+        response = (
+            client.resolve_current_thread(origin=origin)
+            if cursor is None
+            else client.resolve_current_thread(
+                origin=origin,
+                cursor=cursor,
+                page_size=DEFAULT_CURRENT_THREAD_PAGE_SIZE,
+            )
+        )
+        page = response.payload
+        match_count = int(page["matchCount"])
+        match = str(page["match"])
+        returned = int(page["returnedCount"])
+        threads = page["threads"]
+        if expected_count is None:
+            expected_count = match_count
+            expected_match = match
+        elif (
+            match_count != expected_count
+            or match != expected_match
+        ):
+            raise PlanningV2ProtocolError(
+                "planning.current_thread_set_changed",
+                detail=(
+                    "The active planning-thread set changed during exact "
+                    "selection. Read it again from the first page."
+                ),
+                retryable=True,
+            )
+        has_more = page["hasMore"] is True
+        next_cursor = page["nextCursor"]
+        traversed += returned
+        if (
+            returned != len(threads)
+            or returned < 0
+            or traversed > match_count
+            or (has_more and returned == 0)
+            or (has_more and traversed >= match_count)
+            or (not has_more and traversed != match_count)
+        ):
+            raise PlanningV2ProtocolError(
+                "planning.current_thread_pagination_invalid",
+                detail=(
+                    "Dev Hub current-thread pagination did not cover the "
+                    "reported exact match count."
+                ),
+                retryable=True,
+            )
+        if has_more and (
+            not isinstance(next_cursor, str)
+            or not next_cursor
+            or next_cursor == cursor
+        ):
+            raise PlanningV2ProtocolError(
+                "planning.current_thread_cursor_stalled",
+                detail=(
+                    "Dev Hub current-thread pagination did not advance."
+                ),
+                retryable=True,
+            )
+        if not has_more and next_cursor is not None:
+            raise PlanningV2ProtocolError(
+                "planning.current_thread_pagination_invalid",
+                detail=(
+                    "Dev Hub returned a continuation after the exact thread "
+                    "set was exhausted."
+                ),
+                retryable=True,
+            )
+        yield page
+        if not has_more:
+            return
+        cursor = next_cursor
+
+
+def _thread_choice_context(
+    page: Mapping[str, Any],
+) -> dict[str, Any]:
+    threads = page["threads"]
+    return {
+        "choices": _thread_choices(threads),
+        "matchCount": page["matchCount"],
+        "returnedChoiceCount": page["returnedCount"],
+        "moreChoicesAvailable": page["hasMore"],
+        "nextChoiceCursor": page["nextCursor"],
+    }
+
+
+def _current_thread_choice_page(
+    client: PlanningV2Client,
+    cursor: Any,
+) -> Mapping[str, Any]:
+    """Read exactly one model-facing choice page."""
+
+    origin = client.current_origin()
+    if cursor is None:
+        return client.resolve_current_thread(origin=origin).payload
+    return client.resolve_current_thread(
+        origin=origin,
+        cursor=cursor,
+        page_size=DEFAULT_CURRENT_THREAD_PAGE_SIZE,
+    ).payload
 
 
 def _resolve_thread(
     client: PlanningV2Client,
     arguments: Mapping[str, Any],
 ) -> tuple[Optional[PlanningThreadDTO], Optional[dict[str, Any]]]:
-    resolved = client.resolve_current_thread(
-        origin=client.current_origin()
-    ).payload
-    threads = list(resolved["threads"])
     explicit_value = (
         arguments.get("thread_id")
         if arguments.get("thread_id") is not None
         else arguments.get("threadId")
     )
+    selected_option = arguments.get("selectedOption")
+    if explicit_value is None and selected_option is None:
+        choice_page = _current_thread_choice_page(
+            client,
+            arguments.get("threadAfterCursor"),
+        )
+        choice_context = _thread_choice_context(choice_page)
+        if choice_page["match"] == "none":
+            return None, _failure(
+                "planning.facade_current_thread_not_found",
+                detail=(
+                    "This conversation has no active planning thread. Use "
+                    "intent=new only when the human is starting a genuinely "
+                    "new outcome."
+                ),
+                **choice_context,
+            )
+        if choice_page["match"] == "one":
+            return choice_page["threads"][0], None
+        return None, _failure(
+            "planning.facade_current_thread_ambiguous",
+            detail=(
+                "More than one active plan belongs to this exact "
+                "conversation. Ask the human to choose one displayed title; "
+                "Hermes did not pick the newest plan or mutate anything. Use "
+                "nextChoiceCursor to display the next bounded choice page."
+            ),
+            **choice_context,
+        )
+
+    # Exact selectors intentionally restart at page one. A display cursor is
+    # only a model-context continuation and never weakens full authorization
+    # or global title/label uniqueness checks.
+    pages = _current_thread_pages(client)
+    first_page = next(pages)
+    choice_context = _thread_choice_context(first_page)
     if explicit_value is not None:
         if not isinstance(explicit_value, str) or not explicit_value:
             return None, _failure(
@@ -384,15 +572,12 @@ def _resolve_thread(
                     "thread_id must exactly match a thread displayed for this "
                     "conversation."
                 ),
-                choices=_thread_choices(threads),
+                **choice_context,
             )
-        exact = [
-            thread
-            for thread in threads
-            if thread.get("threadId") == explicit_value
-        ]
-        if len(exact) == 1:
-            return exact[0], None
+        for page in chain((first_page,), pages):
+            for thread in page["threads"]:
+                if thread.get("threadId") == explicit_value:
+                    return thread, None
         return None, _failure(
             "planning.facade_thread_not_in_conversation",
             detail=(
@@ -400,41 +585,40 @@ def _resolve_thread(
                 "exact conversation and user. Nothing was read or changed "
                 "through the supplied identifier."
             ),
-            choices=_thread_choices(threads),
+            **choice_context,
         )
-    if resolved["match"] == "none":
-        return None, _failure(
-            "planning.facade_current_thread_not_found",
-            detail=(
-                "This conversation has no active planning thread. Use intent=new "
-                "only when the human is starting a genuinely new outcome."
-            ),
-            choices=[],
-        )
-    selected_option = arguments.get("selectedOption")
-    if selected_option is not None:
-        selected = _selected_thread(threads, selected_option)
-        if selected is not None:
-            return selected, None
+    if not isinstance(selected_option, str) or not selected_option:
         return None, _failure(
             "planning.facade_thread_selection_invalid",
             detail=(
                 "selectedOption must exactly equal one displayed title, "
-                "selection label, or thread identifier. Hermes did not use "
-                "a fuzzy or newest-plan fallback."
+                "selection label, or thread identifier."
             ),
-            choices=_thread_choices(threads),
+            **choice_context,
         )
-    if resolved["match"] == "one":
-        return threads[0], None
+    match_counts = [0, 0, 0]
+    matches: list[Optional[PlanningThreadDTO]] = [None, None, None]
+    for page in chain((first_page,), pages):
+        for thread in page["threads"]:
+            rank = _thread_selection_rank(thread, selected_option)
+            if rank is None:
+                continue
+            match_counts[rank] += 1
+            if matches[rank] is None:
+                matches[rank] = thread
+            if rank == 0:
+                return thread, None
+    for rank, count in enumerate(match_counts):
+        if count == 1:
+            return matches[rank], None
     return None, _failure(
-        "planning.facade_current_thread_ambiguous",
+        "planning.facade_thread_selection_invalid",
         detail=(
-            "More than one active plan belongs to this exact conversation. "
-            "Ask the human to choose one displayed title; Hermes did not pick "
-            "the newest plan or mutate anything."
+            "selectedOption must exactly equal one displayed title, "
+            "selection label, or thread identifier. Hermes did not use a "
+            "fuzzy or newest-plan fallback."
         ),
-        choices=_thread_choices(threads),
+        **choice_context,
     )
 
 
@@ -583,6 +767,329 @@ def _status(
     )
 
 
+def _delivery_attention_page(
+    *,
+    client: PlanningV2Client,
+    thread_id: str,
+    after_resolution_token: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return one bounded model-facing page plus an opaque continuation."""
+
+    response = client.get_delivery_attention(
+        thread_id,
+        origin=client.current_origin(),
+        after_resolution_token=after_resolution_token,
+    )
+    attention = response.payload["deliveryAttention"]
+    return {
+        **dict(attention),
+        "items": [dict(item) for item in attention["items"]],
+    }
+
+
+def _apply_status_page(
+    *,
+    client: PlanningV2Client,
+    thread_id: str,
+    after_recovery_token: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return one bounded apply page without filling the model context."""
+
+    items: list[dict[str, Any]] = []
+    response = client.get_apply_status(
+        thread_id,
+        origin=client.current_origin(),
+        after_recovery_token=after_recovery_token,
+    )
+    status = response.payload["applyStatus"]
+    for raw_item in status["items"]:
+        item = dict(raw_item)
+        token = str(item.pop("recoveryToken"))
+        # Keep the opaque selector available to the model-facing tool but
+        # distinguish it from profile-private artifact recovery tokens.
+        item["applyRecoveryToken"] = token
+        items.append(item)
+    return {
+        **dict(status),
+        "status": (
+            "action_required"
+            if int(status["actionableCount"])
+            else "clear"
+        ),
+        "requiresExplicitToken": int(status["actionableCount"]) > 1,
+        "items": items,
+    }
+
+
+def _status_with_delivery_attention(
+    *,
+    client: PlanningV2Client,
+    thread_id: str,
+    runtime_kwargs: Mapping[str, Any],
+    arguments: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    status = _status(
+        thread_id=thread_id,
+        runtime_kwargs=runtime_kwargs,
+    )
+    if status.get("ok") is not True:
+        return status
+    arguments = arguments or {}
+    attention = _delivery_attention_page(
+        client=client,
+        thread_id=thread_id,
+        after_resolution_token=arguments.get(
+            "deliveryAfterResolutionToken"
+        ),
+    )
+    apply_status = _apply_status_page(
+        client=client,
+        thread_id=thread_id,
+        after_recovery_token=arguments.get(
+            "applyAfterRecoveryToken"
+        ),
+    )
+    result = {
+        **status,
+        "deliveryAttention": attention,
+        "applyStatus": apply_status,
+    }
+    if attention["count"]:
+        result["nextAction"] = {
+            "intent": (
+                "resolve_delivery"
+                if attention["items"]
+                else "status"
+            ),
+            "choices": [
+                {
+                    "resolutionToken": item["resolutionToken"],
+                    "target": item["target"],
+                    "eventType": item["eventType"],
+                    "actions": item["actions"],
+                }
+                for item in attention["items"]
+            ],
+            "continuationToken": attention[
+                "nextAfterResolutionToken"
+            ],
+        }
+        result["instruction"] = (
+            "A provider may already have accepted one or more planning "
+            "messages. Ask the human to choose for each shown target: confirm "
+            "they observed the original, or explicitly accept duplicate risk "
+            "and resend. Retry/resume will not guess or resend."
+        )
+    elif apply_status["actionableCount"]:
+        actionable = [
+            item
+            for item in apply_status["items"]
+            if item.get("nextAction") in _ACTIONABLE_APPLY_STATES
+        ]
+        result["nextAction"] = {
+            "intent": "resume" if actionable else "status",
+            "choices": [
+                {
+                    "applyRecoveryToken": item["applyRecoveryToken"],
+                    "state": item["state"],
+                    "action": item["nextAction"],
+                    "message": item["message"],
+                    "requestedAt": item["requestedAt"],
+                }
+                for item in actionable
+            ],
+            "continuationToken": apply_status[
+                "nextAfterRecoveryToken"
+            ],
+        }
+        if any(item["nextAction"] == "revise" for item in actionable):
+            result["instruction"] = (
+                "Jira permanently rejected at least one field or could not "
+                "resolve a remote identity. The originating human can correct "
+                "it in this chat: resume/revise appends the exact Jira evidence "
+                "and current correction to this same planning thread, then "
+                "creates a fresh preview for a fresh approval."
+            )
+        else:
+            result["instruction"] = (
+                "The original Jira apply can safely continue in place. "
+                "Automatic preflight recovery remains active; an explicit "
+                "resume from this same user and chat also reuses the original "
+                "plan, approval, command, and published effects."
+            )
+    return result
+
+
+def _resolve_delivery(
+    *,
+    client: PlanningV2Client,
+    thread: PlanningThreadDTO,
+    arguments: Mapping[str, Any],
+    runtime_kwargs: Mapping[str, Any],
+) -> dict[str, Any]:
+    exact_text = _exact_user_text(runtime_kwargs)
+    action = arguments.get("deliveryAction")
+    if action not in {"mark_delivered", "resend_acknowledged"}:
+        return _failure(
+            "planning.facade_delivery_action_invalid",
+            detail=(
+                "deliveryAction must be mark_delivered after the human says "
+                "they observed the original, or resend_acknowledged after "
+                "they explicitly accept possible duplicate delivery."
+            ),
+        )
+    thread_id = str(thread["threadId"])
+    attention = _delivery_attention_page(
+        client=client,
+        thread_id=thread_id,
+    )
+    items = attention["items"]
+    if not items:
+        return _failure(
+            "planning.facade_delivery_attention_clear",
+            detail=(
+                "This conversation has no unresolved provider delivery. "
+                "Nothing was changed or resent."
+            ),
+        )
+    supplied_token = arguments.get("resolutionToken")
+    if supplied_token is None and attention["count"] == 1 and len(items) == 1:
+        selected = items[0]
+    elif isinstance(supplied_token, str):
+        selected = {"resolutionToken": supplied_token}
+    else:
+        return _failure(
+            "planning.facade_delivery_selection_required",
+            detail=(
+                "More than one provider delivery needs a decision. Select "
+                "the exact current target returned by status; do not ask the "
+                "human for an internal token."
+            ),
+            deliveryAttention=attention,
+        )
+    resolved = client.resolve_delivery_attention(
+        thread_id,
+        origin=client.current_origin(),
+        resolution_token=str(selected["resolutionToken"]),
+        action=action,
+        reason=exact_text,
+    )
+    return _success(
+        resolved.payload,
+        intent="resolve_delivery",
+        stateChanged=resolved.replayed is not True,
+        deliveryAttentionResolved=True,
+    )
+
+
+def _find_apply_recovery(
+    *,
+    client: PlanningV2Client,
+    thread_id: str,
+    apply_status: Mapping[str, Any],
+    arguments: Mapping[str, Any],
+    required_action: Optional[str] = None,
+) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    supplied = arguments.get("applyRecoveryToken")
+    actionable_count = int(apply_status.get("actionableCount", 0))
+    if supplied is None and actionable_count > 1:
+        return None, _failure(
+            "planning.facade_apply_recovery_selection_required",
+            detail=(
+                "More than one Jira apply needs attention. Select the exact "
+                "displayed state and timestamp; never ask the human for the "
+                "opaque recovery token."
+            ),
+            applyStatus=apply_status,
+        )
+    if supplied is None and actionable_count == 0:
+        return None, None
+
+    expected_count = int(apply_status["count"])
+    cursor: Optional[str] = None
+    while True:
+        page = (
+            dict(apply_status)
+            if cursor is None
+            else _apply_status_page(
+                client=client,
+                thread_id=thread_id,
+                after_recovery_token=cursor,
+            )
+        )
+        if int(page["count"]) != expected_count:
+            return None, _failure(
+                "planning.apply_status_changed",
+                detail=(
+                    "Jira apply status changed during selection. Read the "
+                    "current status again before recovering it."
+                ),
+                retryable=True,
+            )
+        for raw_item in page["items"]:
+            item = dict(raw_item)
+            if item.get("nextAction") not in _ACTIONABLE_APPLY_STATES:
+                continue
+            if supplied is not None and (
+                item.get("applyRecoveryToken") != supplied
+            ):
+                continue
+            if (
+                required_action is not None
+                and item.get("nextAction") != required_action
+            ):
+                return None, None
+            return item, None
+        if page["hasMore"] is not True:
+            break
+        next_cursor = page["nextAfterRecoveryToken"]
+        if (
+            not isinstance(next_cursor, str)
+            or not next_cursor
+            or next_cursor == cursor
+        ):
+            raise PlanningV2ProtocolError(
+                "planning.apply_status_cursor_stalled",
+                detail="Dev Hub apply-status pagination did not advance.",
+            )
+        cursor = next_cursor
+    if supplied is not None:
+        return None, _failure(
+            "planning.facade_apply_recovery_selection_stale",
+            detail=(
+                "The selected Jira apply recovery is no longer actionable in "
+                "this conversation. Read status and use the exact current "
+                "choice."
+            ),
+            applyStatus=apply_status,
+        )
+    raise PlanningV2ProtocolError(
+        "planning.apply_recovery_selection_invalid",
+        detail=(
+            "Apply status reported exactly one actionable recovery but no "
+            "page contained it."
+        ),
+        retryable=True,
+    )
+
+
+def _recover_apply(
+    *,
+    client: PlanningV2Client,
+    thread_id: str,
+    selected: Mapping[str, Any],
+    runtime_kwargs: Mapping[str, Any],
+) -> dict[str, Any]:
+    exact_text = _exact_user_text(runtime_kwargs)
+    response = client.resolve_apply_recovery(
+        thread_id,
+        origin=client.current_origin(),
+        reason=exact_text,
+        recovery_token=str(selected["applyRecoveryToken"]),
+    )
+    return dict(response.payload)
+
+
 def _create(
     *,
     client: PlanningV2Client,
@@ -678,6 +1185,31 @@ def _revise(
     _exact_user_text(runtime_kwargs)
     thread_id = str(thread["threadId"])
     origin = client.current_origin()
+    apply_status = _apply_status_page(
+        client=client,
+        thread_id=thread_id,
+    )
+    selected, selection_failure = _find_apply_recovery(
+        client=client,
+        thread_id=thread_id,
+        apply_status=apply_status,
+        arguments=arguments,
+        required_action="revise",
+    )
+    if selection_failure is not None:
+        return selection_failure
+    if selected is None and apply_status["actionableCount"]:
+        return _failure(
+            "planning.facade_apply_resume_required",
+            detail=(
+                "The existing Jira apply has a safe in-place recovery and "
+                "cannot be replaced by a new planning revision. Resume the "
+                "original apply so published and pending effects stay bound "
+                "to the existing approval."
+            ),
+            applyStatus=apply_status,
+            nextAction={"intent": "resume"},
+        )
     attachments = _private_attachments()
     _route_policy()
     _stage_attachments(
@@ -687,6 +1219,45 @@ def _revise(
         attachments=attachments,
         arguments=arguments,
     )
+    if selected is not None:
+        uploaded, upload_failure = _upload_pending(
+            client=client,
+            thread_id=thread_id,
+            runtime_kwargs=runtime_kwargs,
+        )
+        if upload_failure is not None:
+            return upload_failure
+        recovered = _recover_apply(
+            client=client,
+            thread_id=thread_id,
+            selected=selected,
+            runtime_kwargs=runtime_kwargs,
+        )
+        if recovered["recovery"]["action"] != "revise":
+            raise PlanningV2ProtocolError(
+                "planning.apply_recovery_action_changed",
+                detail=(
+                    "The selected corrective Jira recovery changed while it "
+                    "was being applied; no replacement run was started."
+                ),
+                retryable=True,
+            )
+        run = _start_run(
+            thread_id=thread_id,
+            arguments=arguments,
+            runtime_kwargs=runtime_kwargs,
+        )
+        return _forward(
+            run,
+            intent="revise",
+            inputStored=True,
+            previewInvalidated=True,
+            attachmentsUploaded=uploaded,
+            applyRecovery=recovered["recovery"],
+            applyRecoveryReplayed=bool(recovered["replayed"]),
+            oldOperationImmutable=True,
+            freshPreviewApprovalRequired=True,
+        )
     revision = _invoke_internal(
         {
             "action": "continue",
@@ -738,9 +1309,35 @@ def _retry(
     )
     if upload_failure is not None:
         return upload_failure
-    current = _status(thread_id=thread_id, runtime_kwargs=runtime_kwargs)
+    current = _status_with_delivery_attention(
+        client=client,
+        thread_id=thread_id,
+        runtime_kwargs=runtime_kwargs,
+    )
     if current.get("ok") is not True:
         return _forward(current, intent="retry")
+    if int(
+        current.get("deliveryAttention", {}).get("count", 0)
+    ):
+        return _forward(
+            current,
+            intent="retry",
+            retryDisposition="delivery_attention_required",
+            recoveredArtifacts=uploaded,
+        )
+    if int(current.get("applyStatus", {}).get("actionableCount", 0)):
+        return _forward(
+            current,
+            intent="retry",
+            retryDisposition="apply_recovery_requires_resume",
+            recoveredArtifacts=uploaded,
+            instruction=(
+                "This is a Jira apply recovery, not a failed planning run. "
+                "Use resume on the same conversation; Hermes will reuse the "
+                "original operation or create a corrective preview without "
+                "duplicating the plan or approval."
+            ),
+        )
     if current.get("runStatus") in _ACTIVE_RUN_STATES:
         return _forward(
             current,
@@ -781,12 +1378,72 @@ def _resume(
     )
     if upload_failure is not None:
         return upload_failure
-    current = _status(thread_id=thread_id, runtime_kwargs=runtime_kwargs)
+    current = _status_with_delivery_attention(
+        client=client,
+        thread_id=thread_id,
+        runtime_kwargs=runtime_kwargs,
+    )
     if current.get("ok") is not True:
         return _forward(
             current,
             intent="resume",
             recoveredArtifacts=uploaded,
+        )
+    if int(
+        current.get("deliveryAttention", {}).get("count", 0)
+    ):
+        return _forward(
+            current,
+            intent="resume",
+            resumeDisposition="delivery_attention_required",
+            recoveredArtifacts=uploaded,
+        )
+    if int(current.get("applyStatus", {}).get("actionableCount", 0)):
+        selected, selection_failure = _find_apply_recovery(
+            client=client,
+            thread_id=thread_id,
+            apply_status=current["applyStatus"],
+            arguments=arguments,
+        )
+        if selection_failure is not None:
+            return selection_failure
+        if selected is None:
+            raise PlanningV2ProtocolError(
+                "planning.apply_recovery_selection_invalid",
+                detail=(
+                    "Apply status reported actionable work without one "
+                    "selectable recovery item."
+                ),
+            )
+        recovered = _recover_apply(
+            client=client,
+            thread_id=thread_id,
+            selected=selected,
+            runtime_kwargs=runtime_kwargs,
+        )
+        if recovered["recovery"]["action"] == "automatic_resume":
+            return _success(
+                recovered,
+                intent="resume",
+                resumeDisposition="original_apply_resumed",
+                recoveredArtifacts=uploaded,
+                secondApprovalRequired=False,
+                replacementPlanCreated=False,
+            )
+        run = _start_run(
+            thread_id=thread_id,
+            arguments=arguments,
+            runtime_kwargs=runtime_kwargs,
+        )
+        return _forward(
+            run,
+            intent="resume",
+            resumeDisposition="corrective_preview_started",
+            recoveredArtifacts=uploaded,
+            applyRecovery=recovered["recovery"],
+            applyRecoveryReplayed=bool(recovered["replayed"]),
+            oldOperationImmutable=True,
+            freshPreviewApprovalRequired=True,
         )
     if current.get("runStatus") in _ACTIVE_RUN_STATES:
         return _forward(
@@ -850,7 +1507,11 @@ def _show(
         )
 
     thread_id = str(thread["threadId"])
-    status = _status(thread_id=thread_id, runtime_kwargs=runtime_kwargs)
+    status = _status_with_delivery_attention(
+        client=client,
+        thread_id=thread_id,
+        runtime_kwargs=runtime_kwargs,
+    )
     if status.get("ok") is not True:
         return _forward(status, intent="show")
     preview = status.get("preview")
@@ -1046,62 +1707,121 @@ def _approval_thread(
     Optional[dict[str, Any]],
     Optional[dict[str, Any]],
 ]:
-    resolved = client.resolve_current_thread(
-        origin=client.current_origin()
-    ).payload
-    threads = list(resolved["threads"])
-    if resolved["match"] == "none":
+    selected_option = arguments.get("selectedOption")
+    supplied_choice_cursor = arguments.get("threadAfterCursor")
+    display_page: Optional[Mapping[str, Any]] = None
+    if selected_option is None and supplied_choice_cursor is not None:
+        # Validate the opaque cursor against the exact current origin before
+        # doing the complete approval-eligibility scan.
+        display_page = _current_thread_choice_page(
+            client,
+            supplied_choice_cursor,
+        )
+    pages = _current_thread_pages(client)
+    first_page = next(pages)
+    if first_page["match"] == "none":
         return None, None, _failure(
             "planning.facade_current_thread_not_found",
             detail="This conversation has no active plan to approve.",
         )
-    eligible: list[tuple[PlanningThreadDTO, dict[str, Any]]] = []
-    unreadable: list[
+    if display_page is None:
+        display_page = first_page
+    elif (
+        display_page["match"] != first_page["match"]
+        or display_page["matchCount"] != first_page["matchCount"]
+    ):
+        raise PlanningV2ProtocolError(
+            "planning.current_thread_set_changed",
+            detail=(
+                "The active planning-thread set changed while paging approval "
+                "choices. Read choices again from the first page."
+            ),
+            retryable=True,
+        )
+    display_thread_ids = {
+        str(thread["threadId"])
+        for thread in display_page["threads"]
+    }
+    eligible_count = 0
+    first_eligible: Optional[
         tuple[PlanningThreadDTO, dict[str, Any]]
-    ] = []
-    for thread in threads:
-        preview_id = str(thread.get("activePreviewVersionId") or "")
-        if not preview_id:
-            continue
-        try:
-            page = client.get_preview_page(
-                str(thread["threadId"]),
-                preview_id,
-                offset=0,
-                limit=1,
-            ).payload
-        except PlanningV2ClientError as exc:
-            unreadable.append((thread, exc.compact()))
-            continue
-        review = page.get("reviewStatus")
-        if (
-            page.get("approvalEligible") is True
-            and isinstance(review, Mapping)
-            and review.get("complete") is True
-        ):
-            eligible.append((thread, page))
-    if len(eligible) == 1 and not unreadable:
-        return eligible[0][0], eligible[0][1], None
-    if unreadable:
+    ] = None
+    eligible_choices: list[PlanningThreadDTO] = []
+    unreadable_count = 0
+    unreadable_choices: list[dict[str, Any]] = []
+    unreadable_retryable = False
+    selection_counts = [0, 0, 0]
+    selection_matches: list[
+        Optional[tuple[PlanningThreadDTO, dict[str, Any]]]
+    ] = [None, None, None]
+    for current_page in chain((first_page,), pages):
+        for thread in current_page["threads"]:
+            preview_id = str(
+                thread.get("activePreviewVersionId") or ""
+            )
+            if not preview_id:
+                continue
+            try:
+                preview_page = client.get_preview_page(
+                    str(thread["threadId"]),
+                    preview_id,
+                    offset=0,
+                    limit=1,
+                ).payload
+            except PlanningV2ClientError as exc:
+                failure = exc.compact()
+                unreadable_count += 1
+                unreadable_retryable = (
+                    unreadable_retryable
+                    or bool(failure.get("retryable"))
+                )
+                if (
+                    len(unreadable_choices)
+                    < DEFAULT_CURRENT_THREAD_PAGE_SIZE
+                ):
+                    unreadable_choices.append(
+                        {
+                            **_thread_choices([thread])[0],
+                            "code": failure.get("code"),
+                        }
+                    )
+                continue
+            review = preview_page.get("reviewStatus")
+            if (
+                preview_page.get("approvalEligible") is not True
+                or not isinstance(review, Mapping)
+                or review.get("complete") is not True
+            ):
+                continue
+            candidate = (thread, preview_page)
+            eligible_count += 1
+            if first_eligible is None:
+                first_eligible = candidate
+            if str(thread["threadId"]) in display_thread_ids:
+                eligible_choices.append(thread)
+            rank = _thread_selection_rank(thread, selected_option)
+            if rank is not None:
+                selection_counts[rank] += 1
+                if selection_matches[rank] is None:
+                    selection_matches[rank] = candidate
+    if eligible_count == 1 and unreadable_count == 0:
+        assert first_eligible is not None
+        return first_eligible[0], first_eligible[1], None
+    if unreadable_count:
         return None, None, _failure(
             "planning.facade_preview_status_unavailable",
             detail=(
                 "Hermes could not prove the review state of every candidate "
                 "preview, so it did not guess or approve another one."
             ),
-            retryable=any(
-                bool(failure.get("retryable"))
-                for _thread, failure in unreadable
+            retryable=unreadable_retryable,
+            unreadableChoices=unreadable_choices,
+            unreadableCount=unreadable_count,
+            moreUnreadableChoicesAvailable=(
+                unreadable_count > len(unreadable_choices)
             ),
-            unreadableChoices=[
-                {
-                    **_thread_choices([thread])[0],
-                    "code": failure.get("code"),
-                }
-                for thread, failure in unreadable
-            ],
         )
-    if not eligible:
+    if eligible_count == 0:
         return None, None, _failure(
             "planning.facade_preview_not_fully_reviewed",
             detail=(
@@ -1111,21 +1831,22 @@ def _approval_thread(
             ),
             unreadableChoices=[],
         )
-    selected = _selected_thread(
-        [item[0] for item in eligible],
-        arguments.get("selectedOption"),
-    )
-    if selected is not None:
-        for thread, page in eligible:
-            if thread["threadId"] == selected["threadId"]:
-                return thread, page, None
+    for rank, count in enumerate(selection_counts):
+        if count == 1:
+            selected = selection_matches[rank]
+            assert selected is not None
+            return selected[0], selected[1], None
     return None, None, _failure(
         "planning.facade_approval_ambiguous",
         detail=(
             "More than one preview in this exact conversation is fully "
             "reviewed. Hermes did not guess which one the human approved."
         ),
-        choices=_thread_choices([item[0] for item in eligible]),
+        choices=_thread_choices(eligible_choices),
+        eligibleMatchCount=eligible_count,
+        returnedChoiceCount=len(eligible_choices),
+        moreChoicesAvailable=display_page["hasMore"],
+        nextChoiceCursor=display_page["nextCursor"],
     )
 
 
@@ -1214,6 +1935,48 @@ def invoke_public_tasking_tool(
             )
         )
     try:
+        if tool_name not in {_PLAN_TOOL, _APPROVAL_TOOL}:
+            return _json(
+                _failure(
+                    "planning.facade_public_tool_unsupported",
+                    detail=f"Unsupported public tasking alias: {tool_name!r}.",
+                )
+            )
+        intent = ""
+        if tool_name == _PLAN_TOOL:
+            intent = str(arguments.get("intent") or "").strip().lower()
+            if intent not in _PLAN_INTENTS:
+                return _json(
+                    _failure(
+                        "planning.facade_intent_invalid",
+                        detail=(
+                            "intent must be new, revise, retry, resume, status, "
+                            "show, cancel, or resolve_delivery."
+                        ),
+                    )
+                )
+
+        admission = current_planning_gateway_admission()
+        if not admission.eligible:
+            return _json(
+                _failure(
+                    "planning.bound_gateway_ineligible",
+                    detail=(
+                        "Planning is unavailable from this bound gateway "
+                        "because it cannot produce a provider-confirmed exact "
+                        "delivery receipt. No Planning state was changed."
+                    ),
+                    provider=admission.provider or None,
+                    reason=admission.reason,
+                    nextAction=(
+                        "Continue from a directly bound gateway that supports "
+                        "provider-confirmed exact Planning delivery."
+                    ),
+                    retryable=False,
+                    outcomeAmbiguous=False,
+                )
+            )
+
         client = PlanningV2Client()
         if tool_name == _APPROVAL_TOOL:
             return _json(
@@ -1221,24 +1984,6 @@ def invoke_public_tasking_tool(
                     client=client,
                     arguments=arguments,
                     runtime_kwargs=runtime_kwargs,
-                )
-            )
-        if tool_name != _PLAN_TOOL:
-            return _json(
-                _failure(
-                    "planning.facade_public_tool_unsupported",
-                    detail=f"Unsupported public tasking alias: {tool_name!r}.",
-                )
-            )
-        intent = str(arguments.get("intent") or "").strip().lower()
-        if intent not in _PLAN_INTENTS:
-            return _json(
-                _failure(
-                    "planning.facade_intent_invalid",
-                    detail=(
-                        "intent must be new, revise, retry, resume, status, "
-                        "show, or cancel."
-                    ),
                 )
             )
         if intent in {"new", "revise", "retry", "resume"}:
@@ -1290,15 +2035,24 @@ def invoke_public_tasking_tool(
             )
         elif intent == "status":
             result = _forward(
-                _status(
+                _status_with_delivery_attention(
+                    client=client,
                     thread_id=str(thread["threadId"]),
                     runtime_kwargs=runtime_kwargs,
+                    arguments=arguments,
                 ),
                 intent="status",
                 title=thread.get("title"),
             )
         elif intent == "show":
             result = _show(
+                client=client,
+                thread=thread,
+                arguments=arguments,
+                runtime_kwargs=runtime_kwargs,
+            )
+        elif intent == "resolve_delivery":
+            result = _resolve_delivery(
                 client=client,
                 thread=thread,
                 arguments=arguments,

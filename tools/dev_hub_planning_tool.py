@@ -11,7 +11,6 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 import json
-import secrets
 from typing import Any, Mapping, Optional
 
 from hermes_cli.dev_hub_planning_v2 import (
@@ -36,16 +35,19 @@ from hermes_cli.turn_origin import (
 )
 from hermes_cli.planning_preview_delivery import (
     ProviderDeliveryReceipt,
+    canonical_preview_delivery_target,
+    derive_preview_delivery_nonce,
     register_preview_delivery_intent,
 )
 from hermes_cli.planning_artifact_spool import (
     ArtifactRecoveryRecord,
     acknowledge_artifact_recovery,
     load_artifact_recovery,
+    load_artifact_recovery_completion,
     load_registered_artifact_recovery,
     register_artifact_recovery,
 )
-from tools.registry import registry, tool_error, tool_result
+from tools.registry import tool_error, tool_result
 
 
 PLANNING_V2_TOOLSET = "planning_v2"
@@ -706,8 +708,15 @@ def _consume_artifact_recovery(
     )
 
 
-def _finish_artifact_recovery(token: str) -> None:
-    acknowledge_artifact_recovery(token)
+def _finish_artifact_recovery(
+    token: str,
+    *,
+    completion: Mapping[str, Any],
+) -> None:
+    acknowledge_artifact_recovery(
+        token,
+        completion=completion,
+    )
 
 
 def _artifact_position(args: Mapping[str, Any]) -> int:
@@ -1020,11 +1029,65 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                     attachment_identity=attachment_identity,
                     ingress_ordinal=ingress_ordinal,
                 )
+                completed = load_artifact_recovery_completion(
+                    recovery_token,
+                    current_origin=current_origin,
+                )
+                if completed is not None:
+                    replay = {
+                        **completed,
+                        "uploadReplayed": True,
+                        "completionReplayed": True,
+                    }
+                    artifact = completed["artifact"]
+                    if (
+                        artifact.get("role") != role
+                        or artifact.get("position") != position
+                    ):
+                        replay["immutableLabelReceipt"] = {
+                            "disposition": (
+                                "canonical_first_completion_replayed"
+                            ),
+                            "requested": {
+                                "role": role,
+                                "position": position,
+                            },
+                            "canonical": {
+                                "role": artifact["role"],
+                                "position": artifact["position"],
+                            },
+                        }
+                    replay["nextStep"] = (
+                        "Upload every remaining attachment with its own role "
+                        "and 1-based position. After all artifacts are stored "
+                        "as immutable inputs, start the run."
+                    )
+                    replay["startRunAction"] = {
+                        "tool": PLANNING_V2_TOOL_NAME,
+                        "arguments": {
+                            "action": "start_run",
+                            "thread_id": thread_id,
+                        },
+                    }
+                    return tool_result(replay)
                 recovery = load_registered_artifact_recovery(
                     recovery_token,
                     current_origin=current_origin,
                 )
                 local_path = recovery.snapshot_path
+                # Registration is first-writer authoritative. The same
+                # provider attachment may be described with different model
+                # labels on a retry, but it must replay the original upload
+                # contract rather than mutate role/position under the same
+                # ingress identity.
+                role = recovery.role
+                position = recovery.position
+                required = recovery.required
+                idempotency_key = recovery.idempotency_key
+                content_type = recovery.content_type
+                retain_until = recovery.retain_until
+                attachment_identity = recovery.attachment_identity
+                ingress_ordinal = recovery.ingress_ordinal
             recovery_arguments: dict[str, Any] = {
                 "action": "upload_artifact",
                 "recovery_token": recovery_token,
@@ -1114,21 +1177,27 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                 )
             partial["inputStored"] = True
             partial["inputReplayed"] = input_replayed
-            _finish_artifact_recovery(recovery_token)
+            completion = {
+                "ok": True,
+                "action": action,
+                "threadId": thread_id,
+                "artifact": descriptor,
+                "storageMode": upload["storage"].get("mode"),
+                "uploadDisposition": upload["disposition"],
+                "uploadReplayed": (
+                    upload["disposition"] == "replayed"
+                ),
+                "inputStored": True,
+                "inputReplayed": input_replayed,
+                "previewInvalidated": preview_invalidated,
+            }
+            _finish_artifact_recovery(
+                recovery_token,
+                completion=completion,
+            )
             return tool_result(
                 {
-                    "ok": True,
-                    "action": action,
-                    "threadId": thread_id,
-                    "artifact": descriptor,
-                    "storageMode": upload["storage"].get("mode"),
-                    "uploadDisposition": upload["disposition"],
-                    "uploadReplayed": (
-                        upload["disposition"] == "replayed"
-                    ),
-                    "inputStored": True,
-                    "inputReplayed": input_replayed,
-                    "previewInvalidated": preview_invalidated,
+                    **completion,
                     "nextStep": (
                         "Upload every remaining attachment with its own role "
                         "and 1-based position. After all artifacts are stored "
@@ -1220,7 +1289,21 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
             # register a generation-fenced delivery intent. The callback can
             # write a receipt only after the provider returns SendResult.success.
             origin = client.current_origin()
-            delivery_nonce = "preview-delivery-" + secrets.token_urlsafe(24)
+            delivery_nonce = derive_preview_delivery_nonce(
+                planning_thread_id=thread_id,
+                preview_result_id=preview_result_id,
+                preview_result_hash=preview["previewResultHash"],
+                offset=preview["offset"],
+                count=preview["returned"],
+                page_digest=preview["pageDigest"],
+                origin=origin,
+            )
+            delivery_target = canonical_preview_delivery_target(
+                provider=origin["provider"],
+                gateway_account_id=origin["gatewayAccountId"],
+                chat_id=origin["chatId"],
+                thread_id=origin["threadId"],
+            )
             receipt_key = derive_preview_review_idempotency_key(
                 runner_id=client.runner_id,
                 thread_id=thread_id,
@@ -1298,6 +1381,39 @@ def _handle_planning_v2(args: dict, **kwargs: Any) -> str:
                 ],
                 delivery_nonce=delivery_nonce,
                 acknowledge=_acknowledge_after_delivery,
+                delivery_target=delivery_target,
+                acknowledgement_request={
+                    "schemaVersion": "planning.preview-ack-request.v1",
+                    "threadId": thread_id,
+                    "previewResultId": preview_result_id,
+                    "idempotencyKey": receipt_key,
+                    "expectedPreviewHash": preview["previewResultHash"],
+                    "offset": preview["offset"],
+                    "count": preview["returned"],
+                    "pageDigest": preview["pageDigest"],
+                    "origin": dict(origin),
+                    "deliveryProofBase": {
+                        "schemaVersion": (
+                            "planning.preview-delivery-proof.v1"
+                        ),
+                        "deliveryNonce": delivery_nonce,
+                        "provider": origin["provider"],
+                        "gatewayInstanceId": origin[
+                            "gatewayInstanceId"
+                        ],
+                        "gatewayAccountId": origin[
+                            "gatewayAccountId"
+                        ],
+                        "chatId": origin["chatId"],
+                        "previewResultId": preview_result_id,
+                        "previewResultHash": preview[
+                            "previewResultHash"
+                        ],
+                        "offset": preview["offset"],
+                        "count": preview["returned"],
+                        "pageDigest": preview["pageDigest"],
+                    },
+                },
             )
             result["deliveryReceiptPending"] = registered
             if not registered:
@@ -1779,16 +1895,6 @@ PLANNING_V2_SCHEMA = {
         "required": ["action"],
     },
 }
-
-
-registry.register(
-    name=PLANNING_V2_TOOL_NAME,
-    toolset=PLANNING_V2_TOOLSET,
-    schema=PLANNING_V2_SCHEMA,
-    handler=_handle_planning_v2,
-    check_fn=_check_planning_v2_requirements,
-    emoji="🧭",
-)
 
 
 __all__ = [

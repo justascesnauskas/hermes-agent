@@ -27,7 +27,11 @@ Design notes:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
+import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -36,6 +40,45 @@ from typing import Optional
 _USAGE_EXIT = 2
 _FAILURE_EXIT = 1
 _SUCCESS_EXIT = 0
+_DELIVERY_SCOPE_ID = re.compile(r"^scope_[0-9a-f]{48}$")
+_DELIVERY_PROVIDER = re.compile(r"^[a-z][a-z0-9_-]{0,119}$")
+_DELIVERY_PROFILE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+_REGISTRY_CHILD_ENV_ALLOWLIST = frozenset(
+    {
+        "COMSPEC",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LD_LIBRARY_PATH",
+        "LOGNAME",
+        "NO_COLOR",
+        "PATH",
+        "PATHEXT",
+        "PYTHONHOME",
+        "PYTHONIOENCODING",
+        "PYTHONPATH",
+        "PYTHONUTF8",
+        "SYSTEMROOT",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "TMPDIR",
+        "USER",
+        "VIRTUAL_ENV",
+        "WINDIR",
+    }
+)
+
+
+def _valid_gateway_account_id(value: str) -> bool:
+    return bool(
+        value
+        and value == value.strip()
+        and len(value) <= 500
+        and all(ord(character) >= 32 and ord(character) != 127 for character in value)
+    )
 
 
 def _read_message_body(
@@ -295,13 +338,442 @@ def _load_hermes_env() -> None:
         os.environ[key] = str(val)
 
 
+def _platform_name(value: object) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw or "").strip().lower()
+
+
+def _configured_delivery_accounts() -> list[tuple[str, str]]:
+    """Return enabled, explicitly identified accounts for the active profile."""
+
+    from gateway.config import load_gateway_config
+    from gateway.platform_registry import supports_semantic_exact_attempt
+
+    config = load_gateway_config()
+    accounts: list[tuple[str, str]] = []
+    for platform, platform_config in config.platforms.items():
+        if not platform_config.enabled:
+            continue
+        provider = _platform_name(platform)
+        # Registry rows are dispatch authority, not a generic inventory.
+        # Publishing an incapable account would let Hub fence work that this
+        # Hermes route can only reject.
+        if not supports_semantic_exact_attempt(provider):
+            continue
+        extra = (
+            platform_config.extra
+            if isinstance(platform_config.extra, dict)
+            else {}
+        )
+        raw_gateway_account_id = extra.get("gateway_account_id")
+        if raw_gateway_account_id is None:
+            continue
+        gateway_account_id = str(raw_gateway_account_id)
+        if (
+            _DELIVERY_PROVIDER.fullmatch(provider) is None
+            or not _valid_gateway_account_id(gateway_account_id)
+        ):
+            raise ValueError(
+                f"invalid semantic delivery account for provider {provider!r}"
+            )
+        accounts.append((provider, gateway_account_id))
+    return sorted(set(accounts))
+
+
+def _delivery_account_is_configured(
+    provider: str,
+    gateway_account_id: str,
+) -> bool:
+    exact = (provider.strip().lower(), gateway_account_id.strip())
+    try:
+        return exact in _configured_delivery_accounts()
+    except Exception:
+        return False
+
+
+def _current_delivery_scope_registry() -> dict:
+    """Describe the active profile without reading any sibling profile."""
+
+    from hermes_cli.profiles import get_active_profile_name
+    from hermes_cli.semantic_delivery import (
+        SEMANTIC_DELIVERY_CONTRACT,
+        semantic_delivery_scope_id,
+    )
+
+    profile = get_active_profile_name()
+    scope_id = semantic_delivery_scope_id()
+    if _DELIVERY_SCOPE_ID.fullmatch(scope_id) is None:
+        raise ValueError("semantic delivery ledger emitted an invalid scope id")
+    accounts = [
+        {
+            "profile": profile,
+            "provider": provider,
+            "gateway_account_id": gateway_account_id,
+            "delivery_scope_id": scope_id,
+        }
+        for provider, gateway_account_id in _configured_delivery_accounts()
+    ]
+    return {
+        "delivery_contract": SEMANTIC_DELIVERY_CONTRACT,
+        "accounts": accounts,
+    }
+
+
+def _registry_child_env(root_home: Path) -> dict[str, str]:
+    """Build a non-secret child environment for one exact profile."""
+
+    child_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _REGISTRY_CHILD_ENV_ALLOWLIST
+    }
+    # ``-p`` resolves named profiles relative to this root. No provider token,
+    # API key, account id, or profile dotenv value is inherited from the parent.
+    child_env["HERMES_HOME"] = str(root_home)
+    child_env["HERMES_DELIVERY_REGISTRY_CHILD"] = "1"
+    return child_env
+
+
+def _decode_registry_child(stdout: str) -> dict:
+    """Decode the final JSON line while tolerating profile bootstrap notices."""
+
+    for line in reversed(stdout.splitlines()):
+        clean = line.strip()
+        if not clean:
+            continue
+        try:
+            payload = json.loads(clean)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise ValueError("registry child did not emit a JSON object")
+
+
+def _registry_profile_child(
+    profile: str,
+    root_home: Path,
+) -> tuple[str, dict]:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "-p",
+            profile,
+            "send",
+            "--json",
+            "--delivery-scopes-current",
+        ],
+        cwd=str(Path.cwd()),
+        env=_registry_child_env(root_home),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != _SUCCESS_EXIT:
+        raise RuntimeError(
+            f"profile {profile!r} registry child exited "
+            f"{completed.returncode}"
+        )
+    return profile, _decode_registry_child(completed.stdout)
+
+
+def _semantic_registry_profiles(root_home: Path) -> list[str]:
+    """Enumerate only profile homes provisioning is allowed to own.
+
+    Ordinary gateway profile multiplexing retains its existing behavior.
+    Semantic authority discovery is intentionally narrower: it never follows
+    a symlinked ``profiles`` root or a symlinked named profile into an
+    unprovisioned/outside home.
+    """
+
+    profiles = ["default"]
+    profiles_root = root_home / "profiles"
+    if not profiles_root.is_dir() or profiles_root.is_symlink():
+        return profiles
+    try:
+        profiles_root_resolved = profiles_root.resolve(strict=True)
+        children = sorted(profiles_root.iterdir())
+    except OSError:
+        return profiles
+    for child in children:
+        if child.is_symlink():
+            continue
+        try:
+            child_resolved = child.resolve(strict=True)
+        except OSError:
+            continue
+        if (
+            child.is_dir()
+            and child.name != "default"
+            and _DELIVERY_PROFILE.fullmatch(child.name) is not None
+            and child_resolved.parent == profiles_root_resolved
+        ):
+            profiles.append(child.name)
+    return sorted(profiles)
+
+
+def _all_delivery_scope_registry() -> dict:
+    """Discover every profile in a separate, credential-isolated process."""
+
+    from hermes_constants import get_default_hermes_root
+    from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+    root_home = get_default_hermes_root()
+    all_accounts: list[dict] = []
+    seen_accounts: dict[tuple[str, str], str] = {}
+    expected_keys = {
+        "profile",
+        "provider",
+        "gateway_account_id",
+        "delivery_scope_id",
+    }
+    profiles = _semantic_registry_profiles(root_home)
+    if profiles:
+        with ThreadPoolExecutor(max_workers=min(8, len(profiles))) as executor:
+            child_payloads = list(
+                executor.map(
+                    lambda profile: _registry_profile_child(
+                        profile,
+                        root_home,
+                    ),
+                    profiles,
+                )
+            )
+    else:
+        child_payloads = []
+
+    for profile, payload in child_payloads:
+        if (
+            payload.get("delivery_contract")
+            != SEMANTIC_DELIVERY_CONTRACT
+            or not isinstance(payload.get("accounts"), list)
+        ):
+            raise ValueError(
+                f"profile {profile!r} emitted an invalid registry contract"
+            )
+        for raw_row in payload["accounts"]:
+            if not isinstance(raw_row, dict) or set(raw_row) != expected_keys:
+                raise ValueError(
+                    f"profile {profile!r} emitted an invalid account row"
+                )
+            row = {
+                key: str(raw_row[key] or "").strip()
+                for key in expected_keys
+            }
+            if (
+                row["profile"] != profile
+                or _DELIVERY_PROVIDER.fullmatch(row["provider"]) is None
+                or not _valid_gateway_account_id(row["gateway_account_id"])
+                or _DELIVERY_SCOPE_ID.fullmatch(
+                    row["delivery_scope_id"]
+                ) is None
+            ):
+                raise ValueError(
+                    f"profile {profile!r} emitted an incomplete account row"
+                )
+            identity = (row["provider"], row["gateway_account_id"])
+            owner = seen_accounts.get(identity)
+            if owner is not None:
+                raise ValueError(
+                    "duplicate semantic delivery account "
+                    f"{identity[0]}:{identity[1]} in profiles "
+                    f"{owner!r} and {profile!r}"
+                )
+            seen_accounts[identity] = profile
+            all_accounts.append(row)
+    all_accounts.sort(
+        key=lambda row: (
+            row["profile"],
+            row["provider"],
+            row["gateway_account_id"],
+        )
+    )
+    return {
+        "delivery_contract": SEMANTIC_DELIVERY_CONTRACT,
+        "accounts": all_accounts,
+    }
+
+
+def _emit_delivery_registry(args: argparse.Namespace) -> None:
+    try:
+        payload = _all_delivery_scope_registry()
+    except Exception as exc:
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+        payload = {
+            "delivery_contract": SEMANTIC_DELIVERY_CONTRACT,
+            "accounts": [],
+            "error": "semantic_delivery_scope_discovery_failed",
+            "outcome": "rejected",
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        else:
+            print(f"hermes send: {payload['error']}: {exc}", file=sys.stderr)
+        sys.exit(_FAILURE_EXIT)
+
+    if getattr(args, "json", False):
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    else:
+        for row in payload["accounts"]:
+            print(
+                f"{row['profile']} {row['provider']} "
+                f"{row['gateway_account_id']} {row['delivery_scope_id']}"
+            )
+    sys.exit(_SUCCESS_EXIT)
+
+
+def _semantic_authority_changed(
+    *,
+    delivery_contract: str,
+    delivery_id: str,
+    delivery_scope_id: str,
+    provider: str,
+    gateway_account_id: str,
+    target: str = "",
+    current_delivery_scope_id: str = "",
+) -> dict:
+    payload = {
+        "delivery_contract": delivery_contract,
+        "delivery_id": delivery_id,
+        "delivery_scope_id": delivery_scope_id,
+        "error": "semantic_delivery_authority_changed",
+        "gateway_account_id": gateway_account_id,
+        "outcome": "retryable",
+        "provider": provider,
+        "provider_write_attempted": False,
+        "provider_write_started": False,
+        "replay_strategy": "none",
+        "replayed": False,
+        "target": target,
+    }
+    if current_delivery_scope_id:
+        payload["current_delivery_scope_id"] = current_delivery_scope_id
+    return payload
+
+
 def cmd_send(args: argparse.Namespace) -> None:
     """Entry point wired into the top-level argparse dispatcher."""
+
+    if getattr(args, "delivery_scopes", False):
+        if (
+            getattr(args, "to", None)
+            or getattr(args, "message", None)
+            or getattr(args, "file", None)
+            or getattr(args, "subject", None)
+            or getattr(args, "quiet", False)
+            or getattr(args, "list_targets", False)
+            or getattr(args, "delivery_contract", None)
+            or getattr(args, "delivery_id", None)
+            or getattr(args, "delivery_scope", False)
+            or getattr(args, "delivery_scope_id", None)
+            or getattr(args, "delivery_status", False)
+            or getattr(args, "delivery_scopes_current", False)
+            or getattr(args, "gateway_account_id", None)
+            or getattr(args, "delivery_provider", None)
+        ):
+            print(
+                "hermes send: --delivery-scopes is a read-only registry "
+                "lookup and cannot be combined with another send mode",
+                file=sys.stderr,
+            )
+            sys.exit(_USAGE_EXIT)
+        # This must run before `_load_hermes_env`: registry children receive a
+        # strict allowlist and load only their exact `-p` profile credentials.
+        _emit_delivery_registry(args)
+
+    if getattr(args, "list_targets", False) and any(
+        (
+            getattr(args, "delivery_contract", None),
+            getattr(args, "delivery_id", None),
+            getattr(args, "delivery_scope", False),
+            getattr(args, "delivery_scope_id", None),
+            getattr(args, "delivery_status", False),
+            getattr(args, "delivery_scopes_current", False),
+            getattr(args, "gateway_account_id", None),
+            getattr(args, "delivery_provider", None),
+        )
+    ):
+        print(
+            "hermes send: --list cannot be combined with semantic delivery "
+            "flags",
+            file=sys.stderr,
+        )
+        sys.exit(_USAGE_EXIT)
 
     # Bridge ~/.hermes/.env and ~/.hermes/config.yaml into os.environ so the
     # gateway config loader (invoked downstream by send_message_tool and by
     # the channel directory) can see platform credentials and home channels.
     _load_hermes_env()
+
+    if getattr(args, "delivery_scopes_current", False):
+        if os.environ.get("HERMES_DELIVERY_REGISTRY_CHILD") != "1":
+            print(
+                "hermes send: --delivery-scopes-current is reserved for an "
+                "isolated registry child",
+                file=sys.stderr,
+            )
+            sys.exit(_USAGE_EXIT)
+        if (
+            getattr(args, "to", None)
+            or getattr(args, "message", None)
+            or getattr(args, "file", None)
+            or getattr(args, "subject", None)
+            or getattr(args, "quiet", False)
+            or getattr(args, "list_targets", False)
+            or getattr(args, "delivery_contract", None)
+            or getattr(args, "delivery_id", None)
+            or getattr(args, "delivery_scope", False)
+            or getattr(args, "delivery_scope_id", None)
+            or getattr(args, "delivery_status", False)
+            or getattr(args, "gateway_account_id", None)
+            or getattr(args, "delivery_provider", None)
+        ):
+            print(
+                "hermes send: --delivery-scopes-current is an isolated "
+                "read-only registry child mode",
+                file=sys.stderr,
+            )
+            sys.exit(_USAGE_EXIT)
+        payload = _current_delivery_scope_registry()
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        sys.exit(_SUCCESS_EXIT)
+
+    if getattr(args, "delivery_scope", False):
+        if (
+            getattr(args, "to", None)
+            or getattr(args, "message", None)
+            or getattr(args, "file", None)
+            or getattr(args, "delivery_contract", None)
+            or getattr(args, "delivery_id", None)
+            or getattr(args, "delivery_scope_id", None)
+            or getattr(args, "delivery_status", False)
+            or getattr(args, "gateway_account_id", None)
+            or getattr(args, "delivery_provider", None)
+        ):
+            print(
+                "hermes send: --delivery-scope is a read-only lookup and "
+                "cannot be combined with a target, message, or delivery claim",
+                file=sys.stderr,
+            )
+            sys.exit(_USAGE_EXIT)
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+            semantic_delivery_scope_id,
+        )
+
+        payload = {
+            "delivery_contract": SEMANTIC_DELIVERY_CONTRACT,
+            "delivery_scope_id": semantic_delivery_scope_id(),
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        else:
+            print(payload["delivery_scope_id"])
+        sys.exit(_SUCCESS_EXIT)
 
     # --list short-circuits everything else.
     if getattr(args, "list_targets", False):
@@ -310,6 +782,94 @@ def cmd_send(args: argparse.Namespace) -> None:
         platform_filter = getattr(args, "message", None)
         exit_code = _list_targets(platform_filter, json_mode=getattr(args, "json", False))
         sys.exit(exit_code)
+
+    if getattr(args, "delivery_status", False):
+        delivery_contract = (
+            getattr(args, "delivery_contract", None) or ""
+        ).strip()
+        delivery_id = (
+            getattr(args, "delivery_id", None) or ""
+        ).strip()
+        delivery_scope_id = (
+            getattr(args, "delivery_scope_id", None) or ""
+        ).strip()
+        delivery_provider = (
+            getattr(args, "delivery_provider", None) or ""
+        ).strip().lower()
+        gateway_account_id = (
+            getattr(args, "gateway_account_id", None) or ""
+        ).strip()
+        if (
+            getattr(args, "to", None)
+            or getattr(args, "message", None)
+            or getattr(args, "file", None)
+            or not delivery_contract
+            or not delivery_id
+            or not delivery_scope_id
+            or not delivery_provider
+            or not gateway_account_id
+        ):
+            print(
+                "hermes send: --delivery-status requires "
+                "--delivery-contract, --delivery-id, and "
+                "--delivery-scope-id, --delivery-provider, and "
+                "--gateway-account-id, without a target or message",
+                file=sys.stderr,
+            )
+            sys.exit(_USAGE_EXIT)
+        if not _delivery_account_is_configured(
+            delivery_provider,
+            gateway_account_id,
+        ):
+            payload = _semantic_authority_changed(
+                delivery_contract=delivery_contract,
+                delivery_id=delivery_id,
+                delivery_scope_id=delivery_scope_id,
+                provider=delivery_provider,
+                gateway_account_id=gateway_account_id,
+            )
+            if getattr(args, "json", False):
+                print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+            else:
+                print(payload["outcome"])
+            sys.exit(_FAILURE_EXIT)
+        from hermes_cli.semantic_delivery import (
+            semantic_delivery_scope_id,
+            semantic_delivery_status,
+        )
+
+        current_scope_id = semantic_delivery_scope_id()
+        if current_scope_id != delivery_scope_id:
+            payload = _semantic_authority_changed(
+                delivery_contract=delivery_contract,
+                delivery_id=delivery_id,
+                delivery_scope_id=delivery_scope_id,
+                provider=delivery_provider,
+                gateway_account_id=gateway_account_id,
+                current_delivery_scope_id=current_scope_id,
+            )
+            if getattr(args, "json", False):
+                print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+            else:
+                print(payload["outcome"])
+            sys.exit(_FAILURE_EXIT)
+
+        payload = semantic_delivery_status(
+            delivery_id=delivery_id,
+            contract_version=delivery_contract,
+            expected_scope_id=delivery_scope_id,
+            expected_provider=delivery_provider,
+            gateway_account_id=gateway_account_id,
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        else:
+            print(payload.get("outcome", "unknown"))
+        sys.exit(
+            _SUCCESS_EXIT
+            if payload.get("success") is True
+            else _FAILURE_EXIT
+        )
 
     target = _resolve_target(getattr(args, "to", None))
     if not target:
@@ -341,22 +901,120 @@ def cmd_send(args: argparse.Namespace) -> None:
     if subject:
         message = f"{subject}\n\n{message.lstrip()}"
 
-    # Import lazily so `hermes send --help` stays fast and does not pull in
-    # the full tool registry / gateway config stack.
+    delivery_contract = (
+        getattr(args, "delivery_contract", None) or ""
+    ).strip()
+    delivery_id = (getattr(args, "delivery_id", None) or "").strip()
+    delivery_scope_id = (
+        getattr(args, "delivery_scope_id", None) or ""
+    ).strip()
+    gateway_account_id = (
+        getattr(args, "gateway_account_id", None) or ""
+    ).strip()
+    delivery_provider = (
+        getattr(args, "delivery_provider", None) or ""
+    ).strip()
+    if delivery_provider:
+        print(
+            "hermes send: --delivery-provider is valid only with "
+            "--delivery-status",
+            file=sys.stderr,
+        )
+        sys.exit(_USAGE_EXIT)
+    if (
+        bool(delivery_contract) != bool(delivery_id)
+        or bool(delivery_contract) != bool(delivery_scope_id)
+        or bool(delivery_contract) != bool(gateway_account_id)
+    ):
+        print(
+            "hermes send: --delivery-contract, --delivery-id, and "
+            "--delivery-scope-id, and --gateway-account-id must be "
+            "provided together",
+            file=sys.stderr,
+        )
+        sys.exit(_USAGE_EXIT)
+
+    provider = target.partition(":")[0].strip().lower()
+    if delivery_contract and not _delivery_account_is_configured(
+        provider,
+        gateway_account_id,
+    ):
+        payload = _semantic_authority_changed(
+            delivery_contract=delivery_contract,
+            delivery_id=delivery_id,
+            delivery_scope_id=delivery_scope_id,
+            provider=provider,
+            gateway_account_id=gateway_account_id,
+            target=target,
+        )
+        result = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        exit_code = _emit_result(
+            result,
+            json_mode=getattr(args, "json", False),
+            quiet=getattr(args, "quiet", False),
+        )
+        sys.exit(exit_code)
+
+    if delivery_contract:
+        from hermes_cli.semantic_delivery import semantic_delivery_scope_id
+
+        current_scope_id = semantic_delivery_scope_id()
+        if current_scope_id != delivery_scope_id:
+            result = json.dumps(
+                _semantic_authority_changed(
+                    delivery_contract=delivery_contract,
+                    delivery_id=delivery_id,
+                    delivery_scope_id=delivery_scope_id,
+                    provider=provider,
+                    gateway_account_id=gateway_account_id,
+                    target=target,
+                    current_delivery_scope_id=current_scope_id,
+                ),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            exit_code = _emit_result(
+                result,
+                json_mode=getattr(args, "json", False),
+                quiet=getattr(args, "quiet", False),
+            )
+            sys.exit(exit_code)
+
+    # Import only after semantic account prevalidation so an invalid
+    # profile/provider/account claim cannot enter any provider code path.
     from tools.send_message_tool import send_message_tool
 
-    # send_message_tool auto-loads gateway config + env and routes to the
-    # appropriate platform adapter (bot-token path for Telegram/Discord/Slack/
-    # Signal/SMS/WhatsApp; live-adapter path for plugin platforms).
-    #
-    # It expects the standard tool-call dict and returns a JSON string.
-    tool_args = {
-        "action": "send",
-        "target": target,
-        "message": message,
-    }
+    if delivery_contract:
+        from hermes_cli.semantic_delivery import semantic_send
 
-    result = send_message_tool(tool_args)
+        result = json.dumps(
+            semantic_send(
+                delivery_id=delivery_id,
+                contract_version=delivery_contract,
+                target=target,
+                message=message,
+                send=send_message_tool,
+                expected_scope_id=delivery_scope_id,
+                gateway_account_id=gateway_account_id,
+            ),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    else:
+        result = send_message_tool(
+            {
+                "action": "send",
+                "target": target,
+                "message": message,
+            }
+        )
     exit_code = _emit_result(
         result,
         json_mode=getattr(args, "json", False),
@@ -462,6 +1120,56 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Emit raw JSON result instead of human-readable output.",
+    )
+
+    parser.add_argument(
+        "--delivery-contract",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--delivery-id",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--delivery-scope",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--delivery-scopes",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--delivery-scopes-current",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--delivery-scope-id",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--delivery-status",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--delivery-provider",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--gateway-account-id",
+        default=None,
+        help=argparse.SUPPRESS,
     )
 
     parser.set_defaults(func=cmd_send)

@@ -44,6 +44,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.helpers import redact_phone
 from gateway.platforms.signal_format import markdown_to_signal
+from gateway.platforms.signal_result import validate_signal_send_result
 from gateway.platforms.signal_rate_limit import (
     SIGNAL_BATCH_PACING_NOTICE_THRESHOLD,
     SIGNAL_MAX_ATTACHMENTS_PER_MSG,
@@ -54,6 +55,43 @@ from gateway.platforms.signal_rate_limit import (
     _is_signal_rate_limit_error,
     _signal_send_timeout,
     get_scheduler,
+)
+from gateway.platform_registry import declare_semantic_exact_attempt
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    provider_protocol_rejection_evidence,
+    provider_rejection_evidence,
+    provider_rejection_error,
+)
+
+
+async def _standalone_semantic_exact_attempt(
+    pconfig: Any,
+    chat_id: str,
+    message: str,
+    *,
+    media_files: list[tuple[str, bool]] | None = None,
+    **_semantic_identity: Any,
+) -> dict[str, Any]:
+    """Own Signal's audited one-JSON-RPC standalone exact primitive."""
+
+    from tools.send_message_tool import _send_signal
+
+    return await _send_signal(
+        getattr(pconfig, "extra", {}) or {},
+        chat_id,
+        message,
+        media_files=media_files,
+        semantic_exact_attempt=True,
+    )
+
+
+declare_semantic_exact_attempt(
+    "signal",
+    standalone=True,
+    live=True,
+    owner=__name__,
+    standalone_sender_fn=_standalone_semantic_exact_attempt,
 )
 
 logger = logging.getLogger(__name__)
@@ -260,6 +298,21 @@ class SignalAdapter(BasePlatformAdapter):
     # so streaming suppresses the visible cursor instead of leaving a stale tofu
     # square behind in chat clients when edit attempts fail.
     SUPPORTS_MESSAGE_EDITING = False
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="signal",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="signal-logical-v1",
+        max_logical_units=4_000,
+        length_semantics="unicode_codepoints",
+        wire_encoding="signal-native-text-styles-v1",
+    )
+
+    async def send_semantic_exact_attempt(self, request):
+        from gateway.semantic_exact_attempt import (
+            semantic_exact_attempt_via_send,
+        )
+
+        return await semantic_exact_attempt_via_send(self, request)
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SIGNAL)
@@ -1001,11 +1054,211 @@ class SignalAdapter(BasePlatformAdapter):
         except SignalRateLimitError:
             raise
         except Exception as e:
+            if (
+                raise_on_rate_limit
+                and getattr(
+                    getattr(e, "response", None),
+                    "status_code",
+                    None,
+                )
+                == 429
+            ):
+                raise SignalRateLimitError(
+                    str(e),
+                    retry_after=None,
+                ) from e
             if log_failures:
                 logger.warning("Signal RPC %s failed: %s", method, e)
             else:
                 logger.debug("Signal RPC %s failed: %s", method, e)
             return None
+
+    async def _semantic_exact_rpc_send(
+        self,
+        params: dict[str, Any],
+    ) -> SendResult:
+        """Perform and classify exactly one Signal JSON-RPC send attempt."""
+
+        if not self.client:
+            return SendResult(
+                success=False,
+                error="Signal semantic transport unavailable",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "send",
+            "params": params,
+            "id": f"send_{int(time.time() * 1000)}",
+        }
+        try:
+            response = await self.client.post(
+                f"{self.http_url}/api/v1/rpc",
+                json=payload,
+                timeout=30.0,
+            )
+        except (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.PoolTimeout,
+        ) as exc:
+            return SendResult(
+                success=False,
+                error=f"Signal semantic transport unavailable: {exc}",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"Signal semantic send outcome is uncertain: {exc}",
+            )
+
+        status = int(response.status_code)
+        response_body = response.text
+        if not 200 <= status < 300:
+            rejection = provider_rejection_evidence(
+                provider="Signal JSON-RPC HTTP",
+                status=status,
+                body=response_body,
+            )
+            if status == 429:
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    retryable=True,
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": True,
+                        "provider_rejection": rejection,
+                    },
+                )
+            if 400 <= status < 500:
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                        "provider_rejection": rejection,
+                    },
+                )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_rejection": rejection,
+                },
+            )
+
+        try:
+            data = response.json()
+        except Exception:
+            rejection = provider_protocol_rejection_evidence(
+                provider="Signal",
+                protocol="signal-json-rpc",
+                response=response_body,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_rejection": rejection,
+                },
+            )
+        if not isinstance(data, dict):
+            rejection = provider_protocol_rejection_evidence(
+                provider="Signal",
+                protocol="signal-json-rpc",
+                response=data,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_rejection": rejection,
+                },
+            )
+        if "error" in data:
+            error = data["error"]
+            rejection = provider_protocol_rejection_evidence(
+                provider="Signal",
+                protocol="signal-json-rpc",
+                response=data,
+            )
+            retryable = _is_signal_rate_limit_error(error)
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                retryable=retryable,
+                retry_after=(
+                    _extract_retry_after_seconds(error)
+                    if retryable
+                    else None
+                ),
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": retryable,
+                    "provider_rejection": rejection,
+                },
+            )
+
+        result = data.get("result")
+        success, _error_message = self._validate_send_result(result)
+        if not success:
+            rejection = provider_protocol_rejection_evidence(
+                provider="Signal",
+                protocol="signal-json-rpc",
+                response=data,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                    "provider_rejection": rejection,
+                },
+            )
+        timestamp = (
+            result.get("timestamp")
+            if isinstance(result, dict)
+            else None
+        )
+        if (
+            not isinstance(timestamp, int)
+            or isinstance(timestamp, bool)
+            or timestamp <= 0
+        ):
+            rejection = provider_protocol_rejection_evidence(
+                provider="Signal",
+                protocol="signal-json-rpc",
+                response=data,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_write_attempted": True,
+                    "provider_retryable": False,
+                    "provider_rejection": rejection,
+                },
+            )
+        self._track_sent_timestamp(result)
+        return SendResult(
+            success=True,
+            message_id=str(timestamp),
+            raw_response=data,
+        )
 
     # ------------------------------------------------------------------
     # Formatting — markdown → Signal body ranges
@@ -1030,23 +1283,7 @@ class SignalAdapter(BasePlatformAdapter):
 
         Returns (success, error_message).
         """
-        if not result or not isinstance(result, dict):
-            return True, None
-
-        results = result.get("results")
-        if isinstance(results, list):
-            for r in results:
-                if not isinstance(r, dict):
-                    continue
-                rtype = r.get("type")
-                if rtype and rtype != "SUCCESS":
-                    return False, str(rtype)
-                if "success" in r and not r.get("success"):
-                    fail = r.get("failure")
-                    if fail:
-                        return False, str(fail)
-                    return False, "Recipient delivery failed"
-        return True, None
+        return validate_signal_send_result(result)
 
     # ------------------------------------------------------------------
     # Sending
@@ -1060,9 +1297,53 @@ class SignalAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a text message with native Signal formatting."""
-        await self._stop_typing_indicator(chat_id)
+        semantic_contract = str(
+            (metadata or {}).get("semantic_delivery_contract") or ""
+        ).strip()
+        semantic_delivery_id = str(
+            (metadata or {}).get("semantic_delivery_id") or ""
+        ).strip()
+        semantic_exact_attempt = bool(
+            semantic_contract or semantic_delivery_id
+        )
+        if semantic_exact_attempt:
+            from hermes_cli.semantic_delivery import (
+                SEMANTIC_DELIVERY_CONTRACT,
+            )
+
+            if (
+                semantic_contract != SEMANTIC_DELIVERY_CONTRACT
+                or not semantic_delivery_id
+            ):
+                return SendResult(
+                    success=False,
+                    error="semantic_delivery_identity_invalid",
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                    },
+                )
+            # Cancel the local task, but do not emit a separate sendTyping RPC:
+            # this delivery identity owns exactly one Signal JSON-RPC attempt.
+            await self._stop_typing_indicator(
+                chat_id,
+                provider_rpc=False,
+            )
+        else:
+            await self._stop_typing_indicator(chat_id)
 
         plain_text, text_styles = self._markdown_to_signal(content)
+        if semantic_exact_attempt and (
+            not plain_text or len(plain_text) > MAX_MESSAGE_LENGTH
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
 
         params: Dict[str, Any] = {
             "account": self.account,
@@ -1078,15 +1359,37 @@ class SignalAdapter(BasePlatformAdapter):
         if chat_id.startswith("group:"):
             params["groupId"] = chat_id[6:]
         else:
-            params["recipient"] = [await self._resolve_recipient(chat_id)]
+            params["recipient"] = [
+                chat_id
+                if semantic_exact_attempt
+                else await self._resolve_recipient(chat_id)
+            ]
 
         logger.info("[Signal] Sending response (%d chars) to %s", len(plain_text), chat_id)
-        result = await self._rpc("send", params)
+        if semantic_exact_attempt:
+            return await self._semantic_exact_rpc_send(params)
+        try:
+            result = await self._rpc("send", params)
+        except SignalRateLimitError as exc:
+            return SendResult(
+                success=False,
+                error="Signal RPC rate limited",
+                retryable=True,
+                retry_after=exc.retry_after,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
 
         if result is not None:
             success, err_msg = self._validate_send_result(result)
             if not success:
-                return SendResult(success=False, error=err_msg, raw_response=result)
+                return SendResult(
+                    success=False,
+                    error=err_msg,
+                    raw_response=result,
+                )
             self._track_sent_timestamp(result)
             # Signal has no editable message identifier. Returning None keeps the
             # stream consumer on the non-edit fallback path instead of pretending
@@ -1513,7 +1816,12 @@ class SignalAdapter(BasePlatformAdapter):
     # Typing Indicators
     # ------------------------------------------------------------------
 
-    async def _stop_typing_indicator(self, chat_id: str) -> None:
+    async def _stop_typing_indicator(
+        self,
+        chat_id: str,
+        *,
+        provider_rpc: bool = True,
+    ) -> None:
         """Stop a typing indicator loop for a chat."""
         task = self._typing_tasks.pop(chat_id, None)
         if task:
@@ -1527,23 +1835,26 @@ class SignalAdapter(BasePlatformAdapter):
         # indicator immediately instead of waiting for Signal's ~5s built-in
         # timeout.  Failures are best-effort — the backoff state must still be
         # cleared so the next agent turn starts clean.
-        try:
-            params: Dict[str, Any] = {"account": self.account}
-            if chat_id.startswith("group:"):
-                params["groupId"] = chat_id[6:]
-            else:
-                params["recipient"] = [await self._resolve_recipient(chat_id)]
-            params["stop"] = True
-            await self._rpc(
-                "sendTyping",
-                params,
-                rpc_id="typing-stop",
-                log_failures=False,
-            )
-        except Exception:
-            # Best-effort: any RPC failure (or recipient-resolution failure)
-            # must not prevent backoff cleanup.
-            pass
+        if provider_rpc:
+            try:
+                params: Dict[str, Any] = {"account": self.account}
+                if chat_id.startswith("group:"):
+                    params["groupId"] = chat_id[6:]
+                else:
+                    params["recipient"] = [
+                        await self._resolve_recipient(chat_id)
+                    ]
+                params["stop"] = True
+                await self._rpc(
+                    "sendTyping",
+                    params,
+                    rpc_id="typing-stop",
+                    log_failures=False,
+                )
+            except Exception:
+                # Best-effort: any RPC failure (or recipient-resolution
+                # failure) must not prevent backoff cleanup.
+                pass
 
         self._typing_failures.pop(chat_id, None)
         self._typing_skip_until.pop(chat_id, None)

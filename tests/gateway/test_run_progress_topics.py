@@ -6,6 +6,7 @@ import sys
 import time
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -739,6 +740,27 @@ class QueuedFailedEmptyAgent:
         }
 
 
+class QueuedPlanningIneligibleAgent:
+    """A queued turn must wait when the first Planning preview cannot send."""
+
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        return {
+            "final_response": (
+                "Signed Planning preview"
+                if type(self).calls == 1
+                else "queued follow-up processed"
+            ),
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
@@ -1176,6 +1198,52 @@ async def test_run_agent_sends_normalized_failure_before_queued_followup(
     assert QueuedFailedEmptyAgent.calls == 2
     assert result["final_response"] == "follow-up processed"
     assert any("The request failed: provider exploded" in text for text in sent_texts)
+
+
+@pytest.mark.asyncio
+async def test_queued_planning_ineligible_never_falls_back_or_runs_next_turn(
+    monkeypatch,
+    tmp_path,
+):
+    """The queued branch must preserve the same fail-closed preflight as base."""
+
+    from hermes_cli import planning_preview_delivery
+
+    QueuedPlanningIneligibleAgent.calls = 0
+    delivery = SimpleNamespace(
+        result=None,
+        acknowledged=False,
+        action="planning_ineligible",
+    )
+    monkeypatch.setattr(
+        planning_preview_delivery,
+        "has_preview_delivery_intent",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        planning_preview_delivery,
+        "prepare_preview_delivery_content",
+        lambda _session_key, _generation, content: content,
+    )
+    exact_delivery = AsyncMock(return_value=delivery)
+    monkeypatch.setattr(
+        planning_preview_delivery,
+        "deliver_preview_for_source",
+        exact_delivery,
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedPlanningIneligibleAgent,
+        session_id="sess-queued-planning-ineligible",
+        pending_text="queued follow-up",
+    )
+
+    exact_delivery.assert_awaited_once()
+    assert QueuedPlanningIneligibleAgent.calls == 1
+    assert result["final_response"] == "Signed Planning preview"
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio

@@ -464,6 +464,19 @@ grep -H 'TELEGRAM_BOT_TOKEN\|DISCORD_BOT_TOKEN' \
      ~/.hermes/.env ~/.hermes/profiles/*/.env
 ```
 
+Hermes also provisions a non-secret, stable `gateway_account_id` for each
+enabled platform account. This is separate from token-conflict detection and is
+used to bind semantic outbound delivery to one exact provider authority.
+Provisioning scans all profiles because uniqueness is installation-wide:
+
+```bash
+hermes config provision-delivery-accounts --dry-run
+hermes config provision-delivery-accounts
+```
+
+The dry run is strictly read-only. Normal setup, migration, and update flows
+apply missing IDs automatically.
+
 ## Updating the code
 
 `hermes update` pulls the latest code once and syncs new bundled skills into

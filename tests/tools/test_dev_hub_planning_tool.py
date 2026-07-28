@@ -26,10 +26,13 @@ from hermes_cli.turn_origin import (
 )
 from hermes_cli.planning_preview_delivery import (
     bind_preview_delivery_generation,
+    canonical_preview_delivery_target,
+    claim_preview_delivery,
     complete_preview_delivery,
     prepare_preview_delivery_content,
     reset_preview_delivery_generation,
 )
+from hermes_cli import planning_preview_ack_outbox
 from tools import dev_hub_planning_tool as planning_tool
 from toolsets import resolve_toolset, validate_toolset
 
@@ -45,6 +48,46 @@ def _turn_origin(provider: str, *, event_id: str) -> TurnOriginV1:
         chat_type="direct",
         source_timestamp="2026-07-27T12:30:00Z",
         event_id=event_id,
+    )
+
+
+def _claim_fake_preview(
+    fake: Any,
+    session_key: str,
+    generation: int,
+    delivered_content: str,
+) -> None:
+    origin = fake.current_origin()
+    claim = claim_preview_delivery(
+        session_key,
+        generation,
+        delivered_content=delivered_content,
+        provider=origin["provider"],
+        target=canonical_preview_delivery_target(
+            provider=origin["provider"],
+            gateway_account_id=origin["gatewayAccountId"],
+            chat_id=origin["chatId"],
+            thread_id=origin["threadId"],
+        ),
+        gateway_account_id=origin["gatewayAccountId"],
+    )
+    assert claim.action == "send"
+
+
+def _deliver_fake_preview_ack(
+    fake: Any,
+    request: dict[str, Any],
+) -> Any:
+    return fake.acknowledge_preview_page(
+        request["threadId"],
+        request["previewResultId"],
+        idempotency_key=request["idempotencyKey"],
+        expected_preview_hash=request["expectedPreviewHash"],
+        offset=request["offset"],
+        count=request["count"],
+        page_digest=request["pageDigest"],
+        origin=request["origin"],
+        delivery_proof=request["deliveryProof"],
     )
 
 
@@ -631,14 +674,22 @@ def test_artifact_retry_identity_uses_ingress_attachment_not_model_labels(
 
     assert first["ok"] is True
     assert second["ok"] is True
-    assert fake.upload_calls[0]["idempotency_key"] == fake.upload_calls[1][
-        "idempotency_key"
-    ]
-    assert fake.append_calls[0]["origin"]["providerEventId"] == fake.append_calls[
-        1
-    ]["origin"]["providerEventId"]
-    assert fake.upload_calls[0]["role"] != fake.upload_calls[1]["role"]
-    assert fake.upload_calls[0]["position"] != fake.upload_calls[1]["position"]
+    assert len(fake.upload_calls) == 1
+    assert len(fake.append_calls) == 1
+    assert second["completionReplayed"] is True
+    assert second["uploadReplayed"] is True
+    assert second["artifact"] == first["artifact"]
+    assert second["immutableLabelReceipt"] == {
+        "disposition": "canonical_first_completion_replayed",
+        "requested": {
+            "role": "database_schema",
+            "position": 99,
+        },
+        "canonical": {
+            "role": "design_reference",
+            "position": 7,
+        },
+    }
 
 
 def test_artifact_upload_resolves_sandbox_cache_path_on_gateway(
@@ -1564,6 +1615,7 @@ def test_preview_fetch_is_read_only_until_exact_provider_delivery(
     assert exact_content in outbound
     assert "planning-thread-1" not in outbound
     assert '"threadId"' not in outbound
+    _claim_fake_preview(fake, "session-1", 7, outbound)
     completed = asyncio.run(
         complete_preview_delivery(
             "session-1",
@@ -1652,6 +1704,13 @@ def test_lost_preview_receipt_response_replays_exact_page_before_progressing(
         11,
         "Exact preview follows.",
     )
+    _claim_fake_preview(fake, "session-lost-ack", 11, outbound)
+    clock = [1_000.0]
+    monkeypatch.setattr(
+        planning_preview_ack_outbox.time,
+        "time",
+        lambda: clock[0],
+    )
     completed = asyncio.run(
         complete_preview_delivery(
             "session-lost-ack",
@@ -1672,6 +1731,16 @@ def test_lost_preview_receipt_response_replays_exact_page_before_progressing(
     )
     assert page["pageReviewed"] is False
     assert completed is True
+    assert len(fake.receipt_keys) == 1
+    clock[0] = 1_003.0
+    recovered = planning_preview_ack_outbox.dispatch_one_preview_ack(
+        deliver=lambda request: _deliver_fake_preview_ack(
+            fake,
+            dict(request),
+        ),
+    )
+    assert recovered is not None
+    assert recovered["state"] == "succeeded"
     assert fake.receipt_keys[0] == fake.receipt_keys[1]
     assert fake.receipt_keys[0].startswith(
         "hermes-planning-preview-review-v1:"
@@ -2065,9 +2134,12 @@ def test_write_is_refused_when_current_provider_is_not_opted_in(
 
 def test_planning_toolset_is_valid_but_not_part_of_normal_core() -> None:
     assert validate_toolset("planning_v2") is True
-    assert resolve_toolset("planning_v2") == [
-        planning_tool.PLANNING_V2_TOOL_NAME
-    ]
+    assert resolve_toolset("planning_v2") == sorted(
+        [
+            "agent_ops_task_plan",
+            "agent_ops_task_approve_apply",
+        ]
+    )
 
     from hermes_cli.tools_config import _get_platform_tools
     from toolsets import _HERMES_CORE_TOOLS

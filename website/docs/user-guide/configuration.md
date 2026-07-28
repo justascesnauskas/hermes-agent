@@ -37,6 +37,7 @@ hermes config set KEY VAL  # Set a specific value
 hermes config unset KEY    # Remove a user-set value
 hermes config check        # Check for missing options (after updates)
 hermes config migrate      # Interactively add missing options
+hermes config provision-delivery-accounts --dry-run  # Preview stable messaging IDs
 
 # Examples:
 hermes config get model
@@ -49,6 +50,36 @@ hermes config set OPENROUTER_API_KEY sk-or-...  # Saves to .env
 :::tip
 The `hermes config set` command automatically routes values to the right file — API keys are saved to `.env`, everything else to `config.yaml`.
 :::
+
+### Stable messaging account identities
+
+Hermes gives every enabled messaging account a stable, opaque
+`gateway_account_id`. Semantic delivery uses this identifier together with the
+provider and profile-specific delivery scope; bot tokens are never used as
+identity material.
+
+Setup, config migration, and `hermes update` provision missing identifiers
+automatically across the default profile and every valid named profile. To
+inspect the exact credential-free plan without writing any config, lock,
+journal, or delivery ledger:
+
+```bash
+hermes config provision-delivery-accounts --dry-run
+hermes config provision-delivery-accounts --dry-run --json
+```
+
+To apply or repair the plan explicitly:
+
+```bash
+hermes config provision-delivery-accounts
+```
+
+Existing valid identifiers are preserved. Hermes refuses the whole plan before
+changing a profile config if two profiles already claim the same
+`(provider, gateway_account_id)`. Writes are serialized across the installation,
+applied atomically per `config.yaml`, and resumed with the same generated IDs
+after a process crash. Profile credentials are inspected only inside isolated
+per-profile child processes; command output never includes tokens.
 
 ## Configuration Precedence
 

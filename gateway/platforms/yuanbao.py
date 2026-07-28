@@ -60,6 +60,23 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
     cache_video_from_bytes,
 )
+from gateway.platform_registry import declare_semantic_exact_attempt
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    live_semantic_exact_attempt_provider_route_mapping,
+    provider_protocol_rejection_evidence,
+    provider_rejection_error,
+    semantic_exact_attempt_encoding_contract,
+)
+
+
+declare_semantic_exact_attempt(
+    "yuanbao",
+    standalone=False,
+    live=True,
+    owner=__name__,
+)
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.yuanbao_media import (
     download_url as media_download_url,
@@ -5138,6 +5155,14 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     PLATFORM = Platform.YUANBAO
     MAX_TEXT_CHUNK: int = 4000  # Yuanbao single message character limit
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="yuanbao",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="yuanbao-tim-text-logical-v1",
+        max_logical_units=4_000,
+        length_semantics="unicode_codepoints",
+        wire_encoding="yuanbao-tim-text-protobuf-v1",
+    )
     splits_long_messages = True  # send() auto-chunks via truncate_message(MAX_TEXT_CHUNK)
     MEDIA_MAX_SIZE_MB: int = 50  # Max media file size in MB for upload validation
     REPLY_REF_MAX_ENTRIES: ClassVar[int] = 500  # Max capacity of reference dedup dict
@@ -5341,6 +5366,192 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._group_queues.clear()
 
         logger.info("[%s] Disconnected", self.name)
+
+    def bind_semantic_exact_attempt_provider_route(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str | None = None,
+        reply_to: str | None = None,
+    ) -> Dict[str, str]:
+        del reply_to
+        if not chat_id or thread_id is not None:
+            raise ValueError("Yuanbao semantic delivery route invalid")
+        if chat_id.startswith("group:"):
+            route_identity = chat_id.removeprefix("group:")
+            route_kind = "group"
+        else:
+            route_identity = chat_id.removeprefix("direct:")
+            route_kind = "direct"
+        if not route_identity:
+            raise ValueError("Yuanbao semantic delivery route invalid")
+        return {"route_kind": route_kind}
+
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Write one frozen TIM text envelope and wait for its exact ACK."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+            provider_route = (
+                live_semantic_exact_attempt_provider_route_mapping(
+                    request.provider_route
+                )
+            )
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+            exact_provider_message_id,
+            provider_delivery_token,
+        )
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        route_kind = provider_route.get("route_kind")
+        if route_kind == "group" and request.chat_id.startswith("group:"):
+            route_identity = request.chat_id.removeprefix("group:")
+        elif route_kind == "direct" and not request.chat_id.startswith(
+            "group:"
+        ):
+            route_identity = request.chat_id.removeprefix("direct:")
+        else:
+            route_identity = ""
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or set(provider_route) != {"route_kind"}
+            or route_kind not in {"direct", "group"}
+            or not route_identity
+            or request.thread_id is not None
+            or (route_kind == "direct" and request.reply_to is not None)
+            or not isinstance(request.content, str)
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+            or not self._bot_id
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if self._connection.ws is None:
+            return SendResult(
+                success=False,
+                error="semantic_delivery_transport_unavailable",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+
+        stable_token = provider_delivery_token(
+            request.delivery_id,
+            provider="yuanbao",
+            target=request.delivery_target,
+            unit=request.delivery_unit,
+        )
+        req_id = f"sd_{stable_token.removeprefix('dh_')[:28]}"
+        msg_body = [
+            {
+                "msg_type": "TIMTextElem",
+                "msg_content": {"text": request.content},
+            }
+        ]
+        if route_kind == "group":
+            encoded = encode_send_group_message(
+                group_code=route_identity,
+                msg_body=msg_body,
+                from_account=self._bot_id,
+                msg_id=req_id,
+                ref_msg_id=request.reply_to or "",
+            )
+        else:
+            encoded = encode_send_c2c_message(
+                to_account=route_identity,
+                msg_body=msg_body,
+                from_account=self._bot_id,
+                msg_id=req_id,
+            )
+        try:
+            response = await self._connection.send_biz_request(
+                encoded,
+                req_id=req_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"Yuanbao semantic transport failed: {exc}",
+            )
+
+        head = response.get("head") if isinstance(response, dict) else None
+        status = head.get("status") if isinstance(head, dict) else None
+        receipt_id = exact_provider_message_id(
+            head.get("msg_id") if isinstance(head, dict) else None
+        )
+        if status == 0 and receipt_id == req_id:
+            return SendResult(
+                success=True,
+                message_id=receipt_id,
+                raw_response={"head": head},
+            )
+        if status == 429:
+            rejection = provider_protocol_rejection_evidence(
+                provider="Yuanbao",
+                protocol="yuanbao-tim-websocket",
+                response=response,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        if isinstance(status, int) and status != 0:
+            rejection = provider_protocol_rejection_evidence(
+                provider="Yuanbao",
+                protocol="yuanbao-tim-websocket",
+                response=response,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        rejection = provider_protocol_rejection_evidence(
+            provider="Yuanbao",
+            protocol="yuanbao-tim-websocket",
+            response=response,
+        )
+        return SendResult(
+            success=False,
+            error=provider_rejection_error(rejection),
+            raw_response={
+                "provider_rejection": rejection,
+            },
+        )
 
     async def send(
         self,

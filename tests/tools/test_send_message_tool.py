@@ -7,6 +7,7 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 # python-telegram-bot is an optional dep — skip the entire module when
@@ -145,8 +146,19 @@ class _patch_discord_sender:
         self._mock = mock
         self._entry = None
         self._original = None
+        self._original_exact = None
 
-    async def _adapter(self, pconfig, chat_id, message, *, thread_id=None, media_files=None, caption=None):
+    async def _adapter(
+        self,
+        pconfig,
+        chat_id,
+        message,
+        *,
+        thread_id=None,
+        media_files=None,
+        caption=None,
+        **_kwargs,
+    ):
         token = getattr(pconfig, "token", None)
         # Only forward caption= when set, so mocks written against the
         # pre-caption signature (no caption kwarg) keep working.
@@ -159,12 +171,19 @@ class _patch_discord_sender:
     def __enter__(self):
         self._entry = _discord_entry()
         self._original = self._entry.standalone_sender_fn
+        self._original_exact = (
+            self._entry.standalone_semantic_exact_attempt_fn
+        )
         self._entry.standalone_sender_fn = self._adapter
+        self._entry.standalone_semantic_exact_attempt_fn = self._adapter
         return self._mock
 
     def __exit__(self, exc_type, exc, tb):
         if self._entry is not None:
             self._entry.standalone_sender_fn = self._original
+            self._entry.standalone_semantic_exact_attempt_fn = (
+                self._original_exact
+            )
         return False
 
 
@@ -205,6 +224,7 @@ class _patch_slack_standalone_sender:
         self._mock = mock
         self._entry = None
         self._original = None
+        self._original_exact = None
 
     async def _adapter(self, pconfig, chat_id, message, *, thread_id=None, **_kw):
         from plugins.platforms.slack.adapter import SlackAdapter
@@ -220,12 +240,19 @@ class _patch_slack_standalone_sender:
     def __enter__(self):
         self._entry = _slack_entry()
         self._original = self._entry.standalone_sender_fn
+        self._original_exact = (
+            self._entry.standalone_semantic_exact_attempt_fn
+        )
         self._entry.standalone_sender_fn = self._adapter
+        self._entry.standalone_semantic_exact_attempt_fn = self._adapter
         return self._mock
 
     def __exit__(self, exc_type, exc, tb):
         if self._entry is not None:
             self._entry.standalone_sender_fn = self._original
+            self._entry.standalone_semantic_exact_attempt_fn = (
+                self._original_exact
+            )
         return False
 
 
@@ -965,6 +992,85 @@ class TestSendToPlatformChunking:
         assert result["success"] is True
         helper.assert_awaited_once()
         standalone.assert_not_awaited()
+
+    def test_matrix_semantic_media_rejects_before_public_route_write(
+        self,
+        tmp_path,
+    ):
+        from hermes_cli.plugins import discover_plugins
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+        discover_plugins()
+        media = tmp_path / "matrix-semantic.png"
+        media.write_bytes(b"\x89PNG")
+        helper = AsyncMock(
+            side_effect=AssertionError(
+                "semantic Matrix media must reject before adapter I/O"
+            )
+        )
+
+        with patch(
+            "tools.send_message_tool._send_matrix_via_adapter",
+            helper,
+        ):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.MATRIX,
+                    SimpleNamespace(
+                        enabled=True,
+                        token="tok",
+                        extra={"homeserver": "https://matrix.example.com"},
+                    ),
+                    "!room:example.com",
+                    "ledger hashes this MEDIA-bearing payload",
+                    media_files=[(str(media), False)],
+                    delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+                    delivery_id="delivery-matrix-media",
+                    delivery_target="matrix:!room:example.com",
+                )
+            )
+
+        assert result == {
+            "error": "semantic_delivery_media_shape_unsupported",
+            "provider_write_attempted": False,
+            "provider_retryable": False,
+        }
+        helper.assert_not_awaited()
+
+    def test_slack_semantic_media_rejects_before_public_route_write(
+        self,
+        tmp_path,
+    ):
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+        media = tmp_path / "slack-semantic.png"
+        media.write_bytes(b"\x89PNG")
+        sender = AsyncMock(
+            side_effect=AssertionError(
+                "semantic Slack media must reject before provider I/O"
+            )
+        )
+
+        with _patch_slack_standalone_sender(sender):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="tok", extra={}),
+                    "C123",
+                    "ledger hashes this MEDIA-bearing payload",
+                    media_files=[(str(media), False)],
+                    delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+                    delivery_id="delivery-slack-media",
+                    delivery_target="slack:C123",
+                )
+            )
+
+        assert result == {
+            "error": "semantic_delivery_media_shape_unsupported",
+            "provider_write_attempted": False,
+            "provider_retryable": False,
+        }
+        sender.assert_not_awaited()
 
     def test_send_matrix_via_adapter_sends_document(self, tmp_path):
         file_path = tmp_path / "report.pdf"
@@ -2555,6 +2661,8 @@ class _FakeSignalHttp:
         item = self.responses.pop(0)
         if isinstance(item, BaseException):
             raise item
+        if not isinstance(item, dict):
+            return item
         resp = SimpleNamespace(
             raise_for_status=lambda: None,
             json=lambda data=item: data,
@@ -2980,6 +3088,398 @@ class TestSendSignalChunking:
         assert len(params["attachments"]) == 1
 
 
+class TestSignalSemanticExactRoute:
+    @staticmethod
+    def _config():
+        return SimpleNamespace(
+            extra={
+                "http_url": "http://localhost:8080",
+                "account": "+15551234567",
+            }
+        )
+
+    @staticmethod
+    async def _send(message, *, media_files=None):
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+        return await _send_to_platform(
+            Platform.SIGNAL,
+            TestSignalSemanticExactRoute._config(),
+            "+15557654321",
+            message,
+            media_files=media_files,
+            delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+            delivery_id="delivery-signal-exact",
+            delivery_target="signal:+15557654321",
+        )
+
+    @pytest.mark.asyncio
+    async def test_text_success_uses_one_rpc_and_real_timestamp(
+        self,
+        monkeypatch,
+    ):
+        fake = _FakeSignalHttp(
+            [{"result": {"timestamp": 1712345678901}}]
+        )
+        _install_signal_http(monkeypatch, fake)
+
+        result = await self._send("one exact Signal message")
+
+        assert result["success"] is True
+        assert result["message_id"] == "1712345678901"
+        assert result["message_ids"] == ["1712345678901"]
+        assert len(fake.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_success_without_timestamp_is_ambiguous_receipt(
+        self,
+        monkeypatch,
+    ):
+        fake = _FakeSignalHttp([{"result": {}}])
+        _install_signal_http(monkeypatch, fake)
+
+        result = await self._send("receipt must be authoritative")
+
+        assert result["provider_write_attempted"] is True
+        assert result["provider_retryable"] is False
+        rejection = result["provider_rejection"]
+        assert rejection["schema_version"] == (
+            "hermes.provider-protocol-rejection-evidence/1"
+        )
+        assert rejection["response_sha256"] in result["error"]
+        assert len(fake.calls) == 1
+
+    @pytest.mark.parametrize(
+        "recipient_result",
+        [
+            {"type": "NETWORK_FAILURE"},
+            {
+                "success": False,
+                "failure": "recipient delivery failed",
+            },
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_recipient_failure_never_becomes_timestamp_receipt(
+        self,
+        monkeypatch,
+        recipient_result,
+    ):
+        fake = _FakeSignalHttp(
+            [
+                {
+                    "result": {
+                        "timestamp": 1712345678901,
+                        "results": [recipient_result],
+                    }
+                }
+            ]
+        )
+        _install_signal_http(monkeypatch, fake)
+
+        result = await self._send("recipient proof required")
+
+        assert result["provider_write_attempted"] is False
+        assert result["provider_retryable"] is False
+        assert "message_id" not in result
+        rejection = result["provider_rejection"]
+        assert rejection["protocol"] == "signal-json-rpc"
+        assert rejection["response_sha256"] in result["error"]
+        assert len(fake.calls) == 1
+
+    @pytest.mark.parametrize(
+        "timestamp",
+        [
+            True,
+            0,
+            -1,
+            1712345678901.0,
+            "1712345678901",
+            " 1712345678901 ",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_malformed_timestamp_is_ambiguous_without_coercion(
+        self,
+        monkeypatch,
+        timestamp,
+    ):
+        fake = _FakeSignalHttp([{"result": {"timestamp": timestamp}}])
+        _install_signal_http(monkeypatch, fake)
+
+        result = await self._send("receipt type must be authoritative")
+
+        assert result["provider_write_attempted"] is True
+        assert result["provider_retryable"] is False
+        rejection = result["provider_rejection"]
+        assert rejection["response_sha256"] in result["error"]
+        assert len(fake.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_unreadable_json_keeps_redacted_digest_evidence(
+        self,
+        monkeypatch,
+    ):
+        secret = "ghp_" + ("s" * 80)
+        response_body = (
+            '{"token":"'
+            + secret
+            + '","detail":"'
+            + ("invalid JSON-RPC response " * 40)
+        )
+        response = SimpleNamespace(
+            status_code=200,
+            text=response_body,
+            raise_for_status=lambda: None,
+            json=MagicMock(side_effect=ValueError("invalid JSON")),
+        )
+        fake = _FakeSignalHttp([response])
+        _install_signal_http(monkeypatch, fake)
+
+        result = await self._send("receipt must retain evidence")
+
+        assert result["provider_write_attempted"] is True
+        assert result["provider_retryable"] is False
+        rejection = result["provider_rejection"]
+        assert rejection["response_bytes"] == len(
+            response_body.encode("utf-8")
+        )
+        assert rejection["truncated"] is True
+        assert rejection["redacted"] is True
+        assert secret not in rejection["response_preview"]
+        assert rejection["response_sha256"] in result["error"]
+        assert len(fake.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_rpc_rejection_keeps_structured_evidence_without_retry(
+        self,
+        monkeypatch,
+    ):
+        fake = _FakeSignalHttp(
+            [
+                {
+                    "error": {
+                        "code": -32602,
+                        "message": "invalid recipient",
+                    }
+                }
+            ]
+        )
+        _install_signal_http(monkeypatch, fake)
+
+        result = await self._send("one rejected attempt")
+
+        assert result["provider_write_attempted"] is False
+        assert result["provider_retryable"] is False
+        rejection = result["provider_rejection"]
+        assert rejection["response_sha256"] in result["error"]
+        assert len(fake.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_429_is_retryable_prewrite_without_hidden_retry(
+        self,
+        monkeypatch,
+    ):
+        fake = _FakeSignalHttp(
+            [{"error": {"message": "Failed: [429] Rate Limited"}}]
+        )
+        _install_signal_http(monkeypatch, fake)
+
+        result = await self._send("one attempt only")
+
+        assert result["error"] == "Signal RPC rate limited"
+        assert result["provider_write_attempted"] is False
+        assert result["provider_retryable"] is True
+        assert result["provider_rejection"]["response_sha256"]
+        assert len(fake.calls) == 1
+
+    @pytest.mark.parametrize("status", [400, 401, 403])
+    @pytest.mark.asyncio
+    async def test_http_4xx_is_definitive_with_structured_evidence(
+        self,
+        monkeypatch,
+        status,
+    ):
+        secret = "ghp_" + ("q" * 80)
+        request = httpx.Request(
+            "POST",
+            "http://localhost:8080/api/v1/rpc",
+        )
+        response = httpx.Response(
+            status,
+            request=request,
+            text=f'{{"token":"{secret}","error":"rejected"}}',
+        )
+        fake = _FakeSignalHttp([response])
+        _install_signal_http(monkeypatch, fake)
+
+        result = await self._send("one rejected attempt")
+
+        assert result["provider_write_attempted"] is False
+        assert result["provider_retryable"] is False
+        rejection = result["provider_rejection"]
+        assert rejection["status"] == status
+        assert rejection["redacted"] is True
+        assert secret not in rejection["body_preview"]
+        assert rejection["body_sha256"] in result["error"]
+        assert len(fake.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_http_5xx_is_ambiguous_without_hidden_retry(
+        self,
+        monkeypatch,
+    ):
+        request = httpx.Request(
+            "POST",
+            "http://localhost:8080/api/v1/rpc",
+        )
+        response = httpx.Response(
+            503,
+            request=request,
+            text="upstream failed after dispatch",
+        )
+        fake = _FakeSignalHttp([response])
+        _install_signal_http(monkeypatch, fake)
+
+        result = await self._send("one uncertain attempt")
+
+        assert "provider_write_attempted" not in result
+        assert "provider_retryable" not in result
+        assert result["provider_rejection"]["status"] == 503
+        assert len(fake.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_transport_loss_is_ambiguous_without_retry(
+        self,
+        monkeypatch,
+    ):
+        fake = _FakeSignalHttp(
+            [RuntimeError("connection ended after request write")]
+        )
+        _install_signal_http(monkeypatch, fake)
+
+        result = await self._send("uncertain transport")
+
+        assert "outcome is uncertain" in result["error"]
+        assert "provider_write_attempted" not in result
+        assert len(fake.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_long_text_is_rejected_before_rpc(
+        self,
+        monkeypatch,
+    ):
+        fake = _FakeSignalHttp([])
+        _install_signal_http(monkeypatch, fake)
+
+        result = await self._send("x" * 8001)
+
+        assert result == {
+            "error": "semantic_delivery_message_requires_multiple_writes",
+            "provider_write_attempted": False,
+            "provider_retryable": False,
+        }
+        assert fake.calls == []
+
+    @pytest.mark.asyncio
+    async def test_multi_batch_attachments_are_rejected_before_rpc(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from gateway.platforms.signal_rate_limit import (
+            SIGNAL_MAX_ATTACHMENTS_PER_MSG,
+        )
+
+        media_files = []
+        for index in range(SIGNAL_MAX_ATTACHMENTS_PER_MSG + 1):
+            path = tmp_path / f"media-{index}.png"
+            path.write_bytes(b"\x89PNG")
+            media_files.append((str(path), False))
+        fake = _FakeSignalHttp([])
+        _install_signal_http(monkeypatch, fake)
+
+        result = await self._send("", media_files=media_files)
+
+        assert result == {
+            "error": "semantic_delivery_attachments_require_multiple_writes",
+            "provider_write_attempted": False,
+            "provider_retryable": False,
+        }
+        assert fake.calls == []
+
+    @pytest.mark.asyncio
+    async def test_missing_media_is_rejected_before_rpc(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        fake = _FakeSignalHttp([])
+        _install_signal_http(monkeypatch, fake)
+
+        result = await self._send(
+            "caption",
+            media_files=[(str(tmp_path / "missing.png"), False)],
+        )
+
+        assert result == {
+            "error": "semantic_delivery_media_missing",
+            "provider_write_attempted": False,
+            "provider_retryable": False,
+        }
+        assert fake.calls == []
+
+    @pytest.mark.asyncio
+    async def test_single_attachment_batch_is_one_exact_rpc(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        first = tmp_path / "first.png"
+        second = tmp_path / "second.png"
+        first.write_bytes(b"\x89PNG")
+        second.write_bytes(b"\x89PNG")
+        fake = _FakeSignalHttp(
+            [{"result": {"timestamp": 1712345678902}}]
+        )
+        _install_signal_http(monkeypatch, fake)
+
+        result = await self._send(
+            "one atomic batch",
+            media_files=[
+                (str(first), False),
+                (str(second), False),
+            ],
+        )
+
+        assert result["message_id"] == "1712345678902"
+        assert len(fake.calls) == 1
+        assert fake.calls[0]["payload"]["params"]["attachments"] == [
+            str(first),
+            str(second),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unknown_provider_stays_fail_closed(self):
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+        result = await _send_to_platform(
+            _FakePlatform("unknown-transport"),
+            SimpleNamespace(extra={}),
+            "room-1",
+            "must not send",
+            delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+            delivery_id="delivery-unknown",
+            delivery_target="unknown-transport:room-1",
+        )
+
+        assert result == {
+            "error": "semantic_delivery_provider_capability_required",
+            "provider_write_attempted": False,
+            "provider_retryable": False,
+        }
+
+
 # ── _send_via_adapter standalone fallback ────────────────────────────────
 
 
@@ -3002,7 +3502,12 @@ class TestSendViaAdapterStandaloneFallback:
     """
 
     @staticmethod
-    def _make_entry(send_fn):
+    def _make_entry(
+        send_fn,
+        *,
+        semantic_exact_attempt=False,
+        max_message_length=0,
+    ):
         from gateway.platform_registry import PlatformEntry
 
         return PlatformEntry(
@@ -3011,6 +3516,11 @@ class TestSendViaAdapterStandaloneFallback:
             adapter_factory=lambda cfg: None,
             check_fn=lambda: True,
             standalone_sender_fn=send_fn,
+            semantic_exact_attempt=semantic_exact_attempt,
+            standalone_semantic_exact_attempt_fn=(
+                send_fn if semantic_exact_attempt else None
+            ),
+            max_message_length=max_message_length,
         )
 
     @pytest.mark.asyncio
@@ -3186,6 +3696,230 @@ class TestSendViaAdapterStandaloneFallback:
         assert result["success"] is True
         assert result["message_id"] == "abc-123"
         assert result["extra_field"] == "preserved"
+
+    @pytest.mark.asyncio
+    async def test_semantic_capable_plugin_gets_one_exact_attempt(self):
+        from gateway.platform_registry import platform_registry
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+        from tools.send_message_tool import _send_via_adapter
+
+        calls = []
+
+        async def exact_send(
+            pconfig,
+            chat_id,
+            message,
+            **kwargs,
+        ):
+            calls.append(
+                {
+                    "pconfig": pconfig,
+                    "chat_id": chat_id,
+                    "message": message,
+                    "kwargs": kwargs,
+                }
+            )
+            return {"success": True, "message_id": "plugin-real-id"}
+
+        platform_registry.register(
+            self._make_entry(
+                exact_send,
+                semantic_exact_attempt=True,
+            )
+        )
+        pconfig = SimpleNamespace(extra={})
+        try:
+            result = await _send_via_adapter(
+                _FakePlatform("fakeplatform"),
+                pconfig,
+                "room-1",
+                "one exact message",
+                thread_id="thread-1",
+                delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+                delivery_id="delivery-plugin-exact",
+                delivery_target="fakeplatform:room-1",
+                delivery_unit=3,
+            )
+        finally:
+            platform_registry.unregister("fakeplatform")
+
+        assert result == {
+            "success": True,
+            "message_id": "plugin-real-id",
+        }
+        assert len(calls) == 1
+        assert calls[0]["pconfig"] is pconfig
+        assert calls[0]["kwargs"] == {
+            "thread_id": "thread-1",
+            "media_files": None,
+            "force_document": False,
+            "delivery_contract": SEMANTIC_DELIVERY_CONTRACT,
+            "delivery_id": "delivery-plugin-exact",
+            "delivery_target": "fakeplatform:room-1",
+            "delivery_unit": 3,
+            "semantic_exact_attempt": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_semantic_incapable_plugin_fails_before_sender_call(self):
+        from gateway.platform_registry import platform_registry
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+        from tools.send_message_tool import _send_via_adapter
+
+        calls = []
+
+        async def ordinary_only(*_args, **_kwargs):
+            calls.append("called")
+            return {"success": True, "message_id": "must-not-send"}
+
+        platform_registry.register(self._make_entry(ordinary_only))
+        try:
+            result = await _send_via_adapter(
+                _FakePlatform("fakeplatform"),
+                SimpleNamespace(extra={}),
+                "room-1",
+                "one exact message",
+                delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+                delivery_id="delivery-plugin-incapable",
+                delivery_target="fakeplatform:room-1",
+            )
+        finally:
+            platform_registry.unregister("fakeplatform")
+
+        assert result == {
+            "error": "semantic_delivery_provider_capability_required",
+            "provider_write_attempted": False,
+            "provider_retryable": False,
+        }
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_semantic_boolean_only_plugin_fails_before_sender_call(self):
+        from gateway.platform_registry import PlatformEntry, platform_registry
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+        from tools.send_message_tool import _send_via_adapter
+
+        calls = []
+
+        async def ordinary_only(*_args, **_kwargs):
+            calls.append("called")
+            return {"success": True, "message_id": "must-not-send"}
+
+        platform_registry.register(
+            PlatformEntry(
+                name="bool-only-plugin",
+                label="Boolean-only plugin",
+                adapter_factory=lambda cfg: None,
+                check_fn=lambda: True,
+                standalone_sender_fn=ordinary_only,
+                semantic_exact_attempt=True,
+            )
+        )
+        try:
+            result = await _send_via_adapter(
+                _FakePlatform("bool-only-plugin"),
+                SimpleNamespace(extra={}),
+                "room-1",
+                "one exact message",
+                delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+                delivery_id="delivery-plugin-bool-only",
+                delivery_target="bool-only-plugin:room-1",
+            )
+        finally:
+            platform_registry.unregister("bool-only-plugin")
+
+        assert result == {
+            "error": "semantic_delivery_provider_capability_required",
+            "provider_write_attempted": False,
+            "provider_retryable": False,
+        }
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_semantic_plugin_exception_is_ambiguous_without_retry(self):
+        from gateway.platform_registry import platform_registry
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+        from tools.send_message_tool import _send_via_adapter
+
+        calls = []
+
+        async def uncertain_send(*_args, **_kwargs):
+            calls.append("called")
+            raise RuntimeError("connection ended after write")
+
+        platform_registry.register(
+            self._make_entry(
+                uncertain_send,
+                semantic_exact_attempt=True,
+            )
+        )
+        try:
+            result = await _send_via_adapter(
+                _FakePlatform("fakeplatform"),
+                SimpleNamespace(extra={}),
+                "room-1",
+                "one exact message",
+                delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+                delivery_id="delivery-plugin-uncertain",
+                delivery_target="fakeplatform:room-1",
+            )
+        finally:
+            platform_registry.unregister("fakeplatform")
+
+        assert result["provider_write_attempted"] is None
+        assert "connection ended after write" in result["error"]
+        assert calls == ["called"]
+
+    @pytest.mark.asyncio
+    async def test_semantic_later_chunk_failure_is_partial_write(self):
+        from gateway.platform_registry import platform_registry
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+        from tools.send_message_tool import _send_to_platform
+
+        calls = []
+
+        async def chunk_send(
+            _pconfig,
+            _chat_id,
+            _message,
+            **_kwargs,
+        ):
+            calls.append(_message)
+            if len(calls) == 1:
+                return {"success": True, "message_id": "chunk-one"}
+            return {
+                "error": "second chunk failed",
+                "provider_write_attempted": False,
+                "provider_retryable": True,
+            }
+
+        platform_registry.register(
+            self._make_entry(
+                chunk_send,
+                semantic_exact_attempt=True,
+                max_message_length=24,
+            )
+        )
+        try:
+            result = await _send_to_platform(
+                _FakePlatform("fakeplatform"),
+                SimpleNamespace(extra={}),
+                "room-1",
+                "A long message that must become multiple exact chunks.",
+                delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+                delivery_id="delivery-plugin-partial",
+                delivery_target="fakeplatform:room-1",
+            )
+        finally:
+            platform_registry.unregister("fakeplatform")
+
+        assert len(calls) == 2
+        assert result == {
+            "error": "semantic_delivery_partial_write",
+            "message_ids": ["chunk-one"],
+            "provider_write_attempted": True,
+            "provider_retryable": False,
+        }
 
 
 # ---------------------------------------------------------------------------

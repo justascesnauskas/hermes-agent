@@ -68,8 +68,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlencode
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 # aiohttp/websockets are independent optional deps — import outside lark_oapi
 # so they remain available for tests and webhook mode even if lark_oapi is missing.
@@ -142,10 +142,31 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    live_semantic_exact_attempt_provider_route_mapping,
+    provider_rejection_error,
+    provider_rejection_evidence,
+    semantic_exact_attempt_encoding_contract,
+)
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write, env_float, env_int
 
 logger = logging.getLogger(__name__)
+
+
+class _FeishuSemanticNoRedirectHandler(HTTPRedirectHandler):
+    """Refuse every redirect so one exact attempt cannot change endpoints."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+_FEISHU_SEMANTIC_RATE_LIMIT_CODES = frozenset(
+    {99991402, 11020, 11021}
+)
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -1440,6 +1461,14 @@ class FeishuAdapter(BasePlatformAdapter):
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
 
     MAX_MESSAGE_LENGTH = 8000
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="feishu",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="feishu-logical-v1",
+        max_logical_units=8000,
+        length_semantics="unicode_codepoints",
+        wire_encoding="feishu-text-json-v1",
+    )
     # Max distinct chat IDs retained in _chat_locks before LRU eviction kicks in.
     CHAT_LOCK_MAX_SIZE: int = 1000
     # Threshold for detecting Feishu client-side message splits.
@@ -4709,6 +4738,417 @@ class FeishuAdapter(BasePlatformAdapter):
         return await self._run_blocking(self._client.im.v1.message.create, request)
 
     @staticmethod
+    def _semantic_http_post(
+        url: str,
+        *,
+        headers: Dict[str, str],
+        body: bytes,
+    ) -> tuple[int, Dict[str, str], bytes]:
+        """Perform one non-following HTTP POST with no transport retry."""
+
+        opener = build_opener(_FeishuSemanticNoRedirectHandler())
+        request = Request(
+            url,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with opener.open(request, timeout=30) as response:
+                return (
+                    int(response.getcode()),
+                    dict(response.headers.items()),
+                    response.read(),
+                )
+        except HTTPError as exc:
+            return (
+                int(exc.code),
+                dict(exc.headers.items()) if exc.headers else {},
+                exc.read(),
+            )
+
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Write exactly one Feishu text message after pre-write auth."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+            provider_route = (
+                live_semantic_exact_attempt_provider_route_mapping(
+                    request.provider_route
+                )
+            )
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+            exact_provider_message_id,
+        )
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+
+        def _valid_identifier(value: Any) -> bool:
+            return bool(
+                isinstance(value, str)
+                and value
+                and len(value) <= 256
+                and all(
+                    ord(character) >= 32 and ord(character) != 127
+                    for character in value
+                )
+            )
+
+        try:
+            text_content = json.dumps(
+                {"text": request.content},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            text_content.encode("utf-8", errors="strict")
+            content_is_utf8 = True
+        except (AttributeError, TypeError, UnicodeEncodeError, ValueError):
+            text_content = ""
+            content_is_utf8 = False
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or provider_route
+            or not request.delivery_id
+            or not request.delivery_target
+            or not _valid_identifier(request.chat_id)
+            or (
+                request.thread_id is not None
+                and not _valid_identifier(request.thread_id)
+            )
+            or (
+                request.reply_to is not None
+                and not _valid_identifier(request.reply_to)
+            )
+            or not isinstance(request.content, str)
+            or not content_is_utf8
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+            or not str(getattr(self, "_app_id", "") or "").strip()
+            or not str(getattr(self, "_app_secret", "") or "").strip()
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+
+        base_url = _onboard_open_base_url(
+            str(getattr(self, "_domain_name", "feishu") or "feishu")
+        )
+        token_body = json.dumps(
+            {
+                "app_id": self._app_id,
+                "app_secret": self._app_secret,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        try:
+            token_status, _token_headers, token_raw = await asyncio.to_thread(
+                self._semantic_http_post,
+                f"{base_url}/open-apis/auth/v3/tenant_access_token/internal",
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                body=token_body,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"Feishu semantic auth failed: {exc}",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+        try:
+            token_data = json.loads(token_raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            token_data = None
+        token_code = (
+            token_data.get("code", token_data.get("errcode", 0))
+            if isinstance(token_data, dict)
+            else None
+        )
+        access_token = (
+            str(token_data.get("tenant_access_token") or "").strip()
+            if isinstance(token_data, dict)
+            else ""
+        )
+        token_retryable = bool(
+            token_status == 408
+            or token_status == 429
+            or token_status >= 500
+            or token_code in _FEISHU_SEMANTIC_RATE_LIMIT_CODES
+        )
+        if (
+            not 200 <= token_status < 300
+            or isinstance(token_code, bool)
+            or not isinstance(token_code, int)
+            or token_code != 0
+            or not access_token
+        ):
+            rejection = provider_rejection_evidence(
+                provider="Feishu auth",
+                status=token_status,
+                body=token_raw,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                retryable=token_retryable,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": token_retryable,
+                    "status": token_status,
+                    "provider_rejection": rejection,
+                },
+            )
+
+        stable_uuid = "semantic-" + hashlib.sha256(
+            (
+                f"feishu:{request.delivery_id}:{request.delivery_unit}"
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        if request.reply_to:
+            message_url = (
+                f"{base_url}/open-apis/im/v1/messages/"
+                f"{quote(request.reply_to, safe='')}/reply"
+            )
+            message_payload = {
+                "content": text_content,
+                "msg_type": "text",
+                "reply_in_thread": bool(request.thread_id),
+                "uuid": stable_uuid,
+            }
+        else:
+            if request.thread_id:
+                receive_id = request.thread_id
+                receive_id_type = "thread_id"
+            elif request.chat_id.startswith("feishu_user_id:"):
+                receive_id = request.chat_id.split(":", 1)[1]
+                receive_id_type = "user_id"
+            elif request.chat_id.startswith("ou_"):
+                receive_id = request.chat_id
+                receive_id_type = "open_id"
+            else:
+                receive_id = request.chat_id
+                receive_id_type = "chat_id"
+            if not _valid_identifier(receive_id):
+                return SendResult(
+                    success=False,
+                    error="semantic_delivery_message_shape_invalid",
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                    },
+                )
+            message_url = (
+                f"{base_url}/open-apis/im/v1/messages?"
+                f"{urlencode({'receive_id_type': receive_id_type})}"
+            )
+            message_payload = {
+                "receive_id": receive_id,
+                "msg_type": "text",
+                "content": text_content,
+                "uuid": stable_uuid,
+            }
+        wire_body = json.dumps(
+            message_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        try:
+            status, response_headers, raw_body = await asyncio.to_thread(
+                self._semantic_http_post,
+                message_url,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                body=wire_body,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"Feishu semantic transport failed: {exc}",
+            )
+        try:
+            data = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            data = None
+
+        if 200 <= status < 300:
+            code = data.get("code", data.get("errcode", 0)) if isinstance(data, dict) else None
+            if (
+                isinstance(code, int)
+                and not isinstance(code, bool)
+                and code == 0
+            ):
+                response_data = data.get("data")
+                message_id = exact_provider_message_id(
+                    response_data.get("message_id")
+                    if isinstance(response_data, dict)
+                    else None
+                )
+                if message_id:
+                    return SendResult(
+                        success=True,
+                        message_id=message_id,
+                        raw_response=data,
+                    )
+                rejection = provider_rejection_evidence(
+                    provider="Feishu",
+                    status=status,
+                    body=raw_body,
+                )
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    raw_response={
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            if code in _FEISHU_SEMANTIC_RATE_LIMIT_CODES:
+                rejection = provider_rejection_evidence(
+                    provider="Feishu",
+                    status=status,
+                    body=raw_body,
+                )
+                retry_after = response_headers.get("Retry-After")
+                try:
+                    retry_after_value = float(retry_after)
+                except (TypeError, ValueError):
+                    retry_after_value = None
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    retryable=True,
+                    retry_after=retry_after_value,
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": True,
+                        "retry_after": retry_after_value,
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            if (
+                isinstance(code, int)
+                and not isinstance(code, bool)
+                and (500 <= code < 600 or 50_000 <= code < 60_000)
+            ):
+                rejection = provider_rejection_evidence(
+                    provider="Feishu",
+                    status=status,
+                    body=raw_body,
+                )
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    raw_response={
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            if isinstance(data, dict) and isinstance(code, int):
+                rejection = provider_rejection_evidence(
+                    provider="Feishu",
+                    status=status,
+                    body=raw_body,
+                )
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            rejection = provider_rejection_evidence(
+                provider="Feishu",
+                status=status,
+                body=raw_body,
+            )
+            return SendResult(
+                success=False,
+                error="semantic_delivery_provider_receipt_invalid",
+                raw_response={
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        if status == 429:
+            rejection = provider_rejection_evidence(
+                provider="Feishu",
+                status=status,
+                body=raw_body,
+            )
+            retry_after = response_headers.get("Retry-After")
+            try:
+                retry_after_value = float(retry_after)
+            except (TypeError, ValueError):
+                retry_after_value = None
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                retryable=True,
+                retry_after=retry_after_value,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                    "retry_after": retry_after_value,
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        rejection = provider_rejection_evidence(
+            provider="Feishu",
+            status=status,
+            body=raw_body,
+        )
+        if status == 408 or status >= 500:
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        return SendResult(
+            success=False,
+            error=provider_rejection_error(rejection),
+            raw_response={
+                "provider_write_attempted": False,
+                "provider_retryable": False,
+                "status": status,
+                "provider_rejection": rejection,
+            },
+        )
+
+    @staticmethod
     def _response_succeeded(response: Any) -> bool:
         return bool(response and getattr(response, "success", lambda: False)())
 
@@ -5720,6 +6160,8 @@ def register(ctx) -> None:
         allow_all_env="FEISHU_ALLOW_ALL_USERS",
         cron_deliver_env_var="FEISHU_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=True,
         max_message_length=8000,
         emoji="🪽",
         allow_update_command=True,

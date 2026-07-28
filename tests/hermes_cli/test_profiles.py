@@ -223,6 +223,108 @@ class TestCreateProfile:
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
 
+    def test_clone_config_mints_new_semantic_account_authority(
+        self,
+        profile_env,
+        monkeypatch,
+    ):
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        source_id = "acct_" + ("1" * 48)
+        source_config = {
+            "_config_version": DEFAULT_CONFIG["_config_version"],
+            "platforms": {
+                "slack": {
+                    "enabled": True,
+                    "extra": {"gateway_account_id": source_id},
+                }
+            },
+            "gateway": {
+                "platforms": {
+                    "discord": {
+                        "enabled": True,
+                        "extra": {"gateway_account_id": "legacy-nested"},
+                    }
+                }
+            },
+        }
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump(source_config, sort_keys=False),
+            encoding="utf-8",
+        )
+        from hermes_cli import delivery_account_provisioning as provisioning
+
+        calls = []
+        monkeypatch.setattr(
+            provisioning,
+            "run_lifecycle_provisioning",
+            lambda **kwargs: calls.append(kwargs) or {"ok": True},
+        )
+
+        profile_dir = create_profile(
+            "coder",
+            clone_config=True,
+            no_alias=True,
+        )
+
+        cloned = yaml.safe_load(
+            (profile_dir / "config.yaml").read_text(encoding="utf-8")
+        )
+        assert "gateway_account_id" not in (
+            cloned["platforms"]["slack"]["extra"]
+        )
+        assert "gateway_account_id" not in (
+            cloned["gateway"]["platforms"]["discord"]["extra"]
+        )
+        assert calls == [{"quiet": False}]
+        assert yaml.safe_load(
+            (default_home / "config.yaml").read_text(encoding="utf-8")
+        ) == source_config
+
+    def test_clone_config_provisions_distinct_semantic_account_authority(
+        self,
+        profile_env,
+    ):
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        source_id = "acct_" + ("3" * 48)
+        source_config = {
+            "_config_version": DEFAULT_CONFIG["_config_version"],
+            "platforms": {
+                "signal": {
+                    "enabled": True,
+                    "extra": {
+                        "http_url": "http://127.0.0.1:8080",
+                        "account": "+15551234567",
+                        "gateway_account_id": source_id,
+                    },
+                }
+            },
+        }
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump(source_config, sort_keys=False),
+            encoding="utf-8",
+        )
+
+        profile_dir = create_profile(
+            "coder",
+            clone_config=True,
+            no_alias=True,
+        )
+
+        cloned = yaml.safe_load(
+            (profile_dir / "config.yaml").read_text(encoding="utf-8")
+        )
+        cloned_id = cloned["platforms"]["signal"]["extra"][
+            "gateway_account_id"
+        ]
+        assert cloned_id.startswith("acct_")
+        assert len(cloned_id) == len(source_id)
+        assert cloned_id != source_id
+        assert yaml.safe_load(
+            (default_home / "config.yaml").read_text(encoding="utf-8")
+        ) == source_config
+
     def test_clone_config_migrates_legacy_config_version(self, profile_env):
         tmp_path = profile_env
         default_home = tmp_path / ".hermes"
@@ -275,6 +377,83 @@ class TestCreateProfile:
         assert not (profile_dir / "gateway.pid").exists()
         assert not (profile_dir / "gateway_state.json").exists()
         assert not (profile_dir / "processes.json").exists()
+
+    def test_clone_all_never_copies_delivery_or_ack_authority(
+        self,
+        profile_env,
+        monkeypatch,
+    ):
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        source_id = "acct_" + ("2" * 48)
+        source_config = {
+            "_config_version": DEFAULT_CONFIG["_config_version"],
+            "platforms": {
+                "matrix": {
+                    "enabled": True,
+                    "extra": {"gateway_account_id": source_id},
+                }
+            },
+        }
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump(source_config, sort_keys=False),
+            encoding="utf-8",
+        )
+        semantic_state = default_home / "state" / "semantic-delivery"
+        semantic_state.mkdir(parents=True)
+        (semantic_state / "ledger.sqlite3").write_bytes(b"source-ledger")
+        (semantic_state / "preview-ack-outbox.sqlite3").write_bytes(
+            b"source-ack-outbox"
+        )
+        turn_queue = default_home / "gateway-turn-queue"
+        turn_queue.mkdir()
+        (turn_queue / "turn.sqlite3").write_bytes(b"source-turn-origin")
+        artifact_ingress = (
+            default_home / "planning-v2" / "artifact-ingress"
+        )
+        artifact_ingress.mkdir(parents=True)
+        (artifact_ingress / "snapshot.png").write_bytes(
+            b"source-private-attachment"
+        )
+        from hermes_cli import delivery_account_provisioning as provisioning
+
+        calls = []
+        monkeypatch.setattr(
+            provisioning,
+            "run_lifecycle_provisioning",
+            lambda **kwargs: calls.append(kwargs) or {"ok": True},
+        )
+
+        profile_dir = create_profile(
+            "cloned",
+            clone_all=True,
+            no_alias=True,
+        )
+
+        assert not (profile_dir / "state").exists()
+        assert not (profile_dir / "gateway-turn-queue").exists()
+        assert not (
+            profile_dir / "planning-v2" / "artifact-ingress"
+        ).exists()
+        cloned = yaml.safe_load(
+            (profile_dir / "config.yaml").read_text(encoding="utf-8")
+        )
+        assert "gateway_account_id" not in (
+            cloned["platforms"]["matrix"]["extra"]
+        )
+        assert calls == [{"quiet": False}]
+        assert (semantic_state / "ledger.sqlite3").read_bytes() == (
+            b"source-ledger"
+        )
+        assert (turn_queue / "turn.sqlite3").read_bytes() == (
+            b"source-turn-origin"
+        )
+        assert (artifact_ingress / "snapshot.png").read_bytes() == (
+            b"source-private-attachment"
+        )
+        assert yaml.safe_load(
+            (default_home / "config.yaml").read_text(encoding="utf-8")
+        ) == source_config
 
     def test_clone_all_excludes_sibling_profiles_tree(self, profile_env):
         """--clone-all from default ~/.hermes must not copy profiles/* (nested explosion)."""
@@ -1173,6 +1352,81 @@ class TestExportImport:
         assert Path(result).exists()
         assert tarfile.is_tarfile(str(result))
 
+    def test_named_export_never_copies_delivery_or_ack_authority(
+        self, profile_env, tmp_path
+    ):
+        create_profile("coder", no_alias=True)
+        profile_dir = get_profile_dir("coder")
+        source_id = "acct_" + ("4" * 48)
+        source_config = {
+            "_config_version": DEFAULT_CONFIG["_config_version"],
+            "platforms": {
+                "signal": {
+                    "enabled": True,
+                    "extra": {
+                        "http_url": "http://127.0.0.1:8080",
+                        "account": "+15551234567",
+                        "gateway_account_id": source_id,
+                    },
+                }
+            },
+        }
+        (profile_dir / "config.yaml").write_text(
+            yaml.safe_dump(source_config, sort_keys=False),
+            encoding="utf-8",
+        )
+        semantic_state = profile_dir / "state" / "semantic-delivery"
+        semantic_state.mkdir(parents=True)
+        (semantic_state / "ledger.sqlite3").write_bytes(b"source-ledger")
+        (semantic_state / "preview-ack-outbox.sqlite3").write_bytes(
+            b"source-ack-outbox"
+        )
+        turn_queue = profile_dir / "gateway-turn-queue"
+        turn_queue.mkdir()
+        (turn_queue / "turn.sqlite3").write_bytes(b"source-turn-origin")
+        artifact_ingress = (
+            profile_dir / "planning-v2" / "artifact-ingress"
+        )
+        artifact_ingress.mkdir(parents=True)
+        (artifact_ingress / "snapshot.png").write_bytes(
+            b"source-private-attachment"
+        )
+
+        output = tmp_path / "export" / "coder.tar.gz"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        export_profile("coder", str(output))
+
+        with tarfile.open(output, "r:gz") as tf:
+            names = set(tf.getnames())
+            archived_config_file = tf.extractfile("coder/config.yaml")
+            assert archived_config_file is not None
+            archived_config = yaml.safe_load(archived_config_file.read())
+
+        assert not any(name.startswith("coder/state") for name in names)
+        assert not any(
+            name.startswith("coder/gateway-turn-queue")
+            for name in names
+        )
+        assert not any(
+            name.startswith("coder/planning-v2/artifact-ingress")
+            for name in names
+        )
+        assert "gateway_account_id" not in (
+            archived_config["platforms"]["signal"]["extra"]
+        )
+        assert (semantic_state / "ledger.sqlite3").read_bytes() == (
+            b"source-ledger"
+        )
+        assert (turn_queue / "turn.sqlite3").read_bytes() == (
+            b"source-turn-origin"
+        )
+        assert (artifact_ingress / "snapshot.png").read_bytes() == (
+            b"source-private-attachment"
+        )
+        assert yaml.safe_load(
+            (profile_dir / "config.yaml").read_text(encoding="utf-8")
+        ) == source_config
+
     def test_import_restores_from_archive(self, profile_env, tmp_path):
         # Create and export a profile
         create_profile("coder", no_alias=True)
@@ -1191,6 +1445,76 @@ class TestExportImport:
         imported = import_profile(str(archive_path), name="coder")
         assert imported.is_dir()
         assert (imported / "marker.txt").read_text() == "hello"
+
+    def test_import_mints_fresh_authority_and_discards_legacy_delivery_state(
+        self, profile_env, tmp_path
+    ):
+        source_id = "acct_" + ("5" * 48)
+        archive_tree = tmp_path / "legacy-tree" / "legacy"
+        semantic_state = archive_tree / "state" / "semantic-delivery"
+        semantic_state.mkdir(parents=True)
+        source_config = {
+            "_config_version": DEFAULT_CONFIG["_config_version"],
+            "platforms": {
+                "signal": {
+                    "enabled": True,
+                    "extra": {
+                        "http_url": "http://127.0.0.1:8080",
+                        "account": "+15557654321",
+                        "gateway_account_id": source_id,
+                    },
+                }
+            },
+        }
+        (archive_tree / "config.yaml").write_text(
+            yaml.safe_dump(source_config, sort_keys=False),
+            encoding="utf-8",
+        )
+        (semantic_state / "ledger.sqlite3").write_bytes(b"legacy-ledger")
+        (semantic_state / "preview-ack-outbox.sqlite3").write_bytes(
+            b"legacy-ack-outbox"
+        )
+        turn_queue = archive_tree / "gateway-turn-queue"
+        turn_queue.mkdir()
+        (turn_queue / "turn.sqlite3").write_bytes(b"legacy-turn-origin")
+        artifact_ingress = (
+            archive_tree / "planning-v2" / "artifact-ingress"
+        )
+        artifact_ingress.mkdir(parents=True)
+        (artifact_ingress / "snapshot.png").write_bytes(
+            b"legacy-private-attachment"
+        )
+        (archive_tree / "gateway.pid").write_text("12345", encoding="utf-8")
+        (archive_tree / "gateway_state.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        (archive_tree / "processes.json").write_text("[]", encoding="utf-8")
+
+        archive = tmp_path / "legacy.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(archive_tree, arcname="legacy")
+
+        imported = import_profile(str(archive), name="restored")
+        imported_config = yaml.safe_load(
+            (imported / "config.yaml").read_text(encoding="utf-8")
+        )
+        imported_id = imported_config["platforms"]["signal"]["extra"][
+            "gateway_account_id"
+        ]
+
+        assert imported_id.startswith("acct_")
+        assert len(imported_id) == len(source_id)
+        assert imported_id != source_id
+        # Provisioning may mint a fresh profile-instance marker, but it must
+        # never restore or materialize the source semantic runtime ledger.
+        assert not (imported / "state" / "semantic-delivery").exists()
+        assert not (imported / "gateway-turn-queue").exists()
+        assert not (
+            imported / "planning-v2" / "artifact-ingress"
+        ).exists()
+        assert not (imported / "gateway.pid").exists()
+        assert not (imported / "gateway_state.json").exists()
+        assert not (imported / "processes.json").exists()
 
     def test_import_to_existing_name_raises(self, profile_env, tmp_path):
         create_profile("coder", no_alias=True)
@@ -1320,6 +1644,43 @@ class TestExportImport:
         assert "default/.env" not in names  # credentials excluded
         assert "default/SOUL.md" in names
         assert "default/memories/MEMORY.md" in names
+
+    def test_export_default_strips_semantic_account_authority(
+        self, profile_env, tmp_path
+    ):
+        default_dir = get_profile_dir("default")
+        source_id = "acct_" + ("6" * 48)
+        source_config = {
+            "_config_version": DEFAULT_CONFIG["_config_version"],
+            "platforms": {
+                "signal": {
+                    "enabled": True,
+                    "extra": {
+                        "gateway_account_id": source_id,
+                    },
+                }
+            },
+        }
+        (default_dir / "config.yaml").write_text(
+            yaml.safe_dump(source_config, sort_keys=False),
+            encoding="utf-8",
+        )
+
+        output = tmp_path / "export" / "default.tar.gz"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        export_profile("default", str(output))
+
+        with tarfile.open(output, "r:gz") as tf:
+            archived_config_file = tf.extractfile("default/config.yaml")
+            assert archived_config_file is not None
+            archived_config = yaml.safe_load(archived_config_file.read())
+
+        assert "gateway_account_id" not in (
+            archived_config["platforms"]["signal"]["extra"]
+        )
+        assert yaml.safe_load(
+            (default_dir / "config.yaml").read_text(encoding="utf-8")
+        ) == source_config
 
     def test_export_default_excludes_infrastructure(self, profile_env, tmp_path):
         """Repo checkout, worktrees, profiles, databases are excluded."""

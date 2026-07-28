@@ -10756,6 +10756,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             not has_new_options and current_ver < latest_ver
         )
         needs_migration = has_new_options or current_ver < latest_ver
+        delivery_accounts_checked = False
 
         if version_bump_only:
             # Nothing for the user to fill in — only the config format version
@@ -10769,6 +10770,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             try:
                 migrate_config(interactive=False, quiet=True)
+                delivery_accounts_checked = True
                 print("  ✓ Config format updated (no new settings to configure)")
             except Exception as _mig_err:
                 print(f"  ⚠️  Config format update failed: {_mig_err}")
@@ -10845,6 +10847,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     gateway_mode or assume_yes or response == "auto"
                 )
                 results = migrate_config(interactive=interactive_migration, quiet=False)
+                delivery_accounts_checked = True
 
                 if results["env_added"] or results["config_added"]:
                     print()
@@ -10856,6 +10859,29 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print("Skipped. Run 'hermes config migrate' later to configure.")
         else:
             print("  ✓ Configuration is up to date")
+
+        # Stable semantic-delivery identities are not gated on the numeric
+        # config schema version: a provider may have been enabled after the
+        # previous migration or only in a named profile's .env. This is
+        # intentionally an explicit update/config lifecycle write; send,
+        # status, and discovery remain read-only.
+        if not delivery_accounts_checked:
+            try:
+                from hermes_cli.delivery_account_provisioning import (
+                    run_lifecycle_provisioning,
+                )
+
+                run_lifecycle_provisioning(quiet=False)
+            except Exception as _delivery_account_error:
+                logger.debug(
+                    "semantic delivery account provisioning after update failed: %s",
+                    _delivery_account_error,
+                )
+                print(
+                    "  ⚠ Semantic delivery account provisioning could not run. "
+                    "Retry with: hermes config provision-delivery-accounts",
+                    file=sys.stderr,
+                )
 
         # Safety net: config-version migrations have been observed to leave
         # cron/jobs.json valid-but-empty, silently dropping every scheduled

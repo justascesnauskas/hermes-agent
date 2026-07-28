@@ -95,6 +95,13 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from gateway.config import Platform
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    provider_rejection_error,
+    provider_rejection_evidence,
+    semantic_exact_attempt_encoding_contract,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +649,14 @@ class LineAdapter(BasePlatformAdapter):
 
     # LINE has its own message-edit story (none) — we always send fresh
     # bubbles, never edit, so REQUIRES_EDIT_FINALIZE stays False.
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="line",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="line-logical-v1",
+        max_logical_units=LINE_SAFE_BUBBLE_CHARS,
+        length_semantics="unicode_codepoints",
+        wire_encoding="line-push-text-json-v1",
+    )
 
     def __init__(self, config, **kwargs):
         platform = Platform("line")
@@ -1077,6 +1092,181 @@ class LineAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Outbound send (text)
     # ------------------------------------------------------------------
+
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Push one raw LINE text object without reply-token fallback."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+            exact_provider_message_id,
+        )
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        try:
+            request.content.encode("utf-8", errors="strict")
+            content_is_utf8 = True
+        except (AttributeError, UnicodeEncodeError):
+            content_is_utf8 = False
+        target_invalid = bool(
+            not isinstance(request.chat_id, str)
+            or not request.chat_id
+            or request.chat_id[:1] not in {"U", "C", "R"}
+            or len(request.chat_id) > 64
+            or any(
+                ord(character) < 33 or ord(character) == 127
+                for character in request.chat_id
+            )
+        )
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or not request.delivery_id
+            or not request.delivery_target
+            or target_invalid
+            or not isinstance(request.content, str)
+            or not content_is_utf8
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+            or not self.channel_access_token
+            or self._client is None
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+
+        import aiohttp
+
+        headers = {
+            "Authorization": f"Bearer {self.channel_access_token}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "to": request.chat_id,
+            "messages": [{"type": "text", "text": request.content}],
+        }
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30.0),
+            trust_env=True,
+        )
+        try:
+            async with session.post(
+                LINE_PUSH_URL,
+                headers=headers,
+                json=payload,
+                allow_redirects=False,
+            ) as response:
+                status = int(response.status)
+                if 200 <= status < 300:
+                    try:
+                        data = await response.json(content_type=None)
+                    except Exception:
+                        data = None
+                    sent = (
+                        data.get("sentMessages")
+                        if isinstance(data, dict)
+                        else None
+                    )
+                    message_id = None
+                    if isinstance(sent, list) and sent:
+                        first = sent[0]
+                        if isinstance(first, dict):
+                            message_id = exact_provider_message_id(
+                                first.get("id")
+                            )
+                    if message_id is None:
+                        rejection = provider_rejection_evidence(
+                            provider="LINE",
+                            status=status,
+                            body=await response.text(),
+                        )
+                        return SendResult(
+                            success=False,
+                            error="semantic_delivery_provider_receipt_invalid",
+                            raw_response={
+                                "status": status,
+                                "provider_rejection": rejection,
+                            },
+                        )
+                    return SendResult(
+                        success=True,
+                        message_id=message_id,
+                        raw_response=data,
+                    )
+                body = await response.text()
+                rejection = provider_rejection_evidence(
+                    provider="LINE",
+                    status=status,
+                    body=body,
+                )
+                if status == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    try:
+                        retry_after_value = float(retry_after)
+                    except (TypeError, ValueError):
+                        retry_after_value = None
+                    return SendResult(
+                        success=False,
+                        error="LINE rate limited semantic delivery",
+                        retryable=True,
+                        retry_after=retry_after_value,
+                        raw_response={
+                            "provider_write_attempted": False,
+                            "provider_retryable": True,
+                            "retry_after": retry_after_value,
+                            "status": status,
+                            "provider_rejection": rejection,
+                        },
+                    )
+                if status == 408 or status >= 500:
+                    return SendResult(
+                        success=False,
+                        error=provider_rejection_error(rejection),
+                        raw_response={
+                            "status": status,
+                            "provider_rejection": rejection,
+                        },
+                    )
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+        except asyncio.CancelledError:
+            raise
+        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+            return SendResult(
+                success=False,
+                error=f"LINE semantic transport failed: {exc}",
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"LINE semantic transport failed: {exc}",
+            )
+        finally:
+            await session.close()
 
     async def send(
         self,
@@ -1634,6 +1824,8 @@ def register(ctx) -> None:
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="LINE_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=True,
         allowed_users_env="LINE_ALLOWED_USERS",
         allow_all_env="LINE_ALLOW_ALL_USERS",
         # LINE per-bubble cap is 5000; smart-chunker uses 4500.

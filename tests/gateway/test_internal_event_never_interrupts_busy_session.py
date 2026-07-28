@@ -10,12 +10,10 @@ default ``busy_input_mode='interrupt'`` path — calling
 completions (terminal ``notify_on_complete``), which also re-enter as internal
 events.
 
-The fix: ``_handle_active_session_busy_message`` returns ``False`` early for any
-event with ``internal=True``, so the base adapter queues it silently (no
-interrupt, no ack) and it cascades as a new turn after the current one finishes.
-This preserves strict message-role alternation and the design invariant that a
-completion surfaces as a NEW turn only when idle, never spliced into a running
-turn.
+The fix: ``_handle_active_session_busy_message`` admits every internal event
+through the runner-owned FIFO and returns ``True``. The base adapter therefore
+cannot merge it into its process-local pending slot. It cascades silently as a
+new turn after the current one finishes, and survives a gateway restart.
 """
 
 from __future__ import annotations
@@ -115,12 +113,12 @@ async def test_internal_event_does_not_interrupt_busy_session() -> None:
     parent = _make_running_parent()
     runner._running_agents[sk] = parent
     runner.adapters[event.source.platform] = adapter
+    runner._queue_or_replace_pending_event = MagicMock()
 
     handled = await runner._handle_active_session_busy_message(event, sk)
 
-    # Returns False so the base adapter silently queues the internal event
-    # as a cascading next turn — it must NOT be handled-with-interrupt here.
-    assert handled is False
+    assert handled is True
+    runner._queue_or_replace_pending_event.assert_called_once_with(sk, event)
     # The active turn must survive.
     parent.interrupt.assert_not_called()
     # No "⚡ Interrupting current task" (or any) ack for a synthetic event.

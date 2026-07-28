@@ -1829,6 +1829,9 @@ def test_current_thread_resolution_preserves_exact_origin_and_all_choices() -> N
     response = client.resolve_current_thread(origin=origin)
 
     assert response.payload["threads"] == choices
+    assert response.payload["returnedCount"] == 2
+    assert response.payload["hasMore"] is False
+    assert response.payload["nextCursor"] is None
     assert len(transport.calls) == 1
     call = transport.calls[0]
     assert call["method"] == "POST"
@@ -1839,6 +1842,50 @@ def test_current_thread_resolution_preserves_exact_origin_and_all_choices() -> N
     assert json.loads(call["body"]) == {"origin": origin}
     assert "idempotency-key" not in call["headers"]
     assert call["bodyIsStream"] is False
+
+
+def test_current_thread_resolution_reads_one_bounded_large_history_page() -> None:
+    choices = [
+        {
+            "threadId": f"thread-{index:03d}",
+            "title": f"Planning thread {index:03d}",
+            "status": "active",
+        }
+        for index in range(137, 120, -1)
+    ]
+    transport = _ScriptedTransport(
+        _Response(
+            200,
+            {
+                "match": "ambiguous",
+                "matchCount": 137,
+                "returnedCount": 17,
+                "threads": choices,
+                "hasMore": True,
+                "nextCursor": "opaque-current-thread-page-2",
+            },
+        )
+    )
+    origin = _origin()
+
+    response = _client(transport).resolve_current_thread(
+        origin=origin,
+        cursor="opaque-current-thread-page-1",
+        page_size=17,
+    )
+
+    assert response.payload["matchCount"] == 137
+    assert response.payload["returnedCount"] == len(choices) == 17
+    assert response.payload["threads"] == choices
+    assert response.payload["hasMore"] is True
+    assert response.payload["nextCursor"] == (
+        "opaque-current-thread-page-2"
+    )
+    assert json.loads(transport.calls[0]["body"]) == {
+        "origin": origin,
+        "cursor": "opaque-current-thread-page-1",
+        "pageSize": 17,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1855,6 +1902,39 @@ def test_current_thread_resolution_preserves_exact_origin_and_all_choices() -> N
             "matchCount": 1,
             "threads": [{"threadId": "thread-1"}],
         },
+        {
+            "match": "ambiguous",
+            "matchCount": 2,
+            "returnedCount": 1,
+            "threads": [{"threadId": "thread-1", "title": "One"}],
+        },
+        {
+            "match": "ambiguous",
+            "matchCount": 2,
+            "returnedCount": 2,
+            "threads": [{"threadId": "thread-1", "title": "One"}],
+            "hasMore": False,
+            "nextCursor": None,
+        },
+        {
+            "match": "ambiguous",
+            "matchCount": 2,
+            "returnedCount": 1,
+            "threads": [{"threadId": "thread-1", "title": "One"}],
+            "hasMore": True,
+            "nextCursor": None,
+        },
+        {
+            "match": "ambiguous",
+            "matchCount": 2,
+            "returnedCount": 2,
+            "threads": [
+                {"threadId": "thread-1", "title": "One"},
+                {"threadId": "thread-1", "title": "Duplicate"},
+            ],
+            "hasMore": False,
+            "nextCursor": None,
+        },
     ],
 )
 def test_current_thread_resolution_rejects_inconsistent_or_untitled_choices(
@@ -1867,6 +1947,36 @@ def test_current_thread_resolution_rejects_inconsistent_or_untitled_choices(
 
     assert captured.value.code == "planning.hub_response_invalid"
     assert captured.value.status == 200
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "code"),
+    [
+        ({"page_size": 0}, "planning.current_thread_page_size_invalid"),
+        ({"page_size": 201}, "planning.current_thread_page_size_invalid"),
+        ({"page_size": True}, "planning.current_thread_page_size_invalid"),
+        ({"cursor": ""}, "planning.current_thread_cursor_invalid"),
+        ({"cursor": " padded "}, "planning.current_thread_cursor_invalid"),
+        (
+            {"cursor": "x" * 1025},
+            "planning.current_thread_cursor_invalid",
+        ),
+    ],
+)
+def test_current_thread_resolution_rejects_invalid_page_configuration(
+    kwargs: dict[str, Any],
+    code: str,
+) -> None:
+    transport = _ScriptedTransport()
+
+    with pytest.raises(PlanningV2ConfigError) as captured:
+        _client(transport).resolve_current_thread(
+            origin=_origin(),
+            **kwargs,
+        )
+
+    assert captured.value.code == code
+    assert transport.calls == []
 
 
 def test_typed_hub_failure_preserves_service_code_status_and_detail() -> None:
@@ -2073,6 +2183,9 @@ def test_thread_identity_is_stable_for_exact_event_and_scoped_by_account() -> No
 
 
 def test_cancel_thread_sends_exact_origin_and_validates_terminal_aggregate() -> None:
+    reason = "Cancel this exact planning thread. " + (
+        "Keep the complete human context. " * 320
+    ).rstrip()
     payload = {
         "ok": True,
         "replayed": False,
@@ -2097,7 +2210,7 @@ def test_cancel_thread_sends_exact_origin_and_validates_terminal_aggregate() -> 
     response = _client(transport).cancel_thread(
         "thread-1",
         origin=_origin(),
-        reason="explicit_human_cancel",
+        reason=reason,
     )
 
     assert response.payload == payload
@@ -2108,7 +2221,7 @@ def test_cancel_thread_sends_exact_origin_and_validates_terminal_aggregate() -> 
     )
     assert json.loads(call["body"]) == {
         "origin": _origin(),
-        "reason": "explicit_human_cancel",
+        "reason": reason,
     }
 
 
@@ -2142,3 +2255,340 @@ def test_cancel_thread_rejects_malformed_success() -> None:
         )
 
     assert captured.value.code == "planning.hub_response_invalid"
+
+
+def _delivery_attention_payload(
+    *,
+    token: str = "pdra_" + ("a" * 48),
+    count: int = 1,
+    has_more: bool = False,
+) -> dict[str, Any]:
+    item = {
+        "resolutionToken": token,
+        "kind": "provider_outcome_ambiguous",
+        "eventType": "planning_preview_ready",
+        "generation": 1,
+        "target": {
+            "provider": "discord",
+            "gatewayAccountId": "discord-account",
+            "chatId": "discord-chat",
+            "threadId": None,
+        },
+        "message": "The provider may have accepted this message.",
+        "actions": [
+            {
+                "action": "mark_delivered",
+                "acknowledgement": "user_observed_original_delivery",
+                "meaning": "Observed.",
+            },
+            {
+                "action": "resend_acknowledged",
+                "acknowledgement": "user_accepts_possible_duplicate",
+                "meaning": "Accept duplicate risk.",
+            },
+        ],
+    }
+    return {
+        "ok": True,
+        "threadId": "thread-1",
+        "deliveryAttention": {
+            "status": "action_required",
+            "count": count,
+            "returnedCount": 1,
+            "hasMore": has_more,
+            "nextAfterResolutionToken": token if has_more else None,
+            "requiresExplicitToken": count > 1,
+            "items": [item],
+        },
+        "authorizedBinding": {
+            "provider": "discord",
+            "gatewayAccountId": "discord-account",
+        },
+    }
+
+
+def test_delivery_attention_is_bound_read_only_post_with_opaque_cursor() -> None:
+    token = "pdra_" + ("a" * 48)
+    transport = _ScriptedTransport(
+        _Response(
+            200,
+            _delivery_attention_payload(
+                token=token,
+                count=2,
+                has_more=True,
+            ),
+        )
+    )
+    response = _client(transport).get_delivery_attention(
+        "thread-1",
+        origin=_origin(),
+        after_resolution_token="pdra_" + ("0" * 48),
+        limit=1,
+    )
+
+    assert response.payload["deliveryAttention"]["items"][0][
+        "resolutionToken"
+    ] == token
+    call = transport.calls[0]
+    assert call["method"] == "POST"
+    assert call["url"].endswith(
+        f"{PLANNING_V2_PREFIX}/threads/thread-1/delivery-attention"
+    )
+    assert json.loads(call["body"]) == {
+        "origin": _origin(),
+        "afterResolutionToken": "pdra_" + ("0" * 48),
+        "limit": 1,
+    }
+
+
+def test_delivery_attention_rejects_cross_account_response() -> None:
+    payload = _delivery_attention_payload()
+    payload["authorizedBinding"]["gatewayAccountId"] = "other-account"
+    transport = _ScriptedTransport(_Response(200, payload))
+
+    with pytest.raises(PlanningV2ProtocolError) as captured:
+        _client(transport).get_delivery_attention(
+            "thread-1",
+            origin=_origin(),
+        )
+
+    assert captured.value.code == "planning.hub_response_invalid"
+
+
+def test_delivery_resolution_replays_same_bound_event_after_lost_response() -> None:
+    token = "pdra_" + ("b" * 48)
+    payload = {
+        "ok": True,
+        "replayed": True,
+        "threadId": "thread-1",
+        "resolution": {
+            "resolutionToken": token,
+            "action": "resend_acknowledged",
+            "acknowledgement": "user_accepts_possible_duplicate",
+            "status": "resend_scheduled",
+            "target": {
+                "provider": "discord",
+                "gatewayAccountId": "discord-account",
+                "chatId": "discord-chat",
+                "threadId": None,
+            },
+            "generation": 2,
+            "resolvedAt": "2026-07-28T12:31:00Z",
+        },
+    }
+    transport = _ScriptedTransport(
+        TimeoutError("Hub response lost"),
+        _Response(200, payload),
+    )
+    response = _client(transport).resolve_delivery_attention(
+        "thread-1",
+        origin=_origin(),
+        resolution_token=token,
+        action="resend_acknowledged",
+        reason="Resend; I accept possible duplicate delivery.",
+    )
+
+    assert response.replayed is True
+    assert len(transport.calls) == 2
+    assert transport.calls[0]["body"] == transport.calls[1]["body"]
+    assert json.loads(transport.calls[0]["body"]) == {
+        "origin": _origin(),
+        "resolutionToken": token,
+        "action": "resend_acknowledged",
+        "acknowledgement": "user_accepts_possible_duplicate",
+        "reason": "Resend; I accept possible duplicate delivery.",
+    }
+
+
+def _apply_status_payload(
+    *,
+    token: str = "par_" + ("a" * 64),
+    count: int = 1,
+    has_more: bool = False,
+    next_action: str = "automatic_resume",
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "threadId": "thread-1",
+        "applyStatus": {
+            "count": count,
+            "actionableCount": (
+                0 if next_action == "none" else count
+            ),
+            "automaticResumeCount": (
+                count if next_action == "automatic_resume" else 0
+            ),
+            "revisionRequiredCount": (
+                count if next_action == "revise" else 0
+            ),
+            "returnedCount": 1,
+            "hasMore": has_more,
+            "nextAfterRecoveryToken": token if has_more else None,
+            "items": [
+                {
+                    "recoveryToken": token,
+                    "state": (
+                        "revision_required"
+                        if next_action == "revise"
+                        else "resume_ready"
+                    ),
+                    "progress": {"total": 7, "published": 0},
+                    "nextAction": next_action,
+                    "message": "The original Jira operation can recover.",
+                    "requiresFreshPreviewApproval": next_action == "revise",
+                    "reusesOriginalOperation": (
+                        next_action == "automatic_resume"
+                    ),
+                    "automaticWhenJiraPreflightPasses": (
+                        next_action == "automatic_resume"
+                    ),
+                    "recoveryReason": (
+                        "jira_contract_rejected"
+                        if next_action == "revise"
+                        else None
+                    ),
+                    "requestedAt": "2026-07-28T12:30:00Z",
+                    "updatedAt": "2026-07-28T12:31:00Z",
+                }
+            ],
+        },
+    }
+
+
+def test_apply_status_is_bound_read_only_post_with_opaque_cursor() -> None:
+    token = "par_" + ("b" * 64)
+    transport = _ScriptedTransport(
+        _Response(
+            200,
+            _apply_status_payload(
+                token=token,
+                count=2,
+                has_more=True,
+            ),
+        )
+    )
+
+    response = _client(transport).get_apply_status(
+        "thread-1",
+        origin=_origin(),
+        after_recovery_token="par_" + ("0" * 64),
+        limit=1,
+    )
+
+    assert response.payload["applyStatus"]["items"][0][
+        "recoveryToken"
+    ] == token
+    call = transport.calls[0]
+    assert call["method"] == "POST"
+    assert call["url"].endswith(
+        f"{PLANNING_V2_PREFIX}/threads/thread-1/apply-status"
+    )
+    assert json.loads(call["body"]) == {
+        "origin": _origin(),
+        "afterRecoveryToken": "par_" + ("0" * 64),
+        "limit": 1,
+    }
+
+
+def test_apply_status_rejects_inconsistent_cursor_and_duplicate_items() -> None:
+    payload = _apply_status_payload(count=2, has_more=True)
+    payload["applyStatus"]["nextAfterRecoveryToken"] = "par_" + ("f" * 64)
+    transport = _ScriptedTransport(_Response(200, payload))
+
+    with pytest.raises(PlanningV2ProtocolError) as captured:
+        _client(transport).get_apply_status(
+            "thread-1",
+            origin=_origin(),
+        )
+
+    assert captured.value.code == "planning.hub_response_invalid"
+
+
+def test_apply_recovery_replays_same_turn_and_never_exposes_internal_ids() -> None:
+    token = "par_" + ("c" * 64)
+    payload = {
+        "ok": True,
+        "threadId": "thread-1",
+        "recovery": {
+            "action": "automatic_resume",
+            "state": "resumed",
+            "failedEffectsResumed": 1,
+            "publishedEffectsPreserved": 2,
+            "pendingEffectsPreserved": 4,
+            "reusedOriginalOperation": True,
+            "createdPlan": False,
+            "createdCommand": False,
+            "createdApproval": False,
+        },
+        "nextAction": "wait_for_apply",
+        "replayed": True,
+    }
+    transport = _ScriptedTransport(
+        TimeoutError("Hub response lost"),
+        _Response(200, payload),
+    )
+
+    response = _client(transport).resolve_apply_recovery(
+        "thread-1",
+        origin=_origin(),
+        reason="Jira IL is available; continue the original apply.",
+        recovery_token=token,
+    )
+
+    assert response.replayed is True
+    assert len(transport.calls) == 2
+    assert transport.calls[0]["body"] == transport.calls[1]["body"]
+    assert json.loads(transport.calls[0]["body"]) == {
+        "origin": _origin(),
+        "reason": "Jira IL is available; continue the original apply.",
+        "recoveryToken": token,
+    }
+    assert not {
+        "operationId",
+        "planId",
+        "commandId",
+        "approvalId",
+        "applyBindingId",
+    } & set(response.payload["recovery"])
+
+
+def test_apply_recovery_validates_corrective_revision_contract() -> None:
+    payload = {
+        "ok": True,
+        "threadId": "thread-1",
+        "recovery": {
+            "action": "revise",
+            "state": "revision_input_appended",
+            "inputSequence": 3,
+            "snapshotCreated": True,
+            "knownJiraIdentityCount": 2,
+            "candidateJiraKeys": ["IL-101", "IL-102"],
+            "oldOperationImmutable": True,
+            "requiresFreshPreviewApproval": True,
+        },
+        "nextAction": "create_preview",
+        "replayed": False,
+    }
+    transport = _ScriptedTransport(_Response(200, payload))
+
+    response = _client(transport).resolve_apply_recovery(
+        "thread-1",
+        origin=_origin(),
+        reason="Use Task instead of the rejected Jira issue type.",
+    )
+
+    assert response.payload["recovery"]["candidateJiraKeys"] == [
+        "IL-101",
+        "IL-102",
+    ]
+
+    leaked = json.loads(json.dumps(payload))
+    leaked["recovery"]["operationId"] = "command-secret"
+    with pytest.raises(PlanningV2ProtocolError):
+        _client(
+            _ScriptedTransport(_Response(200, leaked))
+        ).resolve_apply_recovery(
+            "thread-1",
+            origin=_origin(),
+            reason="Use Task instead of the rejected Jira issue type.",
+        )

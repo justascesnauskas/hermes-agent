@@ -9,6 +9,8 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+import hashlib
+import json
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -77,6 +79,51 @@ class TestStateMachine:
         dl.mark_attempting("ob-1")
         dl.mark_failed("ob-1", "chat_not_found")
         assert _row("ob-1")["state"] == "failed"
+
+    def test_long_secret_error_keeps_bounded_structured_evidence(self):
+        _record()
+        secret = "ghp_" + ("s" * 80)
+        error = f"provider token {secret} " + ("failure detail " * 80)
+
+        dl.mark_failed("ob-1", error)
+
+        with dl._connect() as connection:
+            stored = connection.execute(
+                "SELECT last_error FROM delivery_obligations "
+                "WHERE obligation_id='ob-1'"
+            ).fetchone()[0]
+        evidence = json.loads(stored)
+        assert evidence["schema_version"] == (
+            "hermes.delivery-error-evidence/1"
+        )
+        assert evidence["text_sha256"] == (
+            "sha256:"
+            + hashlib.sha256(error.encode("utf-8")).hexdigest()
+        )
+        assert evidence["text_bytes"] == len(error.encode("utf-8"))
+        assert evidence["truncated"] is True
+        assert evidence["redacted"] is True
+        assert secret not in evidence["text_preview"]
+
+    def test_redaction_collapsed_long_error_is_still_marked_truncated(self):
+        _record()
+        error = "Authorization: Bearer " + ("s" * 5_000)
+
+        dl.mark_failed("ob-1", error)
+
+        with dl._connect() as connection:
+            stored = connection.execute(
+                "SELECT last_error FROM delivery_obligations "
+                "WHERE obligation_id='ob-1'"
+            ).fetchone()[0]
+        evidence = json.loads(stored)
+        assert evidence["text_sha256"] == (
+            "sha256:"
+            + hashlib.sha256(error.encode("utf-8")).hexdigest()
+        )
+        assert evidence["truncated"] is True
+        assert evidence["redacted"] is True
+        assert error not in evidence["text_preview"]
 
     def test_rerecord_same_id_is_idempotent(self):
         _record()

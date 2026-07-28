@@ -753,6 +753,15 @@ class SessionEntry:
     resume_pending: bool = False
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
+    # Exact immutable gateway turn that was active when the resume marker was
+    # written.  Startup continuation must restore this identity byte-for-byte:
+    # deriving a fresh event from local restart time would mint a new planning
+    # preview delivery id and could duplicate a provider side effect.
+    #
+    # Only the public TurnOriginV1 wire shape is stored (identifiers and the
+    # opaque attachment fingerprints); private cached attachment paths are
+    # deliberately excluded by TurnOriginV1.to_dict().
+    resume_turn_origin: Optional[Dict[str, Any]] = None
 
     # Session-scoped /model override (model/provider/base_url ONLY — never
     # credentials).  ``_session_model_overrides`` in the gateway runner is
@@ -789,6 +798,7 @@ class SessionEntry:
                 if self.last_resume_marked_at
                 else None
             ),
+            "resume_turn_origin": self.resume_turn_origin,
             "is_fresh_reset": self.is_fresh_reset,
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
@@ -822,6 +832,21 @@ class SessionEntry:
                 last_resume_marked_at = datetime.fromisoformat(_lrma)
             except (TypeError, ValueError):
                 last_resume_marked_at = None
+
+        resume_turn_origin = None
+        _resume_origin = data.get("resume_turn_origin")
+        if isinstance(_resume_origin, dict):
+            try:
+                from hermes_cli.turn_origin import TurnOriginV1
+
+                resume_turn_origin = TurnOriginV1.from_mapping(
+                    _resume_origin
+                ).to_dict()
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring malformed persisted resume turn origin for %s",
+                    data.get("session_key", "<unknown>"),
+                )
 
         session_key = data["session_key"]
         session_id = data["session_id"]
@@ -864,6 +889,7 @@ class SessionEntry:
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
+            resume_turn_origin=resume_turn_origin,
             is_fresh_reset=data.get("is_fresh_reset", False),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
@@ -2211,6 +2237,7 @@ class SessionStore:
         self,
         session_key: str,
         reason: str = "restart_timeout",
+        turn_origin: Optional[Any] = None,
     ) -> bool:
         """Mark a session as resumable after a restart interruption.
 
@@ -2232,9 +2259,79 @@ class SessionStore:
                 entry.resume_pending = True
                 entry.resume_reason = reason
                 entry.last_resume_marked_at = _now()
+                if turn_origin is None:
+                    # Never carry a prior turn's identity into a newer
+                    # originless/internal resume marker.
+                    entry.resume_turn_origin = None
+                else:
+                    from hermes_cli.turn_origin import coerce_turn_origin
+
+                    normalized_origin = coerce_turn_origin(turn_origin)
+                    if normalized_origin is None:
+                        raise ValueError(
+                            "resume turn origin must be a valid TurnOriginV1"
+                        )
+                    entry.resume_turn_origin = normalized_origin.to_dict()
                 self._save()
                 return True
         return False
+
+    def persist_active_turn_origin(
+        self,
+        session_key: str,
+        turn_origin: Any,
+    ) -> bool:
+        """Durably bind the immutable origin before an agent can run tools.
+
+        The value intentionally remains after the in-process agent call
+        returns: the platform adapter still has to send and acknowledge the
+        semantic response.  A later real inbound turn safely overwrites it.
+        """
+        from hermes_cli.turn_origin import coerce_turn_origin
+
+        normalized_origin = coerce_turn_origin(turn_origin)
+        if turn_origin is not None and normalized_origin is None:
+            raise ValueError("active turn origin must be a valid TurnOriginV1")
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return False
+            entry.resume_turn_origin = (
+                normalized_origin.to_dict()
+                if normalized_origin is not None
+                else None
+            )
+            self._save()
+            return True
+
+    def confirm_turn_delivery(
+        self,
+        session_key: str,
+        *,
+        expected_event_id: Optional[str],
+    ) -> bool:
+        """Clear recovery state after the owning provider delivery is proven.
+
+        The event-id compare-and-clear prevents a late callback from an older
+        turn erasing the durable identity of a newer turn on the same session.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or not entry.resume_turn_origin:
+                return False
+            stored_event_id = str(
+                entry.resume_turn_origin.get("event_id") or ""
+            )
+            if stored_event_id != str(expected_event_id or ""):
+                return False
+            entry.resume_turn_origin = None
+            entry.resume_pending = False
+            entry.resume_reason = None
+            entry.last_resume_marked_at = None
+            self._save()
+            return True
 
     def clear_resume_pending(self, session_key: str) -> bool:
         """Clear the resume-pending flag after a successful resumed turn.
@@ -2333,7 +2430,11 @@ class SessionStore:
             for entry in self._entries.values():
                 if entry.resume_pending:
                     continue
-                if not entry.suspended and entry.updated_at >= cutoff:
+                if (
+                    not entry.suspended
+                    and entry.updated_at >= cutoff
+                    and entry.resume_turn_origin is not None
+                ):
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.last_resume_marked_at = _now()

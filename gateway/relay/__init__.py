@@ -21,6 +21,19 @@ from __future__ import annotations
 import os
 from typing import Optional
 
+from gateway.platform_registry import declare_semantic_exact_attempt
+
+
+declare_semantic_exact_attempt(
+    "relay",
+    standalone=False,
+    live=False,
+    owner="gateway.relay",
+    planning_ineligible_reason=(
+        "connector_true_provider_receipt_not_negotiated"
+    ),
+)
+
 
 def relay_url() -> Optional[str]:
     """The connector relay endpoint URL, or None when relay is not configured.
@@ -830,6 +843,8 @@ def register_relay_adapter(force: bool = False, url: Optional[str] = None) -> bo
             adapter_factory=_factory,
             check_fn=lambda: True,
             source="builtin",
+            semantic_exact_attempt=False,
+            live_semantic_exact_attempt=False,
             emoji="\U0001f50c",
         )
     )

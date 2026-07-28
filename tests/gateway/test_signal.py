@@ -1,6 +1,9 @@
 """Tests for Signal messenger platform adapter."""
 import asyncio
 import base64
+import hashlib
+import json
+import httpx
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -46,6 +49,34 @@ def _stub_rpc(return_value):
         return return_value
 
     return mock_rpc, captured
+
+
+def _bind_signal_http_response(
+    adapter,
+    *,
+    payload=None,
+    status: int = 200,
+    text: str | None = None,
+    json_error: Exception | None = None,
+    side_effect: Exception | None = None,
+):
+    response = MagicMock()
+    response.status_code = status
+    response.text = (
+        json.dumps(payload, sort_keys=True)
+        if text is None
+        else text
+    )
+    if json_error is None:
+        response.json.return_value = payload
+    else:
+        response.json.side_effect = json_error
+    adapter.client = MagicMock()
+    adapter.client.post = AsyncMock(
+        return_value=response,
+        side_effect=side_effect,
+    )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -1127,6 +1158,330 @@ class TestSignalSendReturnsMessageId:
 
         assert result.success is True
         assert result.message_id is None
+
+
+class TestSignalSemanticExactSend:
+    @staticmethod
+    def _metadata():
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+        )
+
+        return {
+            "semantic_delivery_contract": SEMANTIC_DELIVERY_CONTRACT,
+            "semantic_delivery_id": "preview_signal_exact_1",
+            "semantic_delivery_target": "signal:preview-target-v1:test",
+            "semantic_delivery_unit": 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_success_is_one_send_rpc_with_real_timestamp(
+        self,
+        monkeypatch,
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        _bind_signal_http_response(
+            adapter,
+            payload={
+                "result": {"timestamp": 1712345678001}
+            },
+        )
+        adapter._resolve_recipient = AsyncMock(
+            side_effect=AssertionError(
+                "semantic route must not probe contacts"
+            )
+        )
+        content = "Exact Planning preview"
+
+        result = await adapter._send_with_retry(
+            chat_id="+15557654321",
+            content=content,
+            metadata=self._metadata(),
+        )
+
+        assert result.success is True
+        assert result.message_id == "1712345678001"
+        assert result.delivered_content_digest == (
+            "sha256:" + hashlib.sha256(content.encode()).hexdigest()
+        )
+        assert result.delivered_content_complete is True
+        adapter.client.post.assert_awaited_once()
+        _, kwargs = adapter.client.post.await_args
+        assert kwargs["json"]["method"] == "send"
+        assert kwargs["json"]["params"]["message"] == content
+        adapter._resolve_recipient.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_timestamp_is_uncertain_without_retry(
+        self,
+        monkeypatch,
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        _bind_signal_http_response(
+            adapter,
+            payload={"result": {}},
+        )
+
+        result = await adapter._send_with_retry(
+            chat_id="+15557654321",
+            content="Receipt required",
+            metadata=self._metadata(),
+        )
+
+        assert result.success is False
+        assert result.raw_response["provider_write_attempted"] is True
+        assert result.raw_response["provider_retryable"] is False
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["provider"] == "Signal"
+        assert rejection["protocol"] == "signal-json-rpc"
+        assert rejection["response_preview"] == '{"result":{}}'
+        assert rejection["response_sha256"] in result.error
+        adapter.client.post.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        "timestamp",
+        [
+            True,
+            0,
+            -1,
+            1712345678001.0,
+            "1712345678001",
+            " 1712345678001 ",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_malformed_timestamp_is_not_coerced_to_success(
+        self,
+        monkeypatch,
+        timestamp,
+    ) -> None:
+        adapter = _make_signal_adapter(monkeypatch)
+        _bind_signal_http_response(
+            adapter,
+            payload={"result": {"timestamp": timestamp}},
+        )
+
+        result = await adapter._send_with_retry(
+            chat_id="+15557654321",
+            content="Receipt type required",
+            metadata=self._metadata(),
+        )
+
+        assert result.success is False
+        assert result.raw_response["provider_write_attempted"] is True
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["response_sha256"] in result.error
+
+    @pytest.mark.asyncio
+    async def test_rpc_rejection_keeps_bounded_protocol_evidence(
+        self,
+        monkeypatch,
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        secret = "ghp_" + ("z" * 80)
+        rpc_result = {
+            "results": [
+                {
+                    "type": "NETWORK_FAILURE",
+                    "failure": secret + (" provider detail" * 40),
+                }
+            ]
+        }
+        _bind_signal_http_response(
+            adapter,
+            payload={"result": rpc_result},
+        )
+
+        result = await adapter._send_with_retry(
+            chat_id="+15557654321",
+            content="Receipt required",
+            metadata=self._metadata(),
+        )
+
+        assert result.success is False
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["schema_version"] == (
+            "hermes.provider-protocol-rejection-evidence/1"
+        )
+        assert rejection["provider"] == "Signal"
+        assert rejection["protocol"] == "signal-json-rpc"
+        assert rejection["truncated"] is True
+        assert rejection["redacted"] is True
+        assert secret not in rejection["response_preview"]
+        assert rejection["response_sha256"] in result.error
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_is_retryable_prewrite_without_retry(
+        self,
+        monkeypatch,
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        _bind_signal_http_response(
+            adapter,
+            payload={
+                "error": {
+                    "code": -32000,
+                    "message": "Failed: [429] Rate Limited",
+                    "data": {
+                        "response": {
+                            "results": [
+                                {
+                                    "type": "RATE_LIMIT_FAILURE",
+                                    "retryAfterSeconds": 17,
+                                }
+                            ]
+                        }
+                    },
+                }
+            },
+        )
+
+        result = await adapter._send_with_retry(
+            chat_id="+15557654321",
+            content="One attempt",
+            metadata=self._metadata(),
+        )
+
+        assert result.success is False
+        assert result.retryable is True
+        assert result.retry_after == 17.0
+        assert result.raw_response["provider_write_attempted"] is False
+        assert result.raw_response["provider_retryable"] is True
+        assert result.raw_response["provider_rejection"]
+        adapter.client.post.assert_awaited_once()
+
+    @pytest.mark.parametrize("status", [400, 401, 403])
+    @pytest.mark.asyncio
+    async def test_http_rejection_is_definitive_and_keeps_raw_evidence(
+        self,
+        monkeypatch,
+        status,
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        raw_body = (
+            '{"token":"ghp_'
+            + ("x" * 80)
+            + '","detail":"request rejected"}'
+        )
+        _bind_signal_http_response(
+            adapter,
+            status=status,
+            text=raw_body,
+        )
+
+        result = await adapter._send_with_retry(
+            chat_id="+15557654321",
+            content="One rejected attempt",
+            metadata=self._metadata(),
+        )
+
+        assert result.success is False
+        assert result.raw_response["provider_write_attempted"] is False
+        assert result.raw_response["provider_retryable"] is False
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["status"] == status
+        assert rejection["body_bytes"] == len(raw_body.encode("utf-8"))
+        assert rejection["redacted"] is True
+        assert "ghp_" not in rejection["body_preview"]
+        adapter.client.post.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_http_5xx_is_ambiguous_and_not_retryable(
+        self,
+        monkeypatch,
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        _bind_signal_http_response(
+            adapter,
+            status=503,
+            text="upstream failed after dispatch",
+        )
+
+        result = await adapter._send_with_retry(
+            chat_id="+15557654321",
+            content="One uncertain attempt",
+            metadata=self._metadata(),
+        )
+
+        assert result.success is False
+        assert result.retryable is False
+        assert "provider_write_attempted" not in result.raw_response
+        assert result.raw_response["provider_rejection"]["status"] == 503
+        adapter.client.post.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_keeps_raw_response_digest(
+        self,
+        monkeypatch,
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        raw_body = '{"partial":'
+        _bind_signal_http_response(
+            adapter,
+            text=raw_body,
+            json_error=ValueError("invalid JSON"),
+        )
+
+        result = await adapter._send_with_retry(
+            chat_id="+15557654321",
+            content="Receipt required",
+            metadata=self._metadata(),
+        )
+
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["response_bytes"] == len(
+            raw_body.encode("utf-8")
+        )
+        assert rejection["response_preview"] == raw_body
+        adapter.client.post.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_transport_uncertainty_does_not_retry_or_fallback(
+        self,
+        monkeypatch,
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        _bind_signal_http_response(
+            adapter,
+            side_effect=httpx.ReadTimeout(
+                "response lost after write"
+            ),
+        )
+
+        result = await adapter._send_with_retry(
+            chat_id="+15557654321",
+            content="One uncertain attempt",
+            metadata=self._metadata(),
+        )
+
+        assert result.success is False
+        assert "outcome is uncertain" in result.error
+        assert result.raw_response is None
+        adapter.client.post.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_oversize_text_is_rejected_before_rpc(
+        self,
+        monkeypatch,
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        _bind_signal_http_response(
+            adapter,
+            payload={"result": {"timestamp": 1}},
+        )
+
+        result = await adapter._send_with_retry(
+            chat_id="+15557654321",
+            content="x" * 8001,
+            metadata=self._metadata(),
+        )
+
+        assert result.success is False
+        assert result.raw_response == {
+            "provider_write_attempted": False,
+            "provider_retryable": False,
+        }
+        adapter.client.post.assert_not_awaited()
 
 
 class TestSignalSendResultValidation:

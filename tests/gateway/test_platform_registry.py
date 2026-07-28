@@ -1,6 +1,7 @@
 """Tests for the platform adapter registry and dynamic Platform enum."""
 
 import os
+import logging
 import pytest
 from unittest.mock import MagicMock
 
@@ -171,6 +172,28 @@ class TestPlatformRegistry:
         names = {e.name for e in reg.all_entries()}
         assert names == {"one", "two"}
 
+    def test_deferred_loader_failure_logs_original_diagnostic(
+        self,
+        caplog,
+    ):
+        reg = PlatformRegistry()
+
+        def broken_loader():
+            raise RuntimeError("provider import exploded")
+
+        reg.register_deferred("broken-deferred", broken_loader)
+        with caplog.at_level(
+            logging.WARNING,
+            logger="gateway.platform_registry",
+        ):
+            assert reg.get("broken-deferred") is None
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert messages == [
+            "Deferred load of platform 'broken-deferred' failed: "
+            "provider import exploded"
+        ]
+
     def test_plugin_entries(self):
         reg = PlatformRegistry()
         plugin_entry, _ = self._make_entry("plugged")
@@ -304,6 +327,8 @@ class TestPlatformEntryExtendedFields:
         assert entry.pii_safe is False
         assert entry.emoji == "🔌"
         assert entry.allow_update_command is True
+        assert entry.semantic_exact_attempt is None
+        assert entry.live_semantic_exact_attempt is None
 
     def test_custom_auth_fields(self):
         entry = PlatformEntry(
@@ -316,11 +341,425 @@ class TestPlatformEntryExtendedFields:
             max_message_length=450,
             pii_safe=False,
             emoji="💬",
+            semantic_exact_attempt=True,
         )
         assert entry.allowed_users_env == "IRC_ALLOWED_USERS"
         assert entry.allow_all_env == "IRC_ALLOW_ALL_USERS"
         assert entry.max_message_length == 450
         assert entry.emoji == "💬"
+        assert entry.semantic_exact_attempt is True
+
+    def test_exact_attempt_capability_is_explicit_and_fail_closed(self):
+        from gateway.platform_registry import (
+            PlatformEntry,
+            platform_registry,
+            supports_live_semantic_exact_attempt,
+            supports_semantic_exact_attempt,
+        )
+        # Built-ins own their declaration in the adapter module rather than a
+        # central provider allowlist.
+        import gateway.platforms.signal  # noqa: F401
+
+        assert supports_semantic_exact_attempt("signal") is True
+        assert supports_live_semantic_exact_attempt("signal") is True
+        assert supports_semantic_exact_attempt("unknown-transport") is False
+        assert (
+            supports_live_semantic_exact_attempt("unknown-transport")
+            is False
+        )
+
+        async def exact_sender(*_args, **_kwargs):
+            return {"success": True, "message_id": "exact-test-id"}
+
+        platform_registry.register(
+            PlatformEntry(
+                name="exact-test",
+                label="Exact test",
+                adapter_factory=lambda cfg: None,
+                check_fn=lambda: True,
+                semantic_exact_attempt=True,
+                standalone_semantic_exact_attempt_fn=exact_sender,
+            )
+        )
+        try:
+            assert supports_semantic_exact_attempt("exact-test") is True
+            assert (
+                supports_live_semantic_exact_attempt("exact-test")
+                is False
+            )
+        finally:
+            platform_registry.unregister("exact-test")
+
+    def test_standalone_boolean_without_owned_callable_fails_closed(self):
+        from gateway.platform_registry import (
+            PlatformEntry,
+            enumerate_standalone_semantic_exact_attempt_conformance,
+            platform_registry,
+            supports_semantic_exact_attempt,
+        )
+
+        async def ordinary_sender(*_args, **_kwargs):
+            return {"success": True, "message_id": "must-not-authorize"}
+
+        platform_registry.register(
+            PlatformEntry(
+                name="bool-only-exact",
+                label="Boolean-only exact",
+                adapter_factory=lambda cfg: None,
+                check_fn=lambda: True,
+                standalone_sender_fn=ordinary_sender,
+                semantic_exact_attempt=True,
+            )
+        )
+        try:
+            assert supports_semantic_exact_attempt("bool-only-exact") is False
+            row = next(
+                item
+                for item in (
+                    enumerate_standalone_semantic_exact_attempt_conformance()
+                )
+                if item.provider == "bool-only-exact"
+            )
+            assert row.declaration is True
+            assert row.exact_sender is False
+            assert row.supported is False
+            assert row.conformant is False
+            assert row.reason == "exact_sender_missing"
+        finally:
+            platform_registry.unregister("bool-only-exact")
+
+    def test_exact_standalone_owners_and_callables_are_frozen(self):
+        from gateway.platform_registry import (
+            enumerate_standalone_semantic_exact_attempt_conformance,
+        )
+        from hermes_cli.plugins import discover_plugins
+        import gateway.platforms.signal  # noqa: F401
+
+        discover_plugins()
+        rows = enumerate_standalone_semantic_exact_attempt_conformance()
+        supported = {
+            row.provider: row
+            for row in rows
+            if row.supported
+        }
+
+        assert set(supported) == {
+            "signal",
+            "discord",
+            "slack",
+            "matrix",
+        }
+        assert all(row.exact_sender for row in supported.values())
+        assert all(row.conformant for row in supported.values())
+
+    def test_live_exact_attempt_requires_separate_opt_in(self):
+        from gateway.platform_registry import (
+            PlatformEntry,
+            platform_registry,
+            supports_live_semantic_exact_attempt,
+            supports_semantic_exact_attempt,
+        )
+
+        platform_registry.register(
+            PlatformEntry(
+                name="live-exact-test",
+                label="Live exact test",
+                adapter_factory=lambda cfg: None,
+                check_fn=lambda: True,
+                live_semantic_exact_attempt=True,
+            )
+        )
+        try:
+            assert (
+                supports_semantic_exact_attempt("live-exact-test")
+                is False
+            )
+            assert (
+                supports_live_semantic_exact_attempt("live-exact-test")
+                is True
+            )
+        finally:
+            platform_registry.unregister("live-exact-test")
+
+    def test_live_conformance_enumerates_and_fails_bound_unsupported(self):
+        from gateway.platform_registry import (
+            PlatformEntry,
+            enumerate_live_semantic_exact_attempt_conformance,
+            platform_registry,
+        )
+
+        class Adapter:
+            platform = "bound-unsupported"
+
+            async def send(self, *args, **kwargs):
+                raise AssertionError("unsupported adapter must never send")
+
+        platform_registry.register(
+            PlatformEntry(
+                name="bound-unsupported",
+                label="Bound unsupported",
+                adapter_factory=lambda cfg: Adapter(),
+                check_fn=lambda: True,
+                semantic_exact_attempt=False,
+                live_semantic_exact_attempt=False,
+            )
+        )
+        try:
+            rows = enumerate_live_semantic_exact_attempt_conformance(
+                {"bound-unsupported": Adapter()}
+            )
+            row = next(
+                item
+                for item in rows
+                if item.provider == "bound-unsupported"
+            )
+            assert row.bound is True
+            assert row.outbound_send is True
+            assert row.declaration is False
+            assert row.supported is False
+            assert row.conformant is False
+            assert row.reason == "bound_adapter_unsupported"
+        finally:
+            platform_registry.unregister("bound-unsupported")
+
+    def test_live_conformance_rejects_unbound_registered_false_without_reason(
+        self,
+    ):
+        from gateway.platform_registry import (
+            PlatformEntry,
+            enumerate_live_semantic_exact_attempt_conformance,
+            platform_registry,
+        )
+
+        platform_registry.register(
+            PlatformEntry(
+                name="unbound-unsupported",
+                label="Unbound unsupported",
+                adapter_factory=lambda cfg: None,
+                check_fn=lambda: True,
+                live_semantic_exact_attempt=False,
+            )
+        )
+        try:
+            row = next(
+                item
+                for item in enumerate_live_semantic_exact_attempt_conformance()
+                if item.provider == "unbound-unsupported"
+            )
+            assert row.registered is True
+            assert row.bound is False
+            assert row.declaration is False
+            assert row.supported is False
+            assert row.conformant is False
+            assert row.reason == "explicitly_unsupported"
+            assert row.planning_ineligible_reason == ""
+        finally:
+            platform_registry.unregister("unbound-unsupported")
+
+    def test_live_conformance_accepts_only_explicit_capable_bound_send(self):
+        from gateway.platform_registry import (
+            PlatformEntry,
+            enumerate_live_semantic_exact_attempt_conformance,
+            platform_registry,
+        )
+        from gateway.semantic_exact_attempt import (
+            LiveSemanticExactAttemptCapability,
+        )
+
+        class Adapter:
+            platform = "bound-exact"
+            SEMANTIC_EXACT_ATTEMPT_CAPABILITY = (
+                LiveSemanticExactAttemptCapability(
+                    provider="bound-exact",
+                    contract="hermes-live-semantic-exact-attempt/1",
+                    segmentation_version="bound-exact-logical-v1",
+                    max_logical_units=500,
+                    length_semantics="unicode_codepoints",
+                    wire_encoding="bound-exact-wire-v1",
+                )
+            )
+
+            async def send(self, *args, **kwargs):
+                return None
+
+            async def send_semantic_exact_attempt(self, request):
+                return None
+
+        platform_registry.register(
+            PlatformEntry(
+                name="bound-exact",
+                label="Bound exact",
+                adapter_factory=lambda cfg: Adapter(),
+                check_fn=lambda: True,
+                semantic_exact_attempt=False,
+                live_semantic_exact_attempt=True,
+            )
+        )
+        try:
+            rows = enumerate_live_semantic_exact_attempt_conformance(
+                {"bound-exact": Adapter()}
+            )
+            row = next(
+                item for item in rows if item.provider == "bound-exact"
+            )
+            assert row.supported is True
+            assert row.conformant is True
+            assert row.reason == "supported"
+        finally:
+            platform_registry.unregister("bound-exact")
+
+    def test_live_conformance_recurses_profiles_and_rejects_one_lying_account(
+        self,
+    ):
+        from gateway.platform_registry import (
+            PlatformEntry,
+            enumerate_live_semantic_exact_attempt_conformance,
+            platform_registry,
+        )
+        from gateway.semantic_exact_attempt import (
+            LiveSemanticExactAttemptCapability,
+        )
+
+        class ExactAdapter:
+            platform = "multi-exact"
+            SEMANTIC_EXACT_ATTEMPT_CAPABILITY = (
+                LiveSemanticExactAttemptCapability(
+                    provider="multi-exact",
+                    contract="hermes-live-semantic-exact-attempt/1",
+                    segmentation_version="multi-exact-logical-v1",
+                    max_logical_units=500,
+                    length_semantics="unicode_codepoints",
+                    wire_encoding="multi-exact-wire-v1",
+                )
+            )
+
+            async def send(self, *args, **kwargs):
+                return None
+
+            async def send_semantic_exact_attempt(self, request):
+                return None
+
+        class LyingAccount:
+            platform = "multi-exact"
+
+            async def send(self, *args, **kwargs):
+                return None
+
+        platform_registry.register(
+            PlatformEntry(
+                name="multi-exact",
+                label="Multi exact",
+                adapter_factory=lambda cfg: ExactAdapter(),
+                check_fn=lambda: True,
+                live_semantic_exact_attempt=True,
+            )
+        )
+        try:
+            rows = enumerate_live_semantic_exact_attempt_conformance(
+                {
+                    "profiles": {
+                        "work": {"multi-exact": ExactAdapter()},
+                        "other": {"multi-exact": LyingAccount()},
+                    }
+                }
+            )
+            row = next(
+                item for item in rows if item.provider == "multi-exact"
+            )
+            assert row.bound is True
+            assert row.outbound_send is True
+            assert row.exact_attempt_method is False
+            assert row.supported is False
+            assert row.conformant is False
+            assert row.reason == "bound_adapter_exact_method_missing"
+        finally:
+            platform_registry.unregister("multi-exact")
+
+    def test_semantic_declaration_rejects_integer_booleans(self):
+        from gateway.platform_registry import (
+            declare_semantic_exact_attempt,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="invalid semantic exact-attempt declaration",
+        ):
+            declare_semantic_exact_attempt(
+                "integer-bool",
+                standalone=1,
+                live=False,
+                owner=__name__,
+            )
+
+    def test_declared_true_without_owned_exact_method_fails_closed(self):
+        from gateway.platform_registry import (
+            PlatformEntry,
+            enumerate_live_semantic_exact_attempt_conformance,
+            platform_registry,
+            supports_live_semantic_exact_attempt,
+        )
+
+        class LyingAdapter:
+            platform = "lying-plugin"
+
+            async def send(self, *args, **kwargs):
+                return {"success": True, "message_id": "fake"}
+
+        platform_registry.register(
+            PlatformEntry(
+                name="lying-plugin",
+                label="Lying plugin",
+                adapter_factory=lambda cfg: LyingAdapter(),
+                check_fn=lambda: True,
+                live_semantic_exact_attempt=True,
+            )
+        )
+        try:
+            adapter = LyingAdapter()
+            assert (
+                supports_live_semantic_exact_attempt(
+                    "lying-plugin",
+                    adapter=adapter,
+                )
+                is False
+            )
+            row = next(
+                item
+                for item in enumerate_live_semantic_exact_attempt_conformance(
+                    {"lying-plugin": adapter}
+                )
+                if item.provider == "lying-plugin"
+            )
+            assert row.declaration is True
+            assert row.exact_attempt_method is False
+            assert row.supported is False
+            assert row.conformant is False
+            assert row.reason == "bound_adapter_exact_method_missing"
+        finally:
+            platform_registry.unregister("lying-plugin")
+
+    def test_every_bundled_plugin_explicitly_declares_live_contract(self):
+        from gateway.platform_registry import platform_registry
+
+        undeclared = sorted(
+            entry.name
+            for entry in platform_registry.plugin_entries()
+            if entry.live_semantic_exact_attempt is None
+        )
+        assert undeclared == []
+
+    def test_every_loaded_provider_has_a_conformant_planning_contract(self):
+        from gateway.platform_registry import (
+            enumerate_live_semantic_exact_attempt_conformance,
+        )
+
+        nonconformant = [
+            (row.provider, row.reason)
+            for row in enumerate_live_semantic_exact_attempt_conformance()
+            if not row.conformant
+        ]
+
+        assert nonconformant == []
 
 
 # ── Cron platform resolution ─────────────────────────────────────────

@@ -8,6 +8,7 @@
  * Endpoints (matches gateway/platforms/whatsapp.py expectations):
  *   GET  /messages       - Long-poll for new incoming messages
  *   POST /send           - Send a message { chatId, message, replyTo? }
+ *   POST /send-exact     - One frozen semantic text message, no fallback
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
  *   POST /send-location  - Send location pin { chatId, latitude, longitude, name?, address? }
@@ -33,6 +34,10 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import {
+  SemanticExactBridgeError,
+  sendSemanticExactText,
+} from './semantic_exact.js';
 import {
   buildPollPayload,
   buildLocationPayload,
@@ -843,6 +848,48 @@ app.post('/send', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Send one frozen Planning semantic message. This endpoint intentionally
+// bypasses formatOutgoingMessage(), splitLongMessage(), quoting, sleeps,
+// media helpers, and every fallback. `sendWithTimeout` serializes access to
+// the socket but invokes sock.sendMessage exactly once.
+app.post('/send-exact', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({
+      error: 'Not connected to WhatsApp',
+      providerWriteAttempted: false,
+      retryable: true,
+    });
+  }
+
+  try {
+    const result = await sendSemanticExactText({
+      payload: req.body,
+      sendMessage: (chatId, payload, options) =>
+        sendWithTimeout(chatId, payload, options),
+    });
+    trackSentMessageId(result.sent);
+    messageStore.remember(result.sent);
+    return res.json({
+      success: true,
+      messageId: result.messageId,
+    });
+  } catch (err) {
+    if (
+      err instanceof SemanticExactBridgeError &&
+      err.providerWriteAttempted === false
+    ) {
+      return res.status(err.statusCode || 400).json({
+        error: err.message,
+        providerWriteAttempted: false,
+        retryable: false,
+      });
+    }
+    return res.status(
+      err instanceof SemanticExactBridgeError ? err.statusCode : 500,
+    ).json({ error: err.message });
   }
 });
 

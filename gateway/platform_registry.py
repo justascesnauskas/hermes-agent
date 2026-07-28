@@ -29,10 +29,244 @@ Usage (gateway side):
 """
 
 import logging
+import importlib
+import re
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticExactAttemptDeclaration:
+    """Provider-owned exact-attempt capability, independent of load path.
+
+    Plugin adapters normally declare on :class:`PlatformEntry`. Built-in
+    adapters that do not have an entry use :func:`declare_semantic_exact_attempt`
+    from their own module. There is deliberately no central provider allowlist:
+    an absent, malformed, or conflicting declaration is unsupported.
+    """
+
+    provider: str
+    standalone: bool | None
+    live: bool | None
+    owner: str
+    planning_ineligible_reason: str = ""
+    standalone_sender_fn: Callable[..., Awaitable[dict]] | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class StandaloneSemanticExactAttemptConformance:
+    """One inspectable standalone-provider exact-attempt verdict."""
+
+    provider: str
+    registered: bool
+    declaration: bool | None
+    exact_sender: bool
+    supported: bool
+    conformant: bool
+    owner: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class LiveSemanticExactAttemptConformance:
+    """One complete, inspectable live-provider capability verdict."""
+
+    provider: str
+    registered: bool
+    bound: bool
+    outbound_send: bool
+    exact_attempt_method: bool
+    declaration: bool | None
+    supported: bool
+    conformant: bool
+    owner: str
+    reason: str
+    planning_ineligible_reason: str = ""
+
+
+_semantic_exact_attempt_declarations: dict[
+    str, SemanticExactAttemptDeclaration
+] = {}
+
+
+def _clean_provider_name(name: Any) -> str:
+    return str(getattr(name, "value", name) or "").strip().lower()
+
+
+def _load_builtin_semantic_declaration(provider: str) -> None:
+    """Load one built-in provider-owned capability contract on first query.
+
+    Plugin declarations arrive through their existing deferred registry entry.
+    Built-ins such as Signal have no ``PlatformEntry`` and therefore need this
+    narrow convention loader in a fresh standalone-send process. Unknown names
+    and import failures remain unsupported; no central capability allowlist is
+    introduced.
+    """
+
+    if provider in _semantic_exact_attempt_declarations:
+        return
+    module_component = provider.replace("-", "_")
+    if re.fullmatch(r"[a-z][a-z0-9_]{0,119}", module_component) is None:
+        return
+    module_name = f"gateway.platforms.{module_component}"
+    try:
+        importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name != module_name:
+            logger.warning(
+                "Semantic capability load of built-in platform '%s' failed: %s",
+                provider,
+                exc,
+                exc_info=True,
+            )
+    except Exception as exc:
+        logger.warning(
+            "Semantic capability load of built-in platform '%s' failed: %s",
+            provider,
+            exc,
+            exc_info=True,
+        )
+
+
+def declare_semantic_exact_attempt(
+    provider: str,
+    *,
+    standalone: bool | None,
+    live: bool | None,
+    owner: str,
+    planning_ineligible_reason: str = "",
+    standalone_sender_fn: Callable[..., Awaitable[dict]] | None = None,
+) -> SemanticExactAttemptDeclaration:
+    """Declare one built-in/provider-owned capability without an allowlist.
+
+    Repeating the identical declaration is idempotent. A second owner cannot
+    silently widen or narrow an existing provider contract: the conflict is
+    retained as an unsupported declaration so all callers fail closed.
+    """
+
+    clean = _clean_provider_name(provider)
+    ineligible_reason = str(planning_ineligible_reason or "").strip()
+    if (
+        not clean
+        or (
+            standalone is not None
+            and type(standalone) is not bool
+        )
+        or (live is not None and type(live) is not bool)
+        or (
+            (standalone is True and not callable(standalone_sender_fn))
+            or (
+                standalone is not True
+                and standalone_sender_fn is not None
+            )
+        )
+        or not str(owner or "").strip()
+        or (
+            ineligible_reason
+            and (
+                live is not False
+                or len(ineligible_reason) > 160
+                or not all(
+                    character.islower()
+                    or character.isdigit()
+                    or character in {"_", "-", "."}
+                    for character in ineligible_reason
+                )
+            )
+        )
+    ):
+        raise ValueError("invalid semantic exact-attempt declaration")
+    proposed = SemanticExactAttemptDeclaration(
+        provider=clean,
+        standalone=standalone,
+        live=live,
+        owner=str(owner).strip(),
+        planning_ineligible_reason=ineligible_reason,
+        standalone_sender_fn=standalone_sender_fn,
+    )
+    existing = _semantic_exact_attempt_declarations.get(clean)
+    if existing is not None and existing != proposed:
+        conflict = SemanticExactAttemptDeclaration(
+            provider=clean,
+            standalone=None,
+            live=None,
+            owner=f"conflict:{existing.owner},{proposed.owner}",
+            planning_ineligible_reason="",
+            standalone_sender_fn=None,
+        )
+        _semantic_exact_attempt_declarations[clean] = conflict
+        logger.error(
+            "Conflicting semantic exact-attempt declarations for '%s': "
+            "%s vs %s",
+            clean,
+            existing,
+            proposed,
+        )
+        return conflict
+    _semantic_exact_attempt_declarations[clean] = proposed
+    return proposed
+
+
+def planning_semantic_delivery_ineligibility(
+    name: Any,
+    *,
+    adapter: Any | None = None,
+) -> str | None:
+    """Return an explicit no-provider-write Planning preflight classification.
+
+    Response planes, ingress-only listeners, and unresolved delegated routes
+    are not broken provider adapters. They deliberately cannot own Planning's
+    exact provider-message receipt. The provider module must declare a stable
+    reason and ``live=False``; absent, conflicting, or adapter-mismatched
+    declarations fail closed as ordinary unsupported providers instead.
+    """
+
+    clean = _clean_provider_name(name)
+    platform_registry.get(clean)
+    _load_builtin_semantic_declaration(clean)
+    declaration = _semantic_exact_attempt_declarations.get(clean)
+    if (
+        declaration is None
+        or declaration.live is not False
+        or not declaration.planning_ineligible_reason
+    ):
+        return None
+    entry = platform_registry.get(clean)
+    if (
+        entry is not None
+        and entry.live_semantic_exact_attempt not in {None, False}
+    ):
+        return None
+    if adapter is not None:
+        adapter_provider = _clean_provider_name(
+            getattr(adapter, "platform", None)
+        )
+        if adapter_provider != clean:
+            return None
+    return declaration.planning_ineligible_reason
+
+
+def unregister_semantic_exact_attempt_declaration(
+    provider: str,
+    *,
+    owner: str | None = None,
+) -> bool:
+    """Test/plugin teardown helper with optional owner fencing."""
+
+    clean = _clean_provider_name(provider)
+    existing = _semantic_exact_attempt_declarations.get(clean)
+    if existing is None:
+        return False
+    if owner is not None and existing.owner != owner:
+        return False
+    del _semantic_exact_attempt_declarations[clean]
+    return True
 
 
 @dataclass
@@ -157,6 +391,27 @@ class PlatformEntry:
     # Without this hook, plugin platforms cannot serve as cron ``deliver=``
     # targets when the gateway is not co-resident with the cron process.
     standalone_sender_fn: Optional[Callable[..., Awaitable[dict]]] = None
+
+    # Explicit opt-in for the versioned semantic-delivery attempt contract.
+    # A capable standalone sender must make exactly one provider attempt,
+    # accept the deterministic delivery_* kwargs, avoid hidden retries and
+    # fallbacks, and return a real provider message receipt on success.
+    # Unknown/third-party plugins remain fail-closed until they declare this.
+    semantic_exact_attempt: bool | None = None
+
+    # The actual standalone primitive that owns the exact-attempt contract.
+    # A boolean declaration alone is never capability. The semantic dispatcher
+    # calls this function (not the ordinary standalone fallback) so a plugin
+    # cannot widen Planning delivery by flipping metadata only.
+    standalone_semantic_exact_attempt_fn: Optional[
+        Callable[..., Awaitable[dict]]
+    ] = None
+
+    # Explicit opt-in for the live gateway adapter path. This is intentionally
+    # separate from ``semantic_exact_attempt``: a safe standalone sender does
+    # not prove that a long-lived SDK adapter avoids retries, typing calls,
+    # recipient probes, chunking, or formatting fallbacks.
+    live_semantic_exact_attempt: bool | None = None
 
 
 class PlatformRegistry:
@@ -330,3 +585,318 @@ class PlatformRegistry:
 
 # Module-level singleton
 platform_registry = PlatformRegistry()
+
+
+def supports_semantic_exact_attempt(name: str) -> bool:
+    """Return whether one standalone route owns the exact-attempt contract."""
+
+    clean = _clean_provider_name(name)
+    entry = platform_registry.get(clean)
+    _load_builtin_semantic_declaration(clean)
+    declaration = _semantic_exact_attempt_declarations.get(clean)
+    values = [
+        value
+        for value in (
+            entry.semantic_exact_attempt if entry is not None else None,
+            declaration.standalone if declaration is not None else None,
+        )
+        if value is not None
+    ]
+    if not values or not all(value is True for value in values):
+        return False
+    entry_claims = (
+        entry is not None and entry.semantic_exact_attempt is True
+    )
+    declaration_claims = (
+        declaration is not None and declaration.standalone is True
+    )
+    return bool(
+        (
+            not entry_claims
+            or callable(entry.standalone_semantic_exact_attempt_fn)
+        )
+        and (
+            not declaration_claims
+            or callable(declaration.standalone_sender_fn)
+        )
+        and (entry_claims or declaration_claims)
+    )
+
+
+def enumerate_standalone_semantic_exact_attempt_conformance(
+) -> tuple[StandaloneSemanticExactAttemptConformance, ...]:
+    """Enumerate declaration and callable ownership for every standalone route."""
+
+    entries = {
+        entry.name: entry for entry in platform_registry.all_entries()
+    }
+    providers = set(entries) | set(_semantic_exact_attempt_declarations)
+    rows: list[StandaloneSemanticExactAttemptConformance] = []
+    for provider in sorted(providers):
+        entry = entries.get(provider)
+        _load_builtin_semantic_declaration(provider)
+        declared = _semantic_exact_attempt_declarations.get(provider)
+        declarations = [
+            value
+            for value in (
+                entry.semantic_exact_attempt if entry is not None else None,
+                declared.standalone if declared is not None else None,
+            )
+            if value is not None
+        ]
+        conflict = bool(
+            declarations
+            and any(value != declarations[0] for value in declarations[1:])
+        )
+        declaration = (
+            None
+            if conflict or not declarations
+            else bool(declarations[0])
+        )
+        entry_claims = bool(
+            entry is not None and entry.semantic_exact_attempt is True
+        )
+        declaration_claims = bool(
+            declared is not None and declared.standalone is True
+        )
+        exact_sender = bool(
+            (
+                not entry_claims
+                or callable(entry.standalone_semantic_exact_attempt_fn)
+            )
+            and (
+                not declaration_claims
+                or callable(declared.standalone_sender_fn)
+            )
+            and (entry_claims or declaration_claims)
+        )
+        supported = bool(
+            declaration is True and exact_sender and not conflict
+        )
+        if conflict:
+            reason = "conflicting_declarations"
+        elif declaration is None:
+            reason = "declaration_missing"
+        elif declaration is True and not exact_sender:
+            reason = "exact_sender_missing"
+        elif supported:
+            reason = "supported"
+        else:
+            reason = "explicitly_unsupported"
+        owner = (
+            declared.owner
+            if declared is not None
+            else (
+                entry.plugin_name
+                if entry is not None and entry.plugin_name
+                else (entry.source if entry is not None else "")
+            )
+        )
+        rows.append(
+            StandaloneSemanticExactAttemptConformance(
+                provider=provider,
+                registered=entry is not None or declared is not None,
+                declaration=declaration,
+                exact_sender=exact_sender,
+                supported=supported,
+                conformant=bool(
+                    not conflict
+                    and declaration is not None
+                    and (declaration is False or exact_sender)
+                ),
+                owner=owner,
+                reason=reason,
+            )
+        )
+    return tuple(rows)
+
+
+def supports_live_semantic_exact_attempt(
+    name: str,
+    *,
+    adapter: Any | None = None,
+) -> bool:
+    """Return whether the live adapter owns the exact-attempt contract."""
+
+    clean = _clean_provider_name(name)
+    entry = platform_registry.get(clean)
+    _load_builtin_semantic_declaration(clean)
+    declaration = _semantic_exact_attempt_declarations.get(clean)
+    values = [
+        value
+        for value in (
+            entry.live_semantic_exact_attempt if entry is not None else None,
+            declaration.live if declaration is not None else None,
+        )
+        if value is not None
+    ]
+    declared = bool(values and all(value is True for value in values))
+    if not declared or adapter is None:
+        return declared
+    from gateway.semantic_exact_attempt import (
+        owns_live_semantic_exact_attempt,
+    )
+
+    adapter_provider = _clean_provider_name(
+        getattr(adapter, "platform", None)
+    )
+    return bool(
+        adapter_provider == clean
+        and owns_live_semantic_exact_attempt(adapter)
+    )
+
+
+def enumerate_live_semantic_exact_attempt_conformance(
+    bound_adapters: Mapping[Any, Any] | None = None,
+) -> tuple[LiveSemanticExactAttemptConformance, ...]:
+    """Enumerate every registry/declaration/runtime outbound provider.
+
+    This is an audit surface, not a capability inference shortcut. Explicit
+    ``False`` is conformant with a bound adapter only when the provider module
+    also owns an explicit Planning-ineligible preflight classification.
+    Otherwise a bound unsupported adapter, a missing/conflicting declaration,
+    or one bound account without the exact primitive is non-conformant.
+    """
+
+    entries = {entry.name: entry for entry in platform_registry.all_entries()}
+    bound_by_provider: dict[str, list[Any]] = {}
+
+    def iter_adapters(
+        value: Any,
+        *,
+        provider_hint: str = "",
+    ):
+        if isinstance(value, Mapping):
+            for key, nested in value.items():
+                yield from iter_adapters(
+                    nested,
+                    provider_hint=_clean_provider_name(key),
+                )
+            return
+        if isinstance(value, (list, tuple, set, frozenset)):
+            for nested in value:
+                yield from iter_adapters(
+                    nested,
+                    provider_hint=provider_hint,
+                )
+            return
+        if value is not None:
+            yield provider_hint, value
+
+    for key, adapter in iter_adapters(bound_adapters or {}):
+        provider = _clean_provider_name(
+            getattr(adapter, "platform", None) or key
+        )
+        if provider:
+            bound_by_provider.setdefault(provider, []).append(adapter)
+
+    providers = (
+        set(entries)
+        | set(_semantic_exact_attempt_declarations)
+        | set(bound_by_provider)
+    )
+    rows: list[LiveSemanticExactAttemptConformance] = []
+    for provider in sorted(providers):
+        entry = entries.get(provider)
+        _load_builtin_semantic_declaration(provider)
+        declared = _semantic_exact_attempt_declarations.get(provider)
+        declarations = [
+            value
+            for value in (
+                entry.live_semantic_exact_attempt if entry is not None else None,
+                declared.live if declared is not None else None,
+            )
+            if value is not None
+        ]
+        conflict = bool(
+            declarations
+            and any(value != declarations[0] for value in declarations[1:])
+        )
+        declaration = (
+            None
+            if conflict or not declarations
+            else bool(declarations[0])
+        )
+        planning_ineligible_reason = (
+            declared.planning_ineligible_reason
+            if (
+                declared is not None
+                and declaration is False
+                and not conflict
+            )
+            else ""
+        )
+        adapters = bound_by_provider.get(provider, [])
+        outbound_send = bool(adapters) and all(
+            callable(getattr(adapter, "send", None))
+            for adapter in adapters
+        )
+        from gateway.semantic_exact_attempt import (
+            owns_live_semantic_exact_attempt,
+        )
+
+        exact_attempt_method = bool(adapters) and all(
+            owns_live_semantic_exact_attempt(adapter)
+            for adapter in adapters
+        )
+        if conflict:
+            reason = "conflicting_declarations"
+        elif declaration is None:
+            reason = "declaration_missing"
+        elif declaration is False and planning_ineligible_reason:
+            reason = "planning_ineligible"
+        elif declaration is False and adapters:
+            reason = "bound_adapter_unsupported"
+        elif declaration is False:
+            reason = "explicitly_unsupported"
+        elif adapters and not outbound_send:
+            reason = "bound_adapter_send_missing"
+        elif adapters and not exact_attempt_method:
+            reason = "bound_adapter_exact_method_missing"
+        else:
+            reason = "supported"
+        conformant = bool(
+            declaration is not None
+            and not conflict
+            and (
+                (
+                    declaration is True
+                    and (
+                        not adapters
+                        or (
+                            outbound_send
+                            and exact_attempt_method
+                        )
+                    )
+                )
+                or (
+                    declaration is False
+                    and bool(planning_ineligible_reason)
+                )
+            )
+        )
+        supported = bool(declaration is True and conformant)
+        owners = [
+            owner
+            for owner in (
+                entry.plugin_name or entry.source if entry is not None else "",
+                declared.owner if declared is not None else "",
+            )
+            if owner
+        ]
+        rows.append(
+            LiveSemanticExactAttemptConformance(
+                provider=provider,
+                registered=entry is not None or declared is not None,
+                bound=bool(adapters),
+                outbound_send=outbound_send,
+                exact_attempt_method=exact_attempt_method,
+                declaration=declaration,
+                supported=supported,
+                conformant=conformant,
+                owner=",".join(owners),
+                reason=reason,
+                planning_ineligible_reason=planning_ineligible_reason,
+            )
+        )
+    return tuple(rows)

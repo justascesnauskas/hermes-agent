@@ -411,24 +411,22 @@ class TestBusyInputModeQueueFifo:
         ]
         assert runner._queue_depth(session_key, adapter=adapter) == len(texts)
 
-    def test_queue_respects_bounded_cap(self):
-        """Beyond the per-session cap, follow-ups are dropped (with a warning)."""
-        from gateway.run import GatewayRunner
-
+    def test_queue_has_no_product_cap(self):
+        """A long discussion keeps every admitted follow-up in exact FIFO order."""
         runner, adapter = self._make_runner_and_adapter()
         session_key = "telegram:user:cap"
 
-        cap = GatewayRunner._BUSY_QUEUE_MAX_PENDING
-        for i in range(cap + 5):
+        total = 137
+        for i in range(total):
             runner._queue_or_replace_pending_event(
                 session_key, self._text_event(f"msg-{i:03d}")
             )
 
-        # Exactly ``cap`` follow-ups retained (head + cap-1 in overflow).
-        assert runner._queue_depth(session_key, adapter=adapter) == cap
+        assert runner._queue_depth(session_key, adapter=adapter) == total
         assert adapter._pending_messages[session_key].text == "msg-000"
-        # The last accepted overflow item is msg-{cap-1}.
-        assert runner._queued_events[session_key][-1].text == f"msg-{cap - 1:03d}"
+        assert [event.text for event in runner._queued_events[session_key]] == [
+            f"msg-{index:03d}" for index in range(1, total)
+        ]
 
     def test_photo_burst_still_merges_in_head_slot(self):
         """Photo bursts must keep album-merge semantics, not split into N turns."""

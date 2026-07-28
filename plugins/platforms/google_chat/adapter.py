@@ -38,6 +38,7 @@ CARD_CLICKED is ACK'd only in v1 (follow-up PR implements interactivity).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -194,6 +195,14 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
     cache_video_from_bytes,
 )
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    live_semantic_exact_attempt_provider_route_mapping,
+    provider_rejection_error,
+    provider_rejection_evidence,
+    semantic_exact_attempt_encoding_contract,
+)
 
 
 # Pin the logger name to the legacy module path so operator log filters,
@@ -203,6 +212,38 @@ from gateway.platforms.base import (
 # loader namespaces this module, which would silently break every
 # downstream log-monitor that greps for ``gateway.platforms.google_chat``.
 logger = logging.getLogger("gateway.platforms.google_chat")
+
+
+class _GoogleChatSemanticNoRedirectHttp:
+    """Force the discovery request onto one non-following HTTP exchange."""
+
+    def __init__(self, delegate: Any):
+        self._delegate = delegate
+
+    @property
+    def connections(self):
+        return getattr(self._delegate, "connections", {})
+
+    def request(
+        self,
+        uri,
+        method="GET",
+        body=None,
+        headers=None,
+        redirections=0,
+        connection_type=None,
+        **kwargs,
+    ):
+        del redirections
+        return self._delegate.request(
+            uri,
+            method=method,
+            body=body,
+            headers=headers,
+            redirections=0,
+            connection_type=connection_type,
+            **kwargs,
+        )
 
 
 # Regex validating Pub/Sub subscription path format.
@@ -228,6 +269,13 @@ _CHAT_SCOPES = [
 
 # Google Chat text-message size limit is 4096; leave margin.
 _MAX_TEXT_LENGTH = 4000
+_SEMANTIC_SPACE_RE = re.compile(r"^spaces/[A-Za-z0-9_-]{1,200}$")
+_SEMANTIC_THREAD_RE = re.compile(
+    r"^(spaces/[A-Za-z0-9_-]{1,200})/threads/[A-Za-z0-9_-]{1,200}$"
+)
+_SEMANTIC_MESSAGE_RE = re.compile(
+    r"^(spaces/[A-Za-z0-9_-]{1,200})/messages/[A-Za-z0-9_-]{1,200}$"
+)
 
 # Per-space rate-limit hit counter threshold; warn if exceeded.
 _RATE_LIMIT_WARN_THRESHOLD = 5
@@ -639,6 +687,14 @@ class GoogleChatAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = _MAX_TEXT_LENGTH
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="google_chat",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="google-chat-logical-v1",
+        max_logical_units=4000,
+        length_semantics="unicode_codepoints",
+        wire_encoding="google-chat-text-json-v1",
+    )
     # Pub/Sub supervisor configuration.
     _MAX_RECONNECT_ATTEMPTS = 10
     _RECONNECT_BASE_DELAY = 2.0
@@ -2054,6 +2110,219 @@ class GoogleChatAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Outbound send paths
     # ------------------------------------------------------------------
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Create one raw text message without typing, retry, or fallback."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+            provider_route = (
+                live_semantic_exact_attempt_provider_route_mapping(
+                    request.provider_route
+                )
+            )
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        space_match = _SEMANTIC_SPACE_RE.fullmatch(request.chat_id or "")
+        thread_match = (
+            _SEMANTIC_THREAD_RE.fullmatch(request.thread_id)
+            if request.thread_id is not None
+            else None
+        )
+        reply_match = (
+            _SEMANTIC_MESSAGE_RE.fullmatch(request.reply_to)
+            if request.reply_to is not None
+            else None
+        )
+        try:
+            request.content.encode("utf-8", errors="strict")
+            content_is_utf8 = True
+        except (AttributeError, UnicodeEncodeError):
+            content_is_utf8 = False
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or provider_route
+            or not request.delivery_id
+            or not request.delivery_target
+            or space_match is None
+            or (
+                request.thread_id is not None
+                and (
+                    thread_match is None
+                    or thread_match.group(1) != request.chat_id
+                )
+            )
+            or (
+                request.reply_to is not None
+                and (
+                    reply_match is None
+                    or reply_match.group(1) != request.chat_id
+                )
+            )
+            or not isinstance(request.content, str)
+            or not content_is_utf8
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+            or getattr(self, "_chat_api", None) is None
+            or getattr(self, "_credentials", None) is None
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+
+        body: Dict[str, Any] = {"text": request.content}
+        kwargs: Dict[str, Any] = {
+            "parent": request.chat_id,
+            "body": body,
+            "messageId": "client-" + hashlib.sha256(
+                (
+                    f"google-chat:{request.delivery_id}:"
+                    f"{request.delivery_unit}"
+                ).encode("utf-8")
+            ).hexdigest()[:48],
+        }
+        if request.thread_id:
+            body["thread"] = {"name": request.thread_id}
+            kwargs["messageReplyOption"] = "REPLY_MESSAGE_OR_FAIL"
+        try:
+            exact_http = self._new_semantic_exact_authed_http()
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=(
+                    "Google Chat semantic auth transport unavailable: "
+                    f"{_redact_sensitive(str(exc))}"
+                ),
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+
+        def _do_create() -> Any:
+            return (
+                self._chat_api.spaces()
+                .messages()
+                .create(**kwargs)
+                .execute(http=exact_http, num_retries=0)
+            )
+
+        try:
+            response = await asyncio.to_thread(_do_create)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            try:
+                status = int(status) if status is not None else None
+            except (TypeError, ValueError):
+                status = None
+            rejection = None
+            if status is not None:
+                rejection_body = getattr(exc, "content", None)
+                if not isinstance(rejection_body, (bytes, str)):
+                    rejection_body = str(exc)
+                rejection = provider_rejection_evidence(
+                    provider="Google Chat",
+                    status=status,
+                    body=rejection_body,
+                )
+            if status == 429:
+                headers = (
+                    getattr(getattr(exc, "resp", None), "headers", {}) or {}
+                )
+                retry_after = headers.get("Retry-After")
+                try:
+                    retry_after_value = float(retry_after)
+                except (TypeError, ValueError):
+                    retry_after_value = None
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    retryable=True,
+                    retry_after=retry_after_value,
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": True,
+                        "retry_after": retry_after_value,
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            if (
+                status is not None
+                and status not in {408, 409}
+                and status < 500
+            ):
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            return SendResult(
+                success=False,
+                error=(
+                    "Google Chat semantic transport failed: "
+                    f"{_redact_sensitive(str(exc))}"
+                ),
+                raw_response=(
+                    {
+                        "status": status,
+                        "provider_rejection": rejection,
+                    }
+                    if status is not None
+                    else None
+                ),
+            )
+        message_name = (
+            str(response.get("name") or "").strip()
+            if isinstance(response, dict)
+            else ""
+        )
+        if (
+            not message_name
+            or _SEMANTIC_MESSAGE_RE.fullmatch(message_name) is None
+            or not message_name.startswith(f"{request.chat_id}/messages/")
+        ):
+            rejection = provider_rejection_evidence(
+                provider="Google Chat",
+                status=200,
+                body=response,
+            )
+            return SendResult(
+                success=False,
+                error="semantic_delivery_provider_receipt_invalid",
+                raw_response={
+                    "provider_rejection": rejection,
+                },
+            )
+        return SendResult(
+            success=True,
+            message_id=message_name,
+            raw_response=response,
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -2525,6 +2794,16 @@ class GoogleChatAdapter(BasePlatformAdapter):
         ``asyncio.to_thread`` workers. Cheap (~no network).
         """
         return AuthorizedHttp(self._credentials, http=httplib2.Http(timeout=30))
+
+    def _new_semantic_exact_authed_http(self) -> Any:
+        """Build auth transport with auth replay and redirects disabled."""
+
+        delegate = AuthorizedHttp(
+            self._credentials,
+            http=httplib2.Http(timeout=30),
+            max_refresh_attempts=0,
+        )
+        return _GoogleChatSemanticNoRedirectHttp(delegate)
 
     async def _call_with_retry(
         self,
@@ -3706,6 +3985,8 @@ def register(ctx) -> None:
         # hook, deliver=google_chat cron jobs fail with "No live adapter"
         # when cron runs separately from the gateway.
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=True,
         # Auth env vars for _is_user_authorized() integration.
         allowed_users_env="GOOGLE_CHAT_ALLOWED_USERS",
         allow_all_env="GOOGLE_CHAT_ALLOW_ALL_USERS",

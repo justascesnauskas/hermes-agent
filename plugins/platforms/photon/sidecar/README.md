@@ -10,8 +10,14 @@ The sidecar:
 - exposes a loopback-only HTTP control channel for the Python adapter
   to push send/typing requests (auth via `X-Hermes-Sidecar-Token`)
 - drains the inbound message stream so `spectrum-ts` keeps its
-  reconnect/heartbeat machinery alive (real inbound delivery is via
-  Photon's signed webhook hitting our Python aiohttp server)
+  reconnect/heartbeat machinery alive and forwards it as NDJSON to Python
+- exposes `/send-exact` for durable Planning previews: it validates the
+  frozen route, encoder, delivery identity, and content digest, then calls
+  `space.send()` exactly once and returns the real Photon message id
+
+The ordinary `/send` route remains optimized for conversational delivery.
+Planning never uses its truncation/retry/fallback behavior; `/send-exact` has
+no internal resend or alternative route.
 
 ## Install
 

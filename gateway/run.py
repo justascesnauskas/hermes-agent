@@ -2036,6 +2036,9 @@ _AGENT_PENDING_SENTINEL = object()
 #   and the dispatch finally.
 # - _session_run_generation: monotonic by design; clearing it would reset
 #   the counter and break stale-run detection (#28686).
+# - _session_preview_delivery_generation: monotonic transport sub-generation;
+#   queued logical turns share one agent-run stack but must never share a
+#   Planning delivery namespace.
 # - _agent_cache: has its own eviction path (_evict_cached_agent) with
 #   resource cleanup; boundaries call it explicitly.
 # - _pending_approvals/_update_prompt_pending/slash-confirm/tool-approval
@@ -3106,6 +3109,7 @@ class GatewayRunner(
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _session_service_tier_overrides: Dict[str, Optional[str]] = {}
     _pending_turn_sidecar_notes: Dict[str, List[str]] = {}
+    _session_preview_delivery_generation: Dict[str, int] = {}
     _session_ephemeral_pin: Dict[str, tuple] = {}
     _session_vc_last: Dict[str, str] = {}
     _startup_restore_in_progress: bool = False
@@ -3236,6 +3240,10 @@ class GatewayRunner(
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+        # Exact immutable origin for each currently-running turn. Shutdown
+        # persists this beside resume_pending so startup continuation cannot
+        # synthesize a new provider event identity.
+        self._active_turn_origins: Dict[str, Dict[str, Any]] = {}
         self._active_session_leases: Dict[str, Any] = {}
         # Per-SESSION_ID turn lease (#64934): serializes the
         # [load history → run → flush] region when two ROUTING KEYS resolve
@@ -3257,19 +3265,18 @@ class GatewayRunner(
         # silent until the user manually re-sends. See #35314. ``"*"`` holds a
         # process-wide last-known-good for sessions seen for the first time.
         self._last_resolved_model: Dict[str, str] = {}
-        # Overflow buffer for explicit /queue commands.  The adapter-level
-        # _pending_messages dict is a single slot per session (designed for
-        # "next-turn" follow-ups where repeated sends collapse into one
-        # event).  /queue has different semantics: each invocation must
-        # produce its own full agent turn, in FIFO order, with no merging.
-        # When the slot is occupied, additional /queue items land here and
-        # are promoted one-at-a-time after each run's drain.  Cleared on
-        # /new and /reset.  /model and other mid-session operations
-        # preserve the queue.
+        # Legacy in-memory overflow remains for partially-constructed test
+        # runners. Real gateway instances journal admitted follow-ups in the
+        # profile-local durable FIFO and hydrate only one head per session.
         self._queued_events: Dict[str, List[MessageEvent]] = {}
         self._pending_native_image_paths_by_session: Dict[str, List[str]] = {}
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
+        self._session_preview_delivery_generation: Dict[str, int] = {}
+        self._turn_queue_owner = (
+            f"gateway-{os.getpid()}-{os.urandom(16).hex()}"
+        )
+        self._durable_queue_starting_sessions: set[str] = set()
         # Startup restore gate: while restart-interrupted sessions are being
         # auto-resumed, real inbound messages are queued instead of competing
         # with the synthetic resume turns for the same session.  The queued
@@ -4831,16 +4838,221 @@ class GatewayRunner(
         # process to pick up.  "interrupt" mode drops them (current behaviour).
         return self._restart_requested and self._busy_input_mode in {"queue", "steer"}
 
-    # -------- /queue FIFO helpers --------------------------------------
-    # /queue must produce one full agent turn per invocation, in FIFO
-    # order, with no merging.  The adapter's _pending_messages dict is a
-    # single "next-up" slot (shared with photo-burst follow-ups), so we
-    # use it for the head of the queue and an overflow list for the
-    # tail.  Enqueue puts new items in the slot when free, otherwise in
-    # the overflow.  Promotion (called after each run's drain) moves the
-    # next overflow item into the slot so the following recursion picks
-    # it up.  Clearing happens on /new and /reset via
-    # _handle_reset_command.
+    # -------- durable /queue FIFO helpers -------------------------------
+    # One hydrated adapter slot is the bounded in-memory working set. Every
+    # admitted follow-up is first journalled in the profile-local FIFO; a
+    # provider-confirmed turn deletes its row. Restart recovery therefore
+    # replays the oldest unacknowledged turn with its exact TurnOrigin.
+
+    def _durable_turn_queue_home(self, event: "MessageEvent") -> Path:
+        explicit = getattr(event, "_hermes_durable_queue_home", None)
+        if explicit:
+            return Path(str(explicit)).expanduser().resolve()
+        source = getattr(event, "source", None)
+        if source is not None:
+            return self._resolve_profile_home_for_source(source)
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home()).expanduser().resolve()
+
+    def _durable_turn_queue_enabled(self) -> bool:
+        # __new__-constructed unit-test runners intentionally retain the
+        # historical in-memory helper behavior. A real GatewayRunner always
+        # owns a random process incarnation before accepting an inbound turn.
+        return bool(getattr(self, "_turn_queue_owner", ""))
+
+    def _claim_durable_turn_event(
+        self,
+        event: Optional["MessageEvent"],
+    ) -> Optional["MessageEvent"]:
+        if event is None or not self._durable_turn_queue_enabled():
+            return event
+        queue_id = getattr(event, "_hermes_durable_queue_id", None)
+        if not queue_id:
+            return event
+        from hermes_cli.gateway_turn_queue import claim_turn
+
+        claimed = claim_turn(
+            str(queue_id),
+            owner=self._turn_queue_owner,
+            profile_home=self._durable_turn_queue_home(event),
+        )
+        if claimed is None:
+            return None
+        if self._retire_semantically_committed_turn(claimed):
+            return None
+        return claimed.event
+
+    def _claim_next_durable_turn(
+        self,
+        session_key: str,
+        *,
+        profile_home: Optional[Path],
+    ) -> Optional["MessageEvent"]:
+        if not self._durable_turn_queue_enabled():
+            return None
+        from hermes_cli.gateway_turn_queue import claim_next_turn
+
+        claimed = claim_next_turn(
+            session_key,
+            owner=self._turn_queue_owner,
+            profile_home=profile_home,
+        )
+        if claimed is None:
+            return None
+        if self._retire_semantically_committed_turn(claimed):
+            return None
+        return claimed.event
+
+    def _acknowledge_durable_turn_event(
+        self,
+        event: Optional["MessageEvent"],
+    ) -> bool:
+        if event is None or not self._durable_turn_queue_enabled():
+            return False
+        queue_id = getattr(event, "_hermes_durable_queue_id", None)
+        if not queue_id:
+            return False
+        from hermes_cli.gateway_turn_queue import acknowledge_turn
+
+        return acknowledge_turn(
+            str(queue_id),
+            owner=self._turn_queue_owner,
+            profile_home=self._durable_turn_queue_home(event),
+        )
+
+    def _retire_semantically_committed_turn(self, claim: Any) -> bool:
+        """Retire an inbound turn whose complete preview outbox owns delivery.
+
+        This check runs before model/tool replay. The semantic ledger proof is
+        profile-local and requires the exact full unit set to have crossed its
+        staging barrier; a partial or unknown group therefore remains a normal
+        replayable queue row.
+        """
+
+        queue_id = str(getattr(claim, "queue_id", "") or "")
+        event = getattr(claim, "event", None)
+        profile_home = Path(getattr(claim, "profile_home"))
+        if not queue_id or event is None:
+            return False
+        from hermes_cli.semantic_delivery import (
+            semantic_retry_turn_execution_committed,
+        )
+
+        ledger_path = (
+            profile_home
+            / "state"
+            / "semantic-delivery"
+            / "ledger.sqlite3"
+        )
+        if not semantic_retry_turn_execution_committed(
+            queue_id,
+            ledger_path=ledger_path,
+        ):
+            return False
+
+        # Clear the session recovery identity before deleting the ingress row.
+        # A crash between these two writes is safe: the queue row remains, and
+        # this same semantic proof retires it on the next process. Reversing the
+        # order could let startup auto-resume and rerun a committed model turn.
+        from hermes_cli.turn_origin import coerce_turn_origin
+
+        origin = coerce_turn_origin(getattr(event, "turn_origin", None))
+        confirm = getattr(
+            getattr(self, "session_store", None),
+            "confirm_turn_delivery",
+            None,
+        )
+        if not callable(confirm):
+            raise RuntimeError(
+                "durable gateway turn execution handoff unavailable"
+            )
+        confirm(
+            str(getattr(claim, "session_key", "") or ""),
+            expected_event_id=(
+                origin.event_id if origin is not None else None
+            ),
+        )
+
+        from hermes_cli.gateway_turn_queue import acknowledge_turn
+
+        if not acknowledge_turn(
+            queue_id,
+            owner=self._turn_queue_owner,
+            profile_home=profile_home,
+        ):
+            raise RuntimeError(
+                "durable gateway turn execution handoff did not retire ingress"
+            )
+        session_key = str(getattr(claim, "session_key", "") or "")
+        active_origin = getattr(self, "_active_turn_origins", {}).get(
+            session_key
+        )
+        if (
+            origin is not None
+            and isinstance(active_origin, dict)
+            and active_origin.get("event_id") == origin.event_id
+        ):
+            self._active_turn_origins.pop(session_key, None)
+        return True
+
+    def _release_durable_turn_event(
+        self,
+        event: Optional["MessageEvent"],
+    ) -> bool:
+        if event is None or not self._durable_turn_queue_enabled():
+            return False
+        queue_id = getattr(event, "_hermes_durable_queue_id", None)
+        if not queue_id:
+            return False
+        from hermes_cli.gateway_turn_queue import release_turn
+
+        return release_turn(
+            str(queue_id),
+            owner=self._turn_queue_owner,
+            profile_home=self._durable_turn_queue_home(event),
+        )
+
+    def _park_durable_turn_event_for_retry(
+        self,
+        event: Optional["MessageEvent"],
+    ) -> Optional[float]:
+        if event is None or not self._durable_turn_queue_enabled():
+            return None
+        queue_id = getattr(event, "_hermes_durable_queue_id", None)
+        if not queue_id:
+            return None
+        from hermes_cli.gateway_turn_queue import park_turn_for_retry
+
+        return park_turn_for_retry(
+            str(queue_id),
+            owner=self._turn_queue_owner,
+            profile_home=self._durable_turn_queue_home(event),
+        )
+
+    def _cancel_durable_session_turns(
+        self,
+        session_key: str,
+        *,
+        source: Optional[SessionSource] = None,
+    ) -> int:
+        if not session_key or not self._durable_turn_queue_enabled():
+            return 0
+        if source is None:
+            source = self._get_cached_session_source(session_key)
+        if source is None:
+            logger.warning(
+                "Cannot resolve profile authority while retiring durable "
+                "queued turns for %s; refusing to guess across profiles",
+                session_key,
+            )
+            return 0
+        from hermes_cli.gateway_turn_queue import cancel_session_turns
+
+        return cancel_session_turns(
+            session_key,
+            profile_home=self._resolve_profile_home_for_source(source),
+        )
 
     def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
         """Append a /queue event to the FIFO chain for a session."""
@@ -4848,6 +5060,20 @@ class GatewayRunner(
             return
         pending_slot = getattr(adapter, "_pending_messages", None)
         if pending_slot is None:
+            return
+        if self._durable_turn_queue_enabled():
+            from hermes_cli.gateway_turn_queue import enqueue_turn
+
+            enqueue_turn(
+                session_key,
+                queued_event,
+                profile_home=self._durable_turn_queue_home(queued_event),
+            )
+            # The journal owns every tail item. Keep at most one hydrated head
+            # in RAM; promotion claims the next row after the current slot is
+            # consumed.
+            if session_key not in pending_slot:
+                pending_slot[session_key] = queued_event
             return
         queued_events = getattr(self, "_queued_events", None)
         if queued_events is None:
@@ -4863,6 +5089,8 @@ class GatewayRunner(
         session_key: str,
         adapter: Any,
         pending_event: Optional["MessageEvent"],
+        *,
+        profile_home: Optional[Path] = None,
     ) -> Optional["MessageEvent"]:
         """Promote the next overflow item after the slot was drained.
 
@@ -4875,6 +5103,20 @@ class GatewayRunner(
             the slot so the NEXT recursion picks it up.
         Returns the (possibly updated) pending_event for drain to use.
         """
+        if self._durable_turn_queue_enabled():
+            profile_home = (
+                self._durable_turn_queue_home(pending_event)
+                if pending_event is not None
+                else profile_home
+            )
+            pending_event = self._claim_durable_turn_event(pending_event)
+            if pending_event is not None:
+                return pending_event
+            return self._claim_next_durable_turn(
+                session_key,
+                profile_home=profile_home,
+            )
+
         queued_events = getattr(self, "_queued_events", None)
         if not queued_events:
             return pending_event
@@ -4895,6 +5137,21 @@ class GatewayRunner(
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
+        if self._durable_turn_queue_enabled():
+            from hermes_cli.gateway_turn_queue import queue_depth
+
+            profile_home = None
+            pending = (
+                getattr(adapter, "_pending_messages", {}).get(session_key)
+                if adapter is not None
+                else None
+            )
+            if pending is not None:
+                profile_home = self._durable_turn_queue_home(pending)
+            return queue_depth(
+                session_key,
+                profile_home=profile_home,
+            )
         queued_events = getattr(self, "_queued_events", None) or {}
         depth = len(queued_events.get(session_key, []))
         if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
@@ -5768,14 +6025,6 @@ class GatewayRunner(
             entry = session_store._entries.get(session_key)  # noqa: SLF001
         return getattr(entry, "session_id", None) if entry is not None else None
 
-    # Hard cap on per-session pending follow-ups for busy_input_mode=queue
-    # (and the draining/steer-fallback/subagent-demotion paths that share
-    # this entry point).  Without a cap, a stuck agent + a rapid-fire user
-    # could grow the overflow list unboundedly.  32 turns of queued
-    # follow-ups is far beyond any realistic conversational backlog while
-    # still small enough to never threaten memory.
-    _BUSY_QUEUE_MAX_PENDING = 32
-
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
@@ -5790,6 +6039,13 @@ class GatewayRunner(
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        if self._durable_turn_queue_enabled():
+            # Durable admission preserves each provider event independently.
+            # Provider-native album assembly happens before this shared busy
+            # path; merging two already-admitted identities here would make
+            # restart replay unable to prove which event owns the turn.
+            self._enqueue_fifo(session_key, event, adapter)
+            return
         if existing is not None and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
@@ -5802,14 +6058,6 @@ class GatewayRunner(
                 session_key,
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
-            )
-            return
-
-        if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
-            logger.warning(
-                "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
-                session_key,
-                self._BUSY_QUEUE_MAX_PENDING,
             )
             return
 
@@ -5948,11 +6196,12 @@ class GatewayRunner(
         # (the default busy_text_mode) aborts the active turn AND sends a "⚡
         # Interrupting current task" ack — exactly the opposite of the design
         # invariant that a completion surfaces as a NEW turn only when idle and
-        # never splices into a running turn. Fall through to the base adapter,
-        # which queues internal events silently (no interrupt, no ack) so they
-        # cascade after the current turn finishes.
+        # never splices into a running turn. Admit the exact event through the
+        # runner-owned durable FIFO so it survives restart without being merged
+        # into another provider event.
         if getattr(event, "internal", False):
-            return False
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
 
         running_agent = self._running_agents.get(session_key)
 
@@ -5963,7 +6212,8 @@ class GatewayRunner(
             and busy_text_mode == "queue"
             and effective_mode != "steer"
         ):
-            return False
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
 
         # Steer mode: inject mid-run via running_agent.steer() instead of
         # queueing + interrupting.  If the agent isn't running yet
@@ -7017,8 +7267,191 @@ class GatewayRunner(
     # .clean_shutdown marker).  All three mean "the agent was mid-turn and
     # we killed it" — eligible for startup auto-resume.
     _AUTO_RESUME_REASONS = frozenset(
-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
+        {
+            "restart_timeout",
+            "shutdown_timeout",
+            "restart_interrupted",
+            "planning_delivery_unconfirmed",
+        }
     )
+
+    def _durable_turn_queue_profile_homes(self) -> list[Path]:
+        """Enumerate profile-local journals without trusting one active profile."""
+
+        homes: dict[str, Path] = {}
+        try:
+            from hermes_constants import get_hermes_home
+
+            default = Path(get_hermes_home()).expanduser().resolve()
+            homes[str(default)] = default
+        except Exception:
+            pass
+        try:
+            from hermes_cli.profiles import list_profiles
+
+            for profile in list_profiles():
+                path = Path(profile.path).expanduser().resolve()
+                homes[str(path)] = path
+        except Exception:
+            logger.debug(
+                "Could not enumerate profile-local turn queues",
+                exc_info=True,
+            )
+        return list(homes.values())
+
+    def _schedule_durable_queued_turns(
+        self,
+        platform: Optional[Platform] = None,
+    ) -> int:
+        """Resume one oldest admitted turn per session from bounded pages."""
+
+        if not self._durable_turn_queue_enabled():
+            return 0
+        from hermes_cli.gateway_turn_queue import (
+            claim_session_heads,
+            cleanup_completed_snapshots,
+            release_turn,
+        )
+
+        scheduled = 0
+        for profile_home in self._durable_turn_queue_profile_homes():
+            try:
+                cleanup_completed_snapshots(
+                    profile_home=profile_home,
+                    limit=200,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not converge completed turn attachment cleanup in %s",
+                    profile_home,
+                    exc_info=True,
+                )
+            cursor: Optional[str] = None
+            while True:
+                try:
+                    claims, cursor = claim_session_heads(
+                        owner=self._turn_queue_owner,
+                        profile_home=profile_home,
+                        after_session_key=cursor,
+                        limit=50,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not inspect durable queued turns in %s",
+                        profile_home,
+                        exc_info=True,
+                    )
+                    break
+                for claim in claims:
+                    try:
+                        if self._retire_semantically_committed_turn(claim):
+                            continue
+                    except Exception:
+                        logger.warning(
+                            "Could not retire semantic-outbox-owned turn %s; "
+                            "parking without model replay",
+                            claim.queue_id,
+                            exc_info=True,
+                        )
+                        self._park_durable_turn_event_for_retry(claim.event)
+                        continue
+                    event = claim.event
+                    source = getattr(event, "source", None)
+                    source_platform = getattr(source, "platform", None)
+                    adapter = (
+                        self._adapter_for_source(source)
+                        if source is not None
+                        else None
+                    )
+                    if (
+                        source is None
+                        or (platform is not None and source_platform != platform)
+                        or adapter is None
+                        or claim.session_key in self._running_agents
+                    ):
+                        release_turn(
+                            claim.queue_id,
+                            owner=self._turn_queue_owner,
+                            profile_home=profile_home,
+                        )
+                        continue
+                    try:
+                        authorized = self._is_user_authorized(source)
+                    except Exception:
+                        authorized = False
+                    if not authorized:
+                        logger.warning(
+                            "Durable queued turn %s remains parked because "
+                            "its source is no longer authorized",
+                            claim.queue_id,
+                        )
+                        release_turn(
+                            claim.queue_id,
+                            owner=self._turn_queue_owner,
+                            profile_home=profile_home,
+                        )
+                        continue
+                    task = asyncio.create_task(adapter.handle_message(event))
+                    self._durable_queue_starting_sessions.add(
+                        claim.session_key
+                    )
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+
+                    def _settle_durable_start(
+                        completed: asyncio.Task,
+                        *,
+                        key: str = claim.session_key,
+                        queued_event: MessageEvent = event,
+                    ) -> None:
+                        self._durable_queue_starting_sessions.discard(key)
+                        failed = completed.cancelled()
+                        if not failed:
+                            try:
+                                failed = completed.exception() is not None
+                            except (asyncio.CancelledError, Exception):
+                                failed = True
+                        if failed:
+                            delay = self._park_durable_turn_event_for_retry(
+                                queued_event
+                            )
+                            if delay is not None:
+                                logger.warning(
+                                    "Durable queued turn for %s failed before "
+                                    "delivery ownership committed; retrying in "
+                                    "%.1fs",
+                                    key,
+                                    delay,
+                                )
+
+                    task.add_done_callback(_settle_durable_start)
+                    if getattr(self, "_startup_restore_in_progress", False):
+                        self._startup_restore_tasks.append(task)
+                    scheduled += 1
+                if cursor is None:
+                    break
+        if scheduled:
+            logger.info(
+                "Scheduled %d durable queued turn head(s) after restart",
+                scheduled,
+            )
+        return scheduled
+
+    async def _durable_turn_queue_watcher(
+        self,
+        interval: float = 1.0,
+    ) -> None:
+        """Continuously admit due durable FIFO heads without a retry ceiling."""
+
+        while self._running:
+            try:
+                self._schedule_durable_queued_turns()
+            except Exception:
+                logger.warning(
+                    "Durable queued-turn watcher tick failed",
+                    exc_info=True,
+                )
+            await asyncio.sleep(max(float(interval), 0.25))
 
     async def _run_startup_resume_event(
         self,
@@ -7284,6 +7717,12 @@ class GatewayRunner(
             # in-flight) — don't synthesize a second continuation turn.
             if entry.session_key in self._running_agents:
                 continue
+            if entry.session_key in getattr(
+                self,
+                "_durable_queue_starting_sessions",
+                set(),
+            ):
+                continue
 
             source = entry.origin
             adapter = self._adapter_for_source(source)
@@ -7328,12 +7767,44 @@ class GatewayRunner(
             # Empty-text internal event — the _is_resume_pending branch in
             # _handle_message_with_agent prepends the proper reason-aware
             # system note before the turn runs.
+            from hermes_cli.turn_origin import coerce_turn_origin
+
+            resume_origin = coerce_turn_origin(entry.resume_turn_origin)
+            resume_timestamp = None
+            if resume_origin is not None and resume_origin.source_timestamp:
+                try:
+                    resume_timestamp = datetime.fromisoformat(
+                        resume_origin.source_timestamp.replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    # The persisted envelope was already validated on load.
+                    # If an in-memory test double bypassed that boundary,
+                    # preserve the identity object and omit the display clock.
+                    resume_timestamp = None
             event = MessageEvent(
                 text="",
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                timestamp=resume_timestamp,
+                message_id=(
+                    resume_origin.message_id
+                    if resume_origin is not None
+                    else None
+                ),
+                event_id=(
+                    resume_origin.event_id
+                    if resume_origin is not None
+                    else None
+                ),
+                turn_origin=resume_origin,
             )
+            if resume_origin is None:
+                # Legacy resume markers predate durable TurnOrigin.  The
+                # continuation may still discuss/recover normal work, but a
+                # Planning action must fail closed with origin_missing instead
+                # of deriving a new id from local restart time.
+                event._hermes_preserve_missing_turn_origin = True
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
             )
@@ -8060,6 +8531,7 @@ class GatewayRunner(
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
         await self._redeliver_pending_obligations()
+        self._schedule_durable_queued_turns()
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 
@@ -8088,6 +8560,10 @@ class GatewayRunner(
 
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
+        self._spawn_supervised(
+            self._durable_turn_queue_watcher,
+            "durable_turn_queue_watcher",
+        )
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
@@ -8558,7 +9034,9 @@ class GatewayRunner(
                         # finalization, /new, and /reset clear them.) See
                         # _CONVERSATION_SCOPED_STATE.
                         self._clear_conversation_scope(
-                            key, reason="expiry_finalized"
+                            key,
+                            reason="expiry_finalized",
+                            source=getattr(entry, "origin", None),
                         )
                         # Persist the finalized flag to sessions.json AND
                         # state.db (single write-path, #9006) — also drops
@@ -8771,6 +9249,9 @@ class GatewayRunner(
                         # auto-resume scoped to this platform so recovery
                         # doesn't silently wait for a manual user message.
                         try:
+                            self._schedule_durable_queued_turns(
+                                platform=platform
+                            )
                             self._schedule_resume_pending_sessions(platform=platform)
                         except Exception:
                             logger.debug(
@@ -9086,6 +9567,9 @@ class GatewayRunner(
                     await self.async_session_store.mark_resume_pending(
                         _sk,
                         "restart_timeout" if self._restart_requested else "shutdown_timeout",
+                        turn_origin=getattr(
+                            self, "_active_turn_origins", {}
+                        ).get(_sk),
                     )
                     _pre_drain_keys.append(_sk)
                 except Exception as _e:
@@ -9163,7 +9647,13 @@ class GatewayRunner(
                     if _agent is _AGENT_PENDING_SENTINEL:
                         continue
                     try:
-                        await self.async_session_store.mark_resume_pending(_sk, _resume_reason)
+                        await self.async_session_store.mark_resume_pending(
+                            _sk,
+                            _resume_reason,
+                            turn_origin=getattr(
+                                self, "_active_turn_origins", {}
+                            ).get(_sk),
+                        )
                     except Exception as _e:
                         logger.debug(
                             "mark_resume_pending failed for %s: %s",
@@ -10092,23 +10582,24 @@ class GatewayRunner(
         # This stays after the ContextVar reset above so the handler's
         # cross-session pre-bind window remains fail-safe.
         turn_origin = None
-        try:
-            gateway_account_id = getattr(source, "gateway_account_id", None)
-            if not gateway_account_id:
-                origin_adapter = self._adapter_for_source(source)
-                origin_extra = getattr(
-                    getattr(origin_adapter, "config", None), "extra", None
+        if not getattr(event, "_hermes_preserve_missing_turn_origin", False):
+            try:
+                gateway_account_id = getattr(source, "gateway_account_id", None)
+                if not gateway_account_id:
+                    origin_adapter = self._adapter_for_source(source)
+                    origin_extra = getattr(
+                        getattr(origin_adapter, "config", None), "extra", None
+                    )
+                    if isinstance(origin_extra, dict):
+                        gateway_account_id = origin_extra.get("gateway_account_id")
+                turn_origin = event.ensure_turn_origin(
+                    gateway_account_id=gateway_account_id
                 )
-                if isinstance(origin_extra, dict):
-                    gateway_account_id = origin_extra.get("gateway_account_id")
-            turn_origin = event.ensure_turn_origin(
-                gateway_account_id=gateway_account_id
-            )
-        except Exception:
-            logger.warning(
-                "Could not normalize turn origin for inbound gateway event",
-                exc_info=True,
-            )
+            except Exception:
+                logger.warning(
+                    "Could not normalize turn origin for inbound gateway event",
+                    exc_info=True,
+                )
 
         if (
             getattr(self, "_startup_restore_in_progress", False)
@@ -10589,7 +11080,11 @@ class GatewayRunner(
                             message_id=event.message_id,
                             channel_prompt=event.channel_prompt,
                         )
-                        adapter._pending_messages[_quick_key] = queued_event
+                        self._enqueue_fifo(
+                            _quick_key,
+                            queued_event,
+                            adapter,
+                        )
                     return "Agent still starting — /steer queued for the next turn."
                 if running_agent and hasattr(running_agent, "steer"):
                     try:
@@ -10611,7 +11106,11 @@ class GatewayRunner(
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
                     )
-                    adapter._pending_messages[_quick_key] = queued_event
+                    self._enqueue_fifo(
+                        _quick_key,
+                        queued_event,
+                        adapter,
+                    )
                 return "No active agent — /steer queued for the next turn."
 
             # /model must not be used while the agent is running.
@@ -10729,7 +11228,7 @@ class GatewayRunner(
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                    self._enqueue_fifo(_quick_key, event, adapter)
                 return None
 
             _telegram_followup_grace = float(
@@ -10750,15 +11249,7 @@ class GatewayRunner(
                 )
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    if self._busy_input_mode == "queue":
-                        self._enqueue_fifo(_quick_key, event, adapter)
-                    else:
-                        merge_pending_message_event(
-                            adapter._pending_messages,
-                            _quick_key,
-                            event,
-                            merge_text=True,
-                        )
+                    self._enqueue_fifo(_quick_key, event, adapter)
                 return None
 
             running_agent = self._running_agents.get(_quick_key)
@@ -10773,12 +11264,7 @@ class GatewayRunner(
                 # agent starts.
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
-                        _quick_key,
-                        event,
-                        merge_text=True,
-                    )
+                    self._enqueue_fifo(_quick_key, event, adapter)
                 return None
             if self._draining:
                 if self._queue_during_drain_enabled():
@@ -12119,8 +12605,160 @@ class GatewayRunner(
                 pass
         return source
 
+    async def _bind_turn_delivery_authority(
+        self,
+        *,
+        confirmation_event: "MessageEvent",
+        queue_event: "MessageEvent",
+        session_key: str,
+        turn_origin: Any,
+    ) -> None:
+        """Persist and bind the exact logical turn before model/tool work.
+
+        Queued turns can execute inside the outer handler's call stack, so the
+        adapter will eventually confirm delivery on ``confirmation_event``.
+        Rebinding that callback here ensures it clears only the latest logical
+        turn origin and retires only that turn's durable FIFO row.
+        """
+
+        from hermes_cli.turn_origin import coerce_turn_origin
+
+        normalized = coerce_turn_origin(turn_origin)
+        persist_origin = getattr(
+            getattr(self, "session_store", None),
+            "persist_active_turn_origin",
+            None,
+        )
+        if not callable(persist_origin):
+            # ``object.__new__`` unit harnesses intentionally provide only the
+            # historical in-memory SessionStore surface. A real runner always
+            # owns the durable turn queue and must never execute without the
+            # matching persisted origin fence.
+            if self._durable_turn_queue_enabled():
+                raise RuntimeError(
+                    "durable gateway turn origin persistence unavailable"
+                )
+            return
+        active_origins = getattr(self, "_active_turn_origins", None)
+        if active_origins is None:
+            active_origins = {}
+            self._active_turn_origins = active_origins
+
+        if normalized is None:
+            active_origins.pop(session_key, None)
+            setattr(
+                confirmation_event,
+                "_hermes_confirm_turn_delivery",
+                None,
+            )
+            setattr(
+                confirmation_event,
+                "_hermes_commit_turn_execution",
+                None,
+            )
+            setattr(
+                confirmation_event,
+                "_hermes_turn_execution_ref",
+                None,
+            )
+            if queue_event is not confirmation_event:
+                setattr(
+                    queue_event,
+                    "_hermes_confirm_turn_delivery",
+                    None,
+                )
+                setattr(
+                    queue_event,
+                    "_hermes_commit_turn_execution",
+                    None,
+                )
+                setattr(
+                    queue_event,
+                    "_hermes_turn_execution_ref",
+                    None,
+                )
+        else:
+            active_origins[session_key] = normalized.to_dict()
+            turn_execution_ref = str(
+                getattr(queue_event, "_hermes_durable_queue_id", "") or ""
+            )
+
+            async def _confirm_turn_delivery() -> None:
+                cleared = await self.async_session_store.confirm_turn_delivery(
+                    session_key,
+                    expected_event_id=normalized.event_id,
+                )
+                if not cleared:
+                    return
+                self._acknowledge_durable_turn_event(queue_event)
+                active_origin = getattr(
+                    self, "_active_turn_origins", {}
+                ).get(session_key)
+                if (
+                    isinstance(active_origin, dict)
+                    and active_origin.get("event_id")
+                    == normalized.event_id
+                ):
+                    self._active_turn_origins.pop(session_key, None)
+
+            async def _commit_turn_execution() -> None:
+                """Transfer delivery ownership to the fully staged outbox."""
+
+                if not turn_execution_ref:
+                    raise RuntimeError(
+                        "durable gateway turn execution reference missing"
+                    )
+                # Persist the no-model-replay boundary before removing ingress.
+                # If the process dies between the two writes, startup observes
+                # the semantic outbox proof and completes the same retirement.
+                await self.async_session_store.confirm_turn_delivery(
+                    session_key,
+                    expected_event_id=normalized.event_id,
+                )
+                retired = self._acknowledge_durable_turn_event(queue_event)
+                if not retired:
+                    # The first commit callback must own and retire its claimed
+                    # row. A later repeat is suppressed by the delivery flow.
+                    raise RuntimeError(
+                        "durable gateway turn execution ingress retirement failed"
+                    )
+                active_origin = getattr(
+                    self, "_active_turn_origins", {}
+                ).get(session_key)
+                if (
+                    isinstance(active_origin, dict)
+                    and active_origin.get("event_id")
+                    == normalized.event_id
+                ):
+                    self._active_turn_origins.pop(session_key, None)
+
+            confirmation_event._hermes_confirm_turn_delivery = (
+                _confirm_turn_delivery
+            )
+            confirmation_event._hermes_commit_turn_execution = (
+                _commit_turn_execution
+            )
+            confirmation_event._hermes_turn_execution_ref = (
+                turn_execution_ref
+            )
+            # Some direct-delivery branches operate on the logical queued
+            # event rather than the adapter-owned outer event.
+            queue_event._hermes_confirm_turn_delivery = _confirm_turn_delivery
+            queue_event._hermes_commit_turn_execution = (
+                _commit_turn_execution
+            )
+            queue_event._hermes_turn_execution_ref = turn_execution_ref
+
+        await self.async_session_store.persist_active_turn_origin(
+            session_key,
+            normalized,
+        )
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        from hermes_cli.turn_origin import coerce_turn_origin
+
+        turn_origin = coerce_turn_origin(getattr(event, "turn_origin", None))
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -12150,6 +12788,43 @@ class GatewayRunner(
 
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        # BasePlatformAdapter still owns the inbound object that entered
+        # ``handle_message`` and consults its callback after final delivery.
+        # Durable admission replaces ``event`` with a deserialized claimed
+        # copy, so confirmation belongs on the outer object while retirement
+        # remains bound to the claimed queue object. Binding both only to the
+        # claimed copy leaves the outer send unconfirmed and promotes the same
+        # row into a duplicate model/tool turn.
+        confirmation_event = event
+        if self._durable_turn_queue_enabled():
+            from hermes_cli.gateway_turn_queue import enqueue_turn
+
+            if not getattr(event, "_hermes_durable_queue_id", None):
+                enqueue_turn(
+                    session_key,
+                    event,
+                    profile_home=self._durable_turn_queue_home(event),
+                )
+            claimed_event = self._claim_durable_turn_event(event)
+            if claimed_event is None:
+                # A predecessor owns this session, another live worker owns the
+                # row, or a complete semantic outbox already owns delivery.
+                # In every case the current handler must not run the model.
+                return
+            event = claimed_event
+            source = getattr(event, "source", None) or source
+            turn_origin = coerce_turn_origin(
+                getattr(event, "turn_origin", None)
+            )
+        # This write precedes every model/tool call. A hard process exit can
+        # therefore reuse the exact provider event identity after crash
+        # recovery; an originless turn durably clears any predecessor.
+        await self._bind_turn_delivery_authority(
+            confirmation_event=confirmation_event,
+            queue_event=event,
+            session_key=session_key,
+            turn_origin=turn_origin,
+        )
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
         ).strip()
@@ -12259,7 +12934,11 @@ class GatewayRunner(
             # model/reasoning overrides, a queued "/model switched" note, or
             # a stale resolved-model cache (#48031, #58403). See
             # _CONVERSATION_SCOPED_STATE.
-            self._clear_conversation_scope(session_key, reason="auto_reset")
+            self._clear_conversation_scope(
+                session_key,
+                reason="auto_reset",
+                source=source,
+            )
             # Evict the cached agent so the fresh session does not inherit the
             # previous conversation's context_compressor._previous_summary —
             # the cache is keyed on the stable session_key, so an auto-reset
@@ -13058,6 +13737,10 @@ class GatewayRunner(
             session_key,
             run_generation,
         )
+        self._observe_preview_delivery_generation(
+            session_key,
+            run_generation,
+        )
 
         try:
             # Emit agent:start hook
@@ -13096,7 +13779,47 @@ class GatewayRunner(
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 turn_origin=turn_origin,
+                preview_delivery_generation=run_generation,
+                confirmation_event=confirmation_event,
+                durable_queue_event=event,
             )
+
+            # The agent has produced a signed Planning preview, but the Base
+            # adapter has not yet claimed/sent it or committed the Hub review
+            # receipt.  Persist an explicit clean-restart recovery marker for
+            # this narrow edge window. Provider+Hub confirmation clears it via
+            # the compare-and-clear callback installed above.
+            _delivery_generation = agent_result.get(
+                "_hermes_preview_delivery_generation",
+                run_generation,
+            )
+            _delivery_origin = coerce_turn_origin(
+                agent_result.get("_hermes_delivery_turn_origin")
+            ) or turn_origin
+            try:
+                from hermes_cli.planning_preview_delivery import (
+                    has_preview_delivery_intent,
+                )
+
+                if (
+                    _delivery_origin is not None
+                    and has_preview_delivery_intent(
+                        session_key,
+                        _delivery_generation,
+                    )
+                ):
+                    await self.async_session_store.mark_resume_pending(
+                        session_key,
+                        "planning_delivery_unconfirmed",
+                        turn_origin=_delivery_origin,
+                    )
+            except Exception:
+                logger.warning(
+                    "Could not persist pending Planning delivery recovery "
+                    "marker for %s",
+                    session_key,
+                    exc_info=True,
+                )
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
@@ -13129,7 +13852,7 @@ class GatewayRunner(
                 if getattr(type(_stale_adapter), "pop_post_delivery_callback", None) is not None:
                     _stale_adapter.pop_post_delivery_callback(
                         _quick_key,
-                        generation=run_generation,
+                        generation=_delivery_generation,
                     )
                 elif _stale_adapter and hasattr(_stale_adapter, "_post_delivery_callbacks"):
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
@@ -13140,7 +13863,7 @@ class GatewayRunner(
 
                     discard_preview_delivery_intent(
                         _quick_key,
-                        run_generation,
+                        _delivery_generation,
                     )
                 except Exception:
                     pass
@@ -13162,6 +13885,36 @@ class GatewayRunner(
                 )
             except Exception:
                 _intentional_silence = False
+            if _intentional_silence:
+                try:
+                    from hermes_cli.planning_preview_delivery import (
+                        has_preview_delivery_intent,
+                    )
+
+                    _silence_has_preview = has_preview_delivery_intent(
+                        session_key,
+                        _delivery_generation,
+                    )
+                except Exception:
+                    _silence_has_preview = True
+                if not _silence_has_preview:
+                    _confirm_silence = getattr(
+                        event,
+                        "_hermes_confirm_turn_delivery",
+                        None,
+                    )
+                    if callable(_confirm_silence):
+                        try:
+                            _silence_result = _confirm_silence()
+                            if inspect.isawaitable(_silence_result):
+                                await _silence_result
+                        except Exception:
+                            logger.debug(
+                                "Could not settle intentional-silence turn "
+                                "for %s",
+                                session_key,
+                                exc_info=True,
+                            )
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -13195,19 +13948,13 @@ class GatewayRunner(
             # This ensures the counter only accumulates across CONSECUTIVE
             # restarts where the session was active (never completed).
             #
-            # Also clear the resume_pending flag (set by drain-timeout
-            # shutdown) — the turn ran to completion, so recovery
-            # succeeded and subsequent messages should no longer receive
-            # the restart-interruption system note.
+            # Do not clear resume_pending / the durable TurnOrigin here.
+            # Returning from the agent is not proof that the platform response
+            # (and, for planning previews, the Hub review receipt) committed.
+            # BasePlatformAdapter invokes the event's identity-guarded
+            # confirmation callback only after that delivery edge succeeds.
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
                 self._clear_restart_failure_count(session_key)
-                try:
-                    await self.async_session_store.clear_resume_pending(session_key)
-                except Exception as _e:
-                    logger.debug(
-                        "clear_resume_pending failed for %s: %s",
-                        session_key, _e,
-                    )
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.
@@ -13446,7 +14193,9 @@ class GatewayRunner(
                 # conversation-scoped per-session dict (#58403 and siblings).
                 # See _CONVERSATION_SCOPED_STATE.
                 self._clear_conversation_scope(
-                    session_key, reason="compression_exhausted_reset"
+                    session_key,
+                    reason="compression_exhausted_reset",
+                    source=source,
                 )
                 if new_entry is not None:
                     # Drop the stale reference to the bloated compressed child and
@@ -14381,6 +15130,11 @@ class GatewayRunner(
                     message_type=MessageType.TEXT,
                     source=source,
                     message_id=None,
+                    event_id=(
+                        "goal-continuation:"
+                        f"{sid}:"
+                        f"{int(getattr(getattr(mgr, '_state', None), 'turns_used', 0))}"
+                    ),
                     channel_prompt=None,
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
@@ -17836,7 +18590,13 @@ class GatewayRunner(
             logger.debug("Failed to rebind turn lease", exc_info=True)
             return False
 
-    def _clear_conversation_scope(self, session_key: str, *, reason: str) -> None:
+    def _clear_conversation_scope(
+        self,
+        session_key: str,
+        *,
+        reason: str,
+        source: Optional[SessionSource] = None,
+    ) -> None:
         """Clear ALL conversation-scoped per-session state for ``session_key``.
 
         THE single conversation-boundary funnel. Call this — and nothing
@@ -17870,6 +18630,15 @@ class GatewayRunner(
         """
         if not session_key:
             return
+        self._cancel_durable_session_turns(
+            session_key,
+            source=source,
+        )
+        if source is not None:
+            adapter = self._adapter_for_source(source)
+            pending_messages = getattr(adapter, "_pending_messages", None)
+            if isinstance(pending_messages, dict):
+                pending_messages.pop(session_key, None)
         for attr in _CONVERSATION_SCOPED_STATE:
             store = getattr(self, attr, None)
             if isinstance(store, dict):
@@ -17944,6 +18713,56 @@ class GatewayRunner(
         generations[session_key] = next_generation
         return next_generation
 
+    def _next_preview_delivery_generation(
+        self,
+        session_key: str,
+        *,
+        floor: int = 0,
+    ) -> int:
+        """Mint a transport sub-generation for one logical queued turn.
+
+        A chain of queued turns intentionally shares the outer agent-run
+        generation so stale-result fencing and its turn lease remain valid.
+        Preview intent/receipt state is different: each logical provider event
+        needs a distinct namespace or two previews can be combined and ACKed as
+        one. The counter never moves backwards and is process-local only; the
+        durable semantic delivery identity remains the provider event + payload.
+        """
+
+        if not session_key:
+            return max(int(floor), 1)
+        generations = self.__dict__.get(
+            "_session_preview_delivery_generation"
+        )
+        if generations is None:
+            generations = {}
+            self._session_preview_delivery_generation = generations
+        current = max(
+            int(generations.get(session_key, 0)),
+            int(floor),
+        )
+        next_generation = current + 1
+        generations[session_key] = next_generation
+        return next_generation
+
+    def _observe_preview_delivery_generation(
+        self,
+        session_key: str,
+        generation: Optional[int],
+    ) -> None:
+        if not session_key or generation is None:
+            return
+        generations = self.__dict__.get(
+            "_session_preview_delivery_generation"
+        )
+        if generations is None:
+            generations = {}
+            self._session_preview_delivery_generation = generations
+        generations[session_key] = max(
+            int(generations.get(session_key, 0)),
+            int(generation),
+        )
+
     def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
         """Invalidate any in-flight run token for ``session_key``."""
         generation = self._begin_session_run_generation(session_key)
@@ -18017,6 +18836,10 @@ class GatewayRunner(
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
+        self._cancel_durable_session_turns(
+            session_key,
+            source=source,
+        )
         self._pending_messages.pop(session_key, None)
         if release_running_state:
             self._release_running_agent_state(session_key)
@@ -18747,6 +19570,9 @@ class GatewayRunner(
         if _streaming_enabled:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                from hermes_cli.planning_preview_delivery import (
+                    has_preview_delivery_intent,
+                )
                 _adapter = self._adapter_for_source(source)
                 if _adapter:
                     _pause_typing_before_finalize = None
@@ -18788,6 +19614,10 @@ class GatewayRunner(
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
+                        delivery_hold=lambda: has_preview_delivery_intent(
+                            session_key or "",
+                            run_generation,
+                        ),
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -18952,6 +19782,9 @@ class GatewayRunner(
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         turn_origin: Optional[Any] = None,
+        preview_delivery_generation: Optional[int] = None,
+        confirmation_event: Optional["MessageEvent"] = None,
+        durable_queue_event: Optional["MessageEvent"] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -18971,6 +19804,9 @@ class GatewayRunner(
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 turn_origin=turn_origin,
+                preview_delivery_generation=preview_delivery_generation,
+                confirmation_event=confirmation_event,
+                durable_queue_event=durable_queue_event,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -18983,6 +19819,9 @@ class GatewayRunner(
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 turn_origin=turn_origin,
+                preview_delivery_generation=preview_delivery_generation,
+                confirmation_event=confirmation_event,
+                durable_queue_event=durable_queue_event,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -19105,6 +19944,9 @@ class GatewayRunner(
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         turn_origin: Optional[Any] = None,
+        preview_delivery_generation: Optional[int] = None,
+        confirmation_event: Optional["MessageEvent"] = None,
+        durable_queue_event: Optional["MessageEvent"] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -19142,6 +19984,11 @@ class GatewayRunner(
             _turn_origin_obj.to_dict()
             if _turn_origin_obj is not None
             else None
+        )
+        _preview_generation = (
+            preview_delivery_generation
+            if preview_delivery_generation is not None
+            else (run_generation if run_generation is not None else 0)
         )
 
         def _run_still_current() -> bool:
@@ -20220,6 +21067,9 @@ class GatewayRunner(
             if _want_stream_deltas or _want_interim_consumer:
                 try:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                    from hermes_cli.planning_preview_delivery import (
+                        has_preview_delivery_intent,
+                    )
                     _adapter = self._adapter_for_source(source)
                     if _adapter:
                         _pause_typing_before_finalize = None
@@ -20276,6 +21126,10 @@ class GatewayRunner(
                             on_before_finalize=_pause_typing_before_finalize,
                             initial_reply_to_id=event_message_id,
                             run_still_current=_run_still_current,
+                            delivery_hold=lambda: has_preview_delivery_intent(
+                                session_key or "",
+                                _preview_generation,
+                            ),
                         )
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
@@ -21093,7 +21947,7 @@ class GatewayRunner(
 
             _preview_delivery_token = bind_preview_delivery_generation(
                 _approval_session_key,
-                run_generation,
+                _preview_generation,
             )
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
@@ -21163,7 +22017,15 @@ class GatewayRunner(
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                from hermes_cli.turn_origin import (
+                    scoped_turn_delivery_adapter,
+                )
+
+                with scoped_turn_delivery_adapter(_status_adapter):
+                    result = agent.run_conversation(
+                        _api_run_message,
+                        **_conversation_kwargs,
+                    )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_preview_delivery_generation(
@@ -21944,6 +22806,21 @@ class GatewayRunner(
 
             # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
+            if isinstance(result, dict):
+                result["_hermes_preview_delivery_generation"] = (
+                    _preview_generation
+                )
+                result["_hermes_delivery_turn_origin"] = (
+                    _turn_origin_payload
+                )
+                if result.get("interrupted"):
+                    # An explicit later user turn superseded this queued
+                    # logical turn. Retire its durable row before claiming the
+                    # next FIFO head; otherwise the predecessor guard would
+                    # correctly replay this superseded turn forever.
+                    self._acknowledge_durable_turn_event(
+                        durable_queue_event
+                    )
             adapter = self._adapter_for_source(source)
             
             # Get pending message from adapter.
@@ -21958,7 +22835,25 @@ class GatewayRunner(
                 # occupied for the full FIFO chain, which (a) preserves
                 # order, and (b) causes any mid-chain /queue to correctly
                 # route to overflow rather than jumping the queue.
-                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                #
+                # With no hydrated follow-up, the durable queue head is still
+                # this turn's claimed row until its final provider delivery is
+                # confirmed by the adapter.  Claiming "next" at this point
+                # merely rehydrates the current row and executes it twice.
+                # Even a hydrated follow-up cannot be claimed until final
+                # delivery retires this row: FIFO claim_next/claim_turn must
+                # keep returning the predecessor while it is the durable
+                # head. Claim the hydrated event after the delivery-confirm
+                # callback below, immediately before recursive execution.
+                if durable_queue_event is None:
+                    pending_event = self._promote_queued_event(
+                        session_key,
+                        adapter,
+                        pending_event,
+                        profile_home=(
+                            self._resolve_profile_home_for_source(source)
+                        ),
+                    )
                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                     interrupt_message = result.get("interrupt_message")
                     if _is_control_interrupt_message(interrupt_message):
@@ -22021,6 +22916,9 @@ class GatewayRunner(
                                 "commands must not be passed as agent input",
                                 _pending_cmd_word,
                             )
+                            self._acknowledge_durable_turn_event(
+                                pending_event
+                            )
                             pending_event = None
                             pending = None
                     except Exception:
@@ -22032,6 +22930,7 @@ class GatewayRunner(
                     session_key or "?",
                     self._status_action_label(),
                 )
+                self._release_durable_turn_event(pending_event)
                 pending_event = None
                 pending = None
 
@@ -22054,12 +22953,31 @@ class GatewayRunner(
                     )
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
-                    elif adapter and hasattr(adapter, 'queue_message'):
-                        adapter.queue_message(session_key, pending)
+                        # The event is already the claimed durable FIFO head.
+                        # Restage that exact identity without merging it into a
+                        # different logical turn.
+                        adapter._pending_messages[session_key] = pending_event
+                    elif adapter and pending:
+                        deferred = MessageEvent(
+                            text=pending,
+                            message_type=MessageType.TEXT,
+                            source=source,
+                            event_id=(
+                                "synthetic-interrupt:"
+                                f"{session_id}:{run_generation}:"
+                                f"{_interrupt_depth}"
+                            ),
+                            internal=True,
+                        )
+                        self._enqueue_fifo(
+                            session_key,
+                            deferred,
+                            adapter,
+                        )
                     return result_holder[0] or {"final_response": response, "messages": history}
 
                 was_interrupted = result.get("interrupted")
+                _delivery_confirmed = False
                 if not was_interrupted:
                     # Queued message after normal completion — deliver the first
                     # response before processing the queued follow-up.
@@ -22096,7 +23014,7 @@ class GatewayRunner(
 
                         if has_preview_delivery_intent(
                             session_key or "",
-                            run_generation,
+                            _preview_generation,
                         ):
                             _already_streamed = False
                     except Exception:
@@ -22116,6 +23034,7 @@ class GatewayRunner(
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                             session_key or "?",
                         )
+                        _delivery_confirmed = True
                     elif first_response and not _already_streamed:
                         try:
                             logger.info(
@@ -22123,27 +23042,132 @@ class GatewayRunner(
                                 session_key or "?",
                             )
                             from hermes_cli.planning_preview_delivery import (
-                                complete_preview_delivery,
+                                deliver_preview_for_source,
+                                has_preview_delivery_intent,
                                 prepare_preview_delivery_content,
+                                preview_delivery_next_action,
+                                PreviewDeliveryClaim,
                             )
                             from datetime import UTC as _UTC, datetime as _datetime
 
                             _queued_content = prepare_preview_delivery_content(
                                 session_key or "",
-                                run_generation,
+                                _preview_generation,
                                 first_response,
                             )
-                            _queued_send_result = await adapter._send_with_retry(
-                                chat_id=source.chat_id,
-                                content=_queued_content,
-                                metadata=_status_thread_metadata,
-                            )
-                            await complete_preview_delivery(
+                            _queued_acknowledged = False
+                            _queued_is_preview = has_preview_delivery_intent(
                                 session_key or "",
-                                run_generation,
-                                delivered_content=_queued_content,
-                                result=_queued_send_result,
-                                delivered_at=_datetime.now(_UTC).isoformat(),
+                                _preview_generation,
+                            )
+                            if _queued_is_preview:
+                                _queued_execution_event = (
+                                    confirmation_event
+                                    or durable_queue_event
+                                )
+                                _queued_flow = (
+                                    await deliver_preview_for_source(
+                                        session_key or "",
+                                        _preview_generation,
+                                        delivered_content=_queued_content,
+                                        source=source,
+                                        adapter=adapter,
+                                        metadata=_status_thread_metadata,
+                                        delivered_at=(
+                                            _datetime.now(_UTC).isoformat()
+                                        ),
+                                        turn_execution_ref=str(
+                                            getattr(
+                                                _queued_execution_event,
+                                                "_hermes_turn_execution_ref",
+                                                "",
+                                            )
+                                            or ""
+                                        ),
+                                        turn_execution_committed=getattr(
+                                            _queued_execution_event,
+                                            "_hermes_commit_turn_execution",
+                                            None,
+                                        ),
+                                    )
+                                )
+                                _queued_send_result = _queued_flow.result
+                                _queued_acknowledged = (
+                                    _queued_flow.acknowledged
+                                )
+                                if _queued_flow.action in {
+                                    "turn_execution_commit_callback_missing",
+                                    "turn_execution_commit_failed",
+                                }:
+                                    # The full semantic outbox already owns
+                                    # this response. Park only the ingress
+                                    # retirement; never rerun the model or send
+                                    # a second generic recovery message.
+                                    self._park_durable_turn_event_for_retry(
+                                        durable_queue_event
+                                    )
+                                    return result
+                                if (
+                                    _queued_send_result is None
+                                    and _queued_flow.action
+                                    not in {
+                                        "in_flight",
+                                        "planning_ineligible",
+                                    }
+                                ):
+                                    recovery_text = (
+                                        preview_delivery_next_action(
+                                            PreviewDeliveryClaim(
+                                                action=_queued_flow.action
+                                            )
+                                        )
+                                    )
+                                    _queued_send_result = (
+                                        await adapter._send_with_retry(
+                                            chat_id=source.chat_id,
+                                            content=recovery_text,
+                                            metadata=(
+                                                _status_thread_metadata
+                                            ),
+                                        )
+                                    )
+                                elif (
+                                    _queued_send_result is None
+                                    and _queued_flow.action
+                                    == "planning_ineligible"
+                                ):
+                                    # Match BasePlatformAdapter's completed
+                                    # turn path: an ingress-only/delegated
+                                    # response plane must fail before every
+                                    # provider mutation. In particular, a
+                                    # queued follow-up must not turn this
+                                    # preflight result into a generic fallback
+                                    # send merely to unblock the next turn.
+                                    logger.error(
+                                        "Planning preview for queued session "
+                                        "%s is ineligible for exact provider "
+                                        "delivery; keeping the next turn "
+                                        "parked without a fallback send.",
+                                        session_key or "?",
+                                    )
+                            else:
+                                _queued_send_result = (
+                                    await adapter._send_with_retry(
+                                        chat_id=source.chat_id,
+                                        content=_queued_content,
+                                        metadata=_status_thread_metadata,
+                                        )
+                                    )
+                            _delivery_confirmed = bool(
+                                _queued_acknowledged
+                                or (
+                                    not _queued_is_preview
+                                    and getattr(
+                                        _queued_send_result,
+                                        "success",
+                                        False,
+                                    )
+                                )
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
@@ -22152,6 +23176,32 @@ class GatewayRunner(
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
                             session_key or "?",
                         )
+                        _delivery_confirmed = True
+
+                    if _delivery_confirmed:
+                        _confirm_delivery = getattr(
+                            confirmation_event,
+                            "_hermes_confirm_turn_delivery",
+                            None,
+                        )
+                        if callable(_confirm_delivery):
+                            _confirmation = _confirm_delivery()
+                            if inspect.isawaitable(_confirmation):
+                                await _confirmation
+                    else:
+                        # Do not overwrite the active origin or run a later
+                        # queued turn while this response is retryable,
+                        # in-flight, or ambiguous. The next row remains in the
+                        # durable FIFO and the semantic delivery ledger owns
+                        # retry/reconciliation of the current response.
+                        self._release_durable_turn_event(pending_event)
+                        if _turn_origin_obj is not None:
+                            await self.async_session_store.mark_resume_pending(
+                                session_key or "",
+                                "planning_delivery_unconfirmed",
+                                turn_origin=_turn_origin_obj,
+                            )
+                        return result
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in
@@ -22159,7 +23209,7 @@ class GatewayRunner(
                     if getattr(type(adapter), "pop_post_delivery_callback", None) is not None:
                         _bg_cb = adapter.pop_post_delivery_callback(
                             session_key,
-                            generation=run_generation,
+                            generation=_preview_generation,
                         )
                         if callable(_bg_cb):
                             try:
@@ -22181,6 +23231,25 @@ class GatewayRunner(
                 # interrupted." is just noise; the user already knows they sent a
                 # new message).
 
+                if (
+                    pending_event is not None
+                    and durable_queue_event is not None
+                ):
+                    # The predecessor has now either been provider-confirmed
+                    # above or explicitly retired as interrupted. Only now can
+                    # this exact FIFO successor be claimed without rehydrating
+                    # and re-executing the predecessor.
+                    pending_event = self._promote_queued_event(
+                        session_key,
+                        adapter,
+                        pending_event,
+                        profile_home=(
+                            self._resolve_profile_home_for_source(source)
+                        ),
+                    )
+                    if pending_event is None:
+                        return result
+
                 updated_history = result.get("messages", history)
                 next_source = source
                 next_message = pending
@@ -22188,6 +23257,7 @@ class GatewayRunner(
                 next_channel_prompt = None
                 next_session_key = session_key
                 next_turn_origin = turn_origin
+                next_preview_generation = _preview_generation
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     try:
@@ -22201,6 +23271,9 @@ class GatewayRunner(
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
                             session_key or "?",
+                        )
+                        self._acknowledge_durable_turn_event(
+                            pending_event
                         )
                         return result
                     # Resolve the follow-up's session key BEFORE preparing the
@@ -22223,9 +23296,35 @@ class GatewayRunner(
                         session_key=next_session_key,
                     )
                     if next_message is None:
+                        # Preprocessing emitted its own refusal (for example a
+                        # blocked @context reference), so this exact queued
+                        # event is intentionally complete.
+                        self._acknowledge_durable_turn_event(
+                            pending_event
+                        )
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                    next_preview_generation = (
+                        self._next_preview_delivery_generation(
+                            next_session_key or "",
+                            floor=int(_preview_generation or 0),
+                        )
+                    )
+                    _confirmation_event = (
+                        confirmation_event or pending_event
+                    )
+                    await self._bind_turn_delivery_authority(
+                        confirmation_event=_confirmation_event,
+                        queue_event=pending_event,
+                        session_key=next_session_key or "",
+                        turn_origin=next_turn_origin,
+                    )
+                    self._bind_adapter_run_generation(
+                        self._adapter_for_source(next_source),
+                        next_session_key or "",
+                        next_preview_generation,
+                    )
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -22268,6 +23367,11 @@ class GatewayRunner(
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     turn_origin=next_turn_origin,
+                    preview_delivery_generation=next_preview_generation,
+                    confirmation_event=(
+                        confirmation_event or pending_event
+                    ),
+                    durable_queue_event=pending_event,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
@@ -22376,7 +23480,7 @@ class GatewayRunner(
 
                 _preview_delivery_pending = has_preview_delivery_intent(
                     session_key or "",
-                    run_generation,
+                    _preview_generation,
                 )
             except Exception:
                 _preview_delivery_pending = False
@@ -22386,6 +23490,22 @@ class GatewayRunner(
                 and not _preview_delivery_pending
                 and (_streamed or _content_delivered)
             ):
+                _confirm_delivery = getattr(
+                    confirmation_event,
+                    "_hermes_confirm_turn_delivery",
+                    None,
+                )
+                if callable(_confirm_delivery):
+                    try:
+                        _confirm_result = _confirm_delivery()
+                        if inspect.isawaitable(_confirm_result):
+                            await _confirm_result
+                    except Exception:
+                        logger.debug(
+                            "Could not confirm streamed turn delivery for %s",
+                            session_key or "?",
+                            exc_info=True,
+                        )
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
@@ -22394,7 +23514,12 @@ class GatewayRunner(
                     _content_delivered,
                 )
                 response["already_sent"] = True
-            elif not _is_empty_sentinel and _transformed and _sc is not None:
+            elif (
+                not _is_empty_sentinel
+                and _transformed
+                and _sc is not None
+                and not _preview_delivery_pending
+            ):
                 # Plugin hooks transformed the response after streaming — edit the
                 # existing streamed message instead of sending a duplicate.
                 _sc_msg_id = _sc.message_id
@@ -22406,6 +23531,15 @@ class GatewayRunner(
                             content=response["final_response"],
                             finalize=True,
                         )
+                        _confirm_delivery = getattr(
+                            confirmation_event,
+                            "_hermes_confirm_turn_delivery",
+                            None,
+                        )
+                        if callable(_confirm_delivery):
+                            _confirm_result = _confirm_delivery()
+                            if inspect.isawaitable(_confirm_result):
+                                await _confirm_result
                         response["already_sent"] = True
                         logger.info(
                             "Edited streamed message %s for session %s to include plugin-transformed content.",
@@ -23181,6 +24315,19 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             raise SystemExit(runner.exit_code)
         return True
 
+    # Durable semantic retries and Planning preview ACKs are gateway-owned,
+    # not cron-provider-owned. Supervise each served profile with its exact
+    # home, secret scope, and adapter map so external cron (e.g. Chronos) and
+    # secondary multiplexed profiles converge identically. Establish this
+    # required ownership before starting optional background providers.
+    from gateway.profile_delivery_supervisor import (
+        start_profile_delivery_supervisor,
+    )
+
+    profile_delivery_supervisor = start_profile_delivery_supervisor(
+        runner,
+    )
+
     # Start the background cron scheduler via the resolved provider so
     # scheduled jobs fire automatically. The built-in provider is the
     # historical in-process 60s ticker; an external provider (e.g. chronos)
@@ -23218,9 +24365,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     housekeeping_thread.start()
 
-    # READY is emitted only after adapters, cron, and housekeeping have all
-    # reached their running boundary. Missing config/systemd runtime state
-    # leaves the watchdog disabled without changing gateway behavior.
+    # READY is emitted only after adapters, cron, housekeeping, and durable
+    # profile delivery recovery have all reached their running boundary.
+    # Missing config/systemd runtime state leaves the watchdog disabled
+    # without changing gateway behavior.
     start_watchdog = getattr(runner, "_start_systemd_watchdog", None)
     if callable(start_watchdog):
         start_watchdog()
@@ -23235,11 +24383,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception:
         pass
 
-    if runner.should_exit_with_failure:
-        if runner.exit_reason:
-            logger.error("Gateway exiting with failure: %s", runner.exit_reason)
-        return False
-    
     # Stop cron scheduler + housekeeping cleanly.
     #
     # These MUST be awaited cooperatively, not join()ed. A cron delivery in
@@ -23262,6 +24405,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     await _await_thread_exit(
         housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
     )
+    await profile_delivery_supervisor.stop(
+        timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
+    )
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
     _planned_stop_watcher_stop.set()
@@ -23273,6 +24419,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         shutdown_mcp_servers()
     except Exception:
         pass
+
+    # A failure verdict controls the process exit status; it must not bypass
+    # the shared runtime teardown above. In particular, fatal adapter exits
+    # can occur after cron, housekeeping, per-profile delivery recovery, the
+    # planned-stop watcher, and MCP clients are all live.
+    if runner.should_exit_with_failure:
+        if runner.exit_reason:
+            logger.error(
+                "Gateway exiting with failure: %s",
+                runner.exit_reason,
+            )
+        return False
 
     if runner.exit_code is not None:
         raise SystemExit(runner.exit_code)

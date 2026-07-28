@@ -2649,6 +2649,180 @@ class TestMatrixEncryptedSendFallback:
         assert fake_client.send_message_event.await_count == 2
 
 
+class TestMatrixLiveSemanticExactSend:
+    @staticmethod
+    def _metadata():
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+        )
+
+        return {
+            "semantic_delivery_contract": SEMANTIC_DELIVERY_CONTRACT,
+            "semantic_delivery_id": "delivery-matrix-live-exact",
+            "semantic_delivery_target": (
+                "matrix:preview-target-v1:matrix-room"
+            ),
+            "semantic_delivery_unit": 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_success_is_one_write_with_durable_txn_id(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_message_event = AsyncMock(return_value="$event-live")
+        adapter._client = client
+
+        result = await adapter.send(
+            "!room:example.org",
+            "Exact preview",
+            metadata=self._metadata(),
+        )
+
+        assert result.success is True
+        assert result.message_id == "$event-live"
+        client.send_message_event.assert_awaited_once()
+        assert (
+            client.send_message_event.await_args.kwargs["txn_id"]
+            .startswith("dh_")
+        )
+
+    @pytest.mark.parametrize(
+        "event_id",
+        [
+            None,
+            7,
+            "event-without-dollar-prefix",
+            "$event with space",
+            "$event\tcontrol",
+            "\ud800",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_invalid_provider_event_id_is_ambiguous_with_evidence(
+        self,
+        event_id,
+    ):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_message_event = AsyncMock(return_value=event_id)
+        adapter._client = client
+
+        result = await adapter.send(
+            "!room:example.org",
+            "Exact preview",
+            metadata=self._metadata(),
+        )
+
+        assert result.success is False
+        assert "provider_write_attempted" not in result.raw_response
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["provider"] == "Matrix"
+        assert rejection["protocol"] == "matrix-sdk"
+        assert rejection["response_sha256"] in result.error
+        assert "invalid_event_id" in rejection["response_preview"]
+        client.send_message_event.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_permanent_rejection_is_one_write(self):
+        class Rejected(Exception):
+            status = 403
+
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_message_event = AsyncMock(
+            side_effect=Rejected("forbidden")
+        )
+        adapter._client = client
+
+        result = await adapter.send(
+            "!room:example.org",
+            "Exact preview",
+            metadata=self._metadata(),
+        )
+
+        assert result.success is False
+        assert result.raw_response["provider_write_attempted"] is False
+        assert result.raw_response["provider_retryable"] is False
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["provider"] == "Matrix"
+        assert rejection["protocol"] == "matrix-sdk"
+        assert '"status":403' in rejection["response_preview"]
+        assert rejection["response_sha256"] in result.error
+        client.send_message_event.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_is_one_write_and_retryable(self):
+        class RateLimited(Exception):
+            status = 429
+            retry_after = 7
+
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_message_event = AsyncMock(
+            side_effect=RateLimited("slow down")
+        )
+        adapter._client = client
+
+        result = await adapter.send(
+            "!room:example.org",
+            "Exact preview",
+            metadata=self._metadata(),
+        )
+
+        assert result.success is False
+        assert result.retry_after == 7
+        assert result.raw_response["provider_write_attempted"] is False
+        assert result.raw_response["provider_retryable"] is True
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["provider"] == "Matrix"
+        assert rejection["protocol"] == "matrix-sdk"
+        assert '"retry_after":7' in rejection["response_preview"]
+        client.send_message_event.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_transport_loss_is_one_write_and_ambiguous(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.send_message_event = AsyncMock(
+            side_effect=ConnectionResetError("lost after write")
+        )
+        adapter._client = client
+
+        result = await adapter.send(
+            "!room:example.org",
+            "Exact preview",
+            metadata=self._metadata(),
+        )
+
+        assert result.success is False
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["provider"] == "Matrix"
+        assert rejection["protocol"] == "matrix-sdk"
+        assert "ConnectionResetError" in rejection["response_preview"]
+        client.send_message_event.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_oversized_payload_is_rejected_before_write(self):
+        adapter = _make_adapter()
+        adapter.max_message_length = 20
+        client = MagicMock()
+        client.send_message_event = AsyncMock(return_value="$must-not-send")
+        adapter._client = client
+
+        result = await adapter.send(
+            "!room:example.org",
+            "A" * 200,
+            metadata=self._metadata(),
+        )
+
+        assert result.success is False
+        assert result.raw_response == {
+            "provider_write_attempted": False,
+            "provider_retryable": False,
+        }
+        client.send_message_event.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # E2EE: _joined_rooms reference preservation for CryptoStateStore
 # ---------------------------------------------------------------------------

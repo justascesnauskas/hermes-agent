@@ -3,9 +3,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 import sys
 
+import aiohttp
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 
 
 def _ensure_discord_mock():
@@ -158,6 +159,534 @@ async def test_send_does_not_retry_on_unrelated_errors():
     # Only the first attempt happens — no reference-retry replay.
     assert channel.send.await_count == 1
     assert send_calls[0]["reference"] is reference_obj
+
+
+def _semantic_metadata():
+    from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+    return {
+        "semantic_delivery_contract": SEMANTIC_DELIVERY_CONTRACT,
+        "semantic_delivery_id": "delivery-discord-live-exact",
+        "semantic_delivery_target": (
+            "discord:preview-target-v1:channel-555"
+        ),
+        "semantic_delivery_unit": 0,
+    }
+
+
+class _SemanticDiscordResponse:
+    def __init__(
+        self,
+        payload=None,
+        *,
+        status=200,
+        headers=None,
+        json_error=None,
+        text="",
+    ):
+        self.payload = payload
+        self.status = status
+        self.headers = headers or {}
+        self.json_error = json_error
+        self.response_text = text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def json(self):
+        if self.json_error is not None:
+            raise self.json_error
+        return self.payload
+
+    async def text(self):
+        return self.response_text
+
+
+class _SemanticDiscordSession:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.posts = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    def post(self, *args, **kwargs):
+        self.posts.append((args, kwargs))
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_semantic_send_is_one_enforced_nonce_http_write(monkeypatch):
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="discord-live-token")
+    )
+    channel = SimpleNamespace(
+        type=0,
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    adapter._record_discord_response = MagicMock()
+    session = _SemanticDiscordSession(
+        response=_SemanticDiscordResponse({"id": "1234"})
+    )
+    monkeypatch.setattr(
+        aiohttp,
+        "ClientSession",
+        lambda **_kwargs: session,
+    )
+
+    result = await adapter.send(
+        "555",
+        "Exact preview",
+        reply_to="99",
+        metadata=_semantic_metadata(),
+    )
+
+    assert result.success is True
+    assert result.message_id == "1234"
+    assert len(session.posts) == 1
+    url = session.posts[0][0][0]
+    kwargs = session.posts[0][1]
+    assert url == (
+        "https://discord.com/api/v10/channels/555/messages"
+    )
+    assert kwargs["headers"]["Authorization"] == (
+        "Bot discord-live-token"
+    )
+    assert kwargs["json"]["content"] == "Exact preview"
+    assert kwargs["json"]["nonce"].startswith("dh_")
+    assert len(kwargs["json"]["nonce"]) == 25
+    assert kwargs["json"]["enforce_nonce"] is True
+    assert kwargs["json"]["message_reference"] == {
+        "message_id": "99",
+        "fail_if_not_exists": False,
+    }
+    assert kwargs["allow_redirects"] is False
+    channel.send.assert_not_awaited()
+    adapter._client.fetch_channel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_semantic_permanent_rejection_is_one_write(monkeypatch):
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="discord-live-token")
+    )
+    channel = SimpleNamespace(
+        type=0,
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    adapter._record_discord_response = MagicMock()
+    session = _SemanticDiscordSession(
+        response=_SemanticDiscordResponse(
+            {"message": "Missing Permissions", "code": 50013},
+            status=403,
+        )
+    )
+    monkeypatch.setattr(
+        aiohttp,
+        "ClientSession",
+        lambda **_kwargs: session,
+    )
+
+    result = await adapter.send(
+        "555",
+        "Exact preview",
+        metadata=_semantic_metadata(),
+    )
+
+    assert result.success is False
+    assert result.raw_response["provider_write_attempted"] is False
+    assert result.raw_response["provider_retryable"] is False
+    rejection = result.raw_response["provider_rejection"]
+    assert rejection["provider"] == "Discord"
+    assert rejection["status"] == 403
+    assert rejection["body_preview"] == (
+        '{"code":50013,"message":"Missing Permissions"}'
+    )
+    assert rejection["body_sha256"] in result.error
+    assert len(session.posts) == 1
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_semantic_rate_limit_is_one_write_and_retryable(monkeypatch):
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="discord-live-token")
+    )
+    channel = SimpleNamespace(
+        type=0,
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    adapter._record_discord_response = MagicMock()
+    session = _SemanticDiscordSession(
+        response=_SemanticDiscordResponse(
+            {
+                "message": "You are being rate limited.",
+                "retry_after": 6,
+            },
+            status=429,
+        )
+    )
+    monkeypatch.setattr(
+        aiohttp,
+        "ClientSession",
+        lambda **_kwargs: session,
+    )
+
+    result = await adapter.send(
+        "555",
+        "Exact preview",
+        metadata=_semantic_metadata(),
+    )
+
+    assert result.success is False
+    assert result.retryable is True
+    assert result.retry_after == 6
+    assert result.raw_response["provider_write_attempted"] is False
+    assert result.raw_response["provider_retryable"] is True
+    rejection = result.raw_response["provider_rejection"]
+    assert rejection["provider"] == "Discord"
+    assert rejection["status"] == 429
+    assert rejection["body_sha256"] in result.error
+    assert len(session.posts) == 1
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_semantic_transport_loss_is_one_write_and_ambiguous(
+    monkeypatch,
+):
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="discord-live-token")
+    )
+    channel = SimpleNamespace(
+        type=0,
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    adapter._record_discord_response = MagicMock()
+    session = _SemanticDiscordSession(
+        error=ConnectionResetError("lost after write")
+    )
+    monkeypatch.setattr(
+        aiohttp,
+        "ClientSession",
+        lambda **_kwargs: session,
+    )
+
+    result = await adapter.send(
+        "555",
+        "Exact preview",
+        metadata=_semantic_metadata(),
+    )
+
+    assert result.success is False
+    assert result.raw_response == {}
+    assert len(session.posts) == 1
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_semantic_missing_receipt_is_not_replayed(monkeypatch):
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="discord-live-token")
+    )
+    channel = SimpleNamespace(
+        type=0,
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    adapter._record_discord_response = MagicMock()
+    session = _SemanticDiscordSession(
+        response=_SemanticDiscordResponse({"content": "Exact preview"})
+    )
+    monkeypatch.setattr(
+        aiohttp,
+        "ClientSession",
+        lambda **_kwargs: session,
+    )
+
+    result = await adapter.send(
+        "555",
+        "Exact preview",
+        metadata=_semantic_metadata(),
+    )
+
+    assert result.success is False
+    rejection = result.raw_response["provider_rejection"]
+    assert rejection["provider"] == "Discord"
+    assert rejection["status"] == 200
+    assert rejection["body_sha256"] in result.error
+    assert result.raw_response["provider_write_attempted"] is True
+    assert result.raw_response["provider_retryable"] is False
+    assert len(session.posts) == 1
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_semantic_unreadable_success_preserves_redacted_body_evidence(
+    monkeypatch,
+):
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="discord-live-token")
+    )
+    channel = SimpleNamespace(
+        type=0,
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    adapter._record_discord_response = MagicMock()
+    secret = "super-secret-provider-token-" + ("x" * 5_000)
+    body = f"Authorization: Bearer {secret}"
+    session = _SemanticDiscordSession(
+        response=_SemanticDiscordResponse(
+            status=200,
+            json_error=ValueError("invalid JSON"),
+            text=body,
+        )
+    )
+    monkeypatch.setattr(
+        aiohttp,
+        "ClientSession",
+        lambda **_kwargs: session,
+    )
+
+    result = await adapter.send(
+        "555",
+        "Exact preview",
+        metadata=_semantic_metadata(),
+    )
+
+    assert result.success is False
+    rejection = result.raw_response["provider_rejection"]
+    assert rejection["provider"] == "Discord"
+    assert rejection["status"] == 200
+    assert rejection["body_sha256"] in result.error
+    assert rejection["truncated"] is True
+    assert rejection["redacted"] is True
+    assert secret not in rejection["body_preview"]
+    assert secret not in result.error
+    assert len(session.posts) == 1
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_semantic_oversized_payload_is_zero_writes(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter.MAX_MESSAGE_LENGTH = 20
+    channel = SimpleNamespace(
+        type=0,
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    session_factory = MagicMock()
+    monkeypatch.setattr(
+        aiohttp,
+        "ClientSession",
+        session_factory,
+    )
+
+    result = await adapter.send(
+        "555",
+        "A" * 200,
+        metadata=_semantic_metadata(),
+    )
+
+    assert result.success is False
+    assert result.raw_response == {
+        "provider_write_attempted": False,
+        "provider_retryable": False,
+    }
+    channel.send.assert_not_awaited()
+    session_factory.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("receipt_id", "accepted"),
+    [
+        ("9" * 2_048, True),
+        (7, False),
+        ("123 456", False),
+        ("123\t456", False),
+        ("\ud800", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_discord_standalone_exact_snowflake_boundary(
+    receipt_id,
+    accepted,
+    monkeypatch,
+):
+    from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+    import plugins.platforms.discord.adapter as discord_adapter_module
+
+    session = _SemanticDiscordSession(
+        response=_SemanticDiscordResponse({"id": receipt_id})
+    )
+    monkeypatch.setattr(
+        aiohttp,
+        "ClientSession",
+        lambda **_kwargs: session,
+    )
+
+    result = await discord_adapter_module._standalone_send(
+        PlatformConfig(enabled=True, token="discord-live-token"),
+        "555",
+        "Exact preview",
+        thread_id="555",
+        delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+        delivery_id="delivery-discord-standalone",
+        delivery_target="discord:preview-target-v1:555",
+        semantic_exact_attempt=True,
+    )
+
+    assert bool(result.get("success")) is accepted
+    if accepted:
+        assert result["message_id"] == receipt_id
+    else:
+        rejection = result["provider_rejection"]
+        assert rejection["provider"] == "Discord"
+        assert rejection["status"] == 200
+        assert rejection["body_sha256"] in result["error"]
+    assert len(session.posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_discord_standalone_malformed_success_has_bounded_evidence(
+    monkeypatch,
+):
+    from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+    import plugins.platforms.discord.adapter as discord_adapter_module
+
+    secret = "super-secret-provider-token-" + ("x" * 5_000)
+    session = _SemanticDiscordSession(
+        response=_SemanticDiscordResponse(
+            status=200,
+            json_error=ValueError("invalid JSON"),
+            text=f"Authorization: Bearer {secret}",
+        )
+    )
+    monkeypatch.setattr(
+        aiohttp,
+        "ClientSession",
+        lambda **_kwargs: session,
+    )
+
+    result = await discord_adapter_module._standalone_send(
+        PlatformConfig(enabled=True, token="discord-live-token"),
+        "555",
+        "Exact preview",
+        thread_id="555",
+        delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+        delivery_id="delivery-discord-standalone",
+        delivery_target="discord:preview-target-v1:555",
+        semantic_exact_attempt=True,
+    )
+
+    rejection = result["provider_rejection"]
+    assert rejection["provider"] == "Discord"
+    assert rejection["status"] == 200
+    assert rejection["body_sha256"] in result["error"]
+    assert rejection["truncated"] is True
+    assert rejection["redacted"] is True
+    assert secret not in rejection["body_preview"]
+    assert secret not in result["error"]
+    assert len(session.posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_generic_adapter_semantic_dispatch_reaches_discord_exact_sender(
+    monkeypatch,
+):
+    from hermes_cli.plugins import discover_plugins
+    from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+    from tools.send_message_tool import _send_via_adapter
+
+    discover_plugins()
+    session = _SemanticDiscordSession(
+        response=_SemanticDiscordResponse({"id": "123456789"})
+    )
+    monkeypatch.setattr(
+        aiohttp,
+        "ClientSession",
+        lambda **_kwargs: session,
+    )
+
+    result = await _send_via_adapter(
+        Platform.DISCORD,
+        PlatformConfig(enabled=True, token="discord-live-token"),
+        "555",
+        "Exact preview",
+        thread_id="555",
+        delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+        delivery_id="delivery-discord-generic-dispatch",
+        delivery_target="discord:preview-target-v1:555",
+    )
+
+    assert result["success"] is True
+    assert result["message_id"] == "123456789"
+    assert len(session.posts) == 1
+    assert session.posts[0][1]["json"]["enforce_nonce"] is True
+
+
+@pytest.mark.asyncio
+async def test_semantic_forum_parent_is_rejected_before_write(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    forum = _discord_mod.ForumChannel()
+    forum.create_thread = AsyncMock()
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: forum,
+        fetch_channel=AsyncMock(),
+    )
+    session_factory = MagicMock()
+    monkeypatch.setattr(
+        aiohttp,
+        "ClientSession",
+        session_factory,
+    )
+
+    result = await adapter.send(
+        "555",
+        "Exact preview",
+        metadata=_semantic_metadata(),
+    )
+
+    assert result.success is False
+    assert result.error == "semantic_delivery_forum_not_idempotent"
+    forum.create_thread.assert_not_awaited()
+    session_factory.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -89,6 +89,16 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
+from gateway.platform_registry import declare_semantic_exact_attempt
+
+
+declare_semantic_exact_attempt(
+    "api_server",
+    standalone=False,
+    live=False,
+    owner=__name__,
+    planning_ineligible_reason="response_plane_without_push_receipt",
+)
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
 

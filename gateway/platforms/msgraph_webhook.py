@@ -27,6 +27,16 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from gateway.platform_registry import declare_semantic_exact_attempt
+
+
+declare_semantic_exact_attempt(
+    "msgraph_webhook",
+    standalone=False,
+    live=False,
+    owner=__name__,
+    planning_ineligible_reason="ingress_only_without_outbound_receipt",
+)
 
 logger = logging.getLogger(__name__)
 

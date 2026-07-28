@@ -68,6 +68,13 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    provider_protocol_rejection_evidence,
+    provider_rejection_error,
+    semantic_exact_attempt_encoding_contract,
+)
 from utils import env_float
 
 logger = logging.getLogger(__name__)
@@ -145,6 +152,14 @@ class WeComAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     SUPPORTS_MESSAGE_EDITING = False
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="wecom",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="wecom-logical-v1",
+        max_logical_units=4000,
+        length_semantics="unicode_codepoints",
+        wire_encoding="wecom-aibot-send-msg-markdown-json-v1",
+    )
     # Threshold for detecting WeCom client-side message splits.
     # When a chunk is near the 4000-char limit, a continuation is almost certain.
     _SPLIT_THRESHOLD = 3900
@@ -1383,6 +1398,201 @@ class WeComAdapter(BasePlatformAdapter):
             },
         )
 
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Write one proactive markdown frame and await its correlated ACK."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+            exact_provider_message_id,
+        )
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        try:
+            request.content.encode("utf-8", errors="strict")
+            content_is_utf8 = True
+        except (AttributeError, UnicodeEncodeError):
+            content_is_utf8 = False
+        target_invalid = bool(
+            not isinstance(request.chat_id, str)
+            or not request.chat_id
+            or len(request.chat_id) > 256
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in request.chat_id
+            )
+        )
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or not request.delivery_id
+            or not request.delivery_target
+            or target_invalid
+            or not isinstance(request.content, str)
+            or not content_is_utf8
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+            or not self._ws
+            or self._ws.closed
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+
+        request_hash = hashlib.sha256(
+            (
+                f"wecom:{request.delivery_id}:{request.delivery_unit}"
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        req_id = f"semantic-{request_hash}"
+        if req_id in self._pending_responses:
+            return SendResult(
+                success=False,
+                error="semantic_delivery_attempt_already_pending",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        frame = {
+            "cmd": APP_CMD_SEND,
+            "headers": {"req_id": req_id},
+            "body": {
+                "chatid": request.chat_id,
+                "msgtype": "markdown",
+                "markdown": {"content": request.content},
+            },
+        }
+        future = asyncio.get_running_loop().create_future()
+        self._pending_responses[req_id] = future
+        try:
+            await self._send_json(frame)
+            response = await asyncio.wait_for(
+                future,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"WeCom semantic transport failed: {exc}",
+            )
+        finally:
+            if self._pending_responses.get(req_id) is future:
+                self._pending_responses.pop(req_id, None)
+
+        if not isinstance(response, dict):
+            rejection = provider_protocol_rejection_evidence(
+                provider="WeCom",
+                protocol="wecom-aibot-websocket",
+                response=response,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_rejection": rejection,
+                },
+            )
+        response_req_id = self._payload_req_id(response)
+        errcode_raw = response.get("errcode")
+        if (
+            response_req_id != req_id
+            or isinstance(errcode_raw, bool)
+            or not isinstance(errcode_raw, int)
+        ):
+            rejection = provider_protocol_rejection_evidence(
+                provider="WeCom",
+                protocol="wecom-aibot-websocket",
+                response=response,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_rejection": rejection,
+                },
+            )
+        if errcode_raw == 0:
+            body = response.get("body")
+            message_id = exact_provider_message_id(
+                (
+                    body.get("msgid")
+                    or body.get("msg_id")
+                    or body.get("message_id")
+                )
+                if isinstance(body, dict)
+                else None
+            )
+            if message_id is None:
+                rejection = provider_protocol_rejection_evidence(
+                    provider="WeCom",
+                    protocol="wecom-aibot-websocket",
+                    response=response,
+                )
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    raw_response={
+                        "provider_rejection": rejection,
+                    },
+                )
+            return SendResult(
+                success=True,
+                message_id=message_id,
+                raw_response=response,
+            )
+        rejection = provider_protocol_rejection_evidence(
+            provider="WeCom",
+            protocol="wecom-aibot-websocket",
+            response=response,
+        )
+        if errcode_raw == 45009:
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                    "provider_rejection": rejection,
+                },
+            )
+        if 500 <= errcode_raw < 600 or 50_000 <= errcode_raw < 60_000:
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_rejection": rejection,
+                },
+            )
+        return SendResult(
+            success=False,
+            error=provider_rejection_error(rejection),
+            raw_response={
+                "provider_write_attempted": False,
+                "provider_retryable": False,
+                "provider_rejection": rejection,
+            },
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -1867,6 +2077,8 @@ def register(ctx) -> None:
         allow_all_env="WECOM_ALLOW_ALL_USERS",
         cron_deliver_env_var="WECOM_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=True,
         max_message_length=4000,
         emoji="💼",
         allow_update_command=True,
@@ -1884,6 +2096,9 @@ def register(ctx) -> None:
         install_hint="pip install 'hermes-agent[wecom]'",
         allowed_users_env="WECOM_CALLBACK_ALLOWED_USERS",
         allow_all_env="WECOM_CALLBACK_ALLOW_ALL_USERS",
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=True,
+        max_message_length=2048,
         emoji="💼",
         allow_update_command=True,
     )

@@ -21,6 +21,11 @@
 //   - POST /send        -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "text": "...",
 //              "format": "text" | "markdown" (default "text")}
+//   - POST /send-exact  -> one provider write plus a correlated proof object
+//       body: {"spaceId": "...", "text": "...", "deliveryId": "...",
+//              "deliveryUnit": 0, "routeKind": "dm_phone" | "space_id",
+//              "wireEncoding": "photon-spectrum-markdown-v1",
+//              "contentDigest": "sha256:..."}
 //   - POST /send-attachment -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "path": "...", "name": "..." | null,
 //              "mimeType": "..." | null, "caption": "..." | null,
@@ -58,6 +63,10 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
+import {
+  PhotonSemanticExactError,
+  sendPhotonSemanticExact,
+} from "./semantic_exact.mjs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
 const projectSecret = process.env.PHOTON_PROJECT_SECRET;
@@ -606,6 +615,23 @@ function serverError(res) {
   res.end(JSON.stringify({ ok: false, error: "internal sidecar error" }));
 }
 
+function semanticExactError(res, error) {
+  const providerWriteAttempted =
+    error.providerWriteAttempted === true;
+  const retryable =
+    !providerWriteAttempted && error.retryable === true;
+  res.statusCode = providerWriteAttempted ? 502 : retryable ? 503 : 400;
+  res.setHeader("Content-Type", "application/json");
+  res.end(
+    JSON.stringify({
+      ok: false,
+      error: error.code || "photon_semantic_exact_failed",
+      providerWriteAttempted,
+      retryable,
+    })
+  );
+}
+
 function ok(res, data) {
   res.statusCode = 200;
   res.setHeader("Content-Type", "application/json");
@@ -689,6 +715,37 @@ async function resolveSpace(spaceId) {
   return space;
 }
 
+async function resolveExactSpace(spaceId, routeKind) {
+  const cached = knownSpaces.get(spaceId);
+  if (cached) return cached;
+
+  const im = imessage(app);
+  const phoneTarget = phoneTargetFromSpaceId(spaceId);
+  let space;
+  if (routeKind === "dm_phone") {
+    if (!phoneTarget) {
+      throw new Error("Photon exact DM route does not contain a phone");
+    }
+    // Exactly one deterministic route operation: never fall through from the
+    // DM route to an opaque-space lookup.
+    space = await im.space.create(phoneTarget);
+  } else if (routeKind === "space_id") {
+    if (phoneTarget) {
+      throw new Error("Photon exact space route unexpectedly contains a phone");
+    }
+    // Exactly one deterministic route operation: never retry as a DM.
+    space = await im.space.get(spaceId);
+  } else {
+    throw new Error("Photon exact route kind invalid");
+  }
+  if (!space) throw new Error(`unable to resolve exact space id ${spaceId}`);
+
+  rememberKnownSpace(spaceId, space);
+  if (phoneTarget) rememberKnownSpace(phoneTarget, space);
+  rememberKnownSpace(space?.id, space);
+  return space;
+}
+
 // Constant-time token comparison — don't leak the token via `!==` timing.
 const _tokenBuf = Buffer.from(sharedToken);
 function tokenOk(header) {
@@ -734,6 +791,21 @@ const server = http.createServer(async (req, res) => {
         format === "markdown" ? spectrumMarkdown(text) : spectrumText(text);
       const result = await space.send(builder);
       return ok(res, { messageId: result?.id || null });
+    }
+    if (req.url === "/send-exact") {
+      try {
+        const proof = await sendPhotonSemanticExact({
+          body,
+          resolveExactSpace,
+          markdown: spectrumMarkdown,
+        });
+        return ok(res, proof);
+      } catch (error) {
+        if (error instanceof PhotonSemanticExactError) {
+          return semanticExactError(res, error);
+        }
+        throw error;
+      }
     }
     if (req.url === "/send-attachment") {
       const { spaceId, path, name, mimeType, caption, kind } =

@@ -44,6 +44,7 @@ from gateway.run import (
     build_resume_recovery_note,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
+from hermes_cli.turn_origin import TurnOriginV1
 from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
@@ -78,6 +79,21 @@ def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
 
 def _make_store(tmp_path):
     return SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+
+
+def _resume_origin(platform: Platform) -> TurnOriginV1:
+    provider = platform.value
+    return TurnOriginV1(
+        provider=provider,
+        gateway_account_id=f"{provider}-account",
+        chat_id=f"{provider}-chat",
+        thread_id=f"{provider}-thread",
+        message_id=f"{provider}-message",
+        sender_id=f"{provider}-sender",
+        chat_type="thread",
+        source_timestamp="2026-07-28T08:00:00Z",
+        event_id=f"{provider}-event",
+    )
 
 
 def _build_agent_history(history: list) -> list:
@@ -324,6 +340,47 @@ class TestClearResumePending:
         store = _make_store(tmp_path)
         assert store.clear_resume_pending("no-such-key") is False
 
+    def test_delivery_confirmation_is_event_id_compare_and_clear(
+        self,
+        tmp_path,
+    ):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        origin = _resume_origin(Platform.TELEGRAM)
+        store.persist_active_turn_origin(entry.session_key, origin)
+        store.mark_resume_pending(
+            entry.session_key,
+            turn_origin=origin,
+        )
+
+        assert not store.confirm_turn_delivery(
+            entry.session_key,
+            expected_event_id="different-event",
+        )
+        pending = store._entries[entry.session_key]
+        assert pending.resume_pending is True
+        assert pending.resume_turn_origin == origin.to_dict()
+
+        assert store.confirm_turn_delivery(
+            entry.session_key,
+            expected_event_id=origin.event_id,
+        )
+        confirmed = store._entries[entry.session_key]
+        assert confirmed.resume_pending is False
+        assert confirmed.resume_turn_origin is None
+
+    def test_originless_new_turn_clears_predecessor_identity(self, tmp_path):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        store.persist_active_turn_origin(
+            entry.session_key,
+            _resume_origin(Platform.TELEGRAM),
+        )
+
+        store.mark_resume_pending(entry.session_key, turn_origin=None)
+
+        assert store._entries[entry.session_key].resume_turn_origin is None
+
 
 # ---------------------------------------------------------------------------
 # SessionStore.get_or_create_session resume_pending behaviour
@@ -430,6 +487,10 @@ class TestSuspendRecentlyActiveSkipsResumePending:
         entry_a = store.get_or_create_session(source_a)
         entry_b = store.get_or_create_session(source_b)
         store.mark_resume_pending(entry_a.session_key)
+        store.persist_active_turn_origin(
+            entry_b.session_key,
+            _resume_origin(Platform.TELEGRAM),
+        )
 
         count = store.suspend_recently_active()
         # entry_a is already resume_pending → skipped. entry_b gets marked.
@@ -437,6 +498,19 @@ class TestSuspendRecentlyActiveSkipsResumePending:
         assert store._entries[entry_a.session_key].suspended is False
         assert store._entries[entry_b.session_key].resume_pending is True
         assert store._entries[entry_b.session_key].suspended is False
+
+    def test_confirmed_recent_turn_is_not_crash_resumed(self, tmp_path):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source(chat_id="done"))
+        origin = _resume_origin(Platform.TELEGRAM)
+        store.persist_active_turn_origin(entry.session_key, origin)
+        assert store.confirm_turn_delivery(
+            entry.session_key,
+            expected_event_id=origin.event_id,
+        )
+
+        assert store.suspend_recently_active() == 0
+        assert store._entries[entry.session_key].resume_pending is False
 
 
 # ---------------------------------------------------------------------------
@@ -1065,6 +1139,85 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     # _handle_message_with_agent owns the system-note injection so we don't
     # double it up.
     assert event.text == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", [Platform.TELEGRAM, Platform.MATRIX])
+async def test_fresh_runner_restores_exact_complete_turn_origin(
+    platform: Platform,
+):
+    """Startup continuation reuses provider identity for native/non-native paths."""
+    runner, adapter = make_restart_runner()
+    source = SessionSource(
+        platform=platform,
+        chat_id=f"{platform.value}-chat",
+        chat_type="group",
+        user_id=f"{platform.value}-sender",
+        thread_id=f"{platform.value}-thread",
+    )
+    origin = _resume_origin(platform)
+    persisted = SessionEntry(
+        session_key=f"agent:main:{platform.value}:group:resume",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=platform,
+        chat_type="group",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+        resume_turn_origin=origin.to_dict(),
+    )
+    # Simulate a fresh process reading the persisted JSON-shaped entry.
+    restored = SessionEntry.from_dict(persisted.to_dict())
+    runner.session_store._entries = {restored.session_key: restored}
+    runner.adapters = {platform: adapter}
+    adapter.handle_message = AsyncMock()
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.turn_origin is not origin
+    assert event.turn_origin.to_dict() == origin.to_dict()
+    assert event.message_id == origin.message_id
+    assert event.event_id == origin.event_id
+    assert event.timestamp.isoformat() == "2026-07-28T08:00:00+00:00"
+    assert not getattr(
+        event, "_hermes_preserve_missing_turn_origin", False
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_resume_marker_does_not_mint_new_turn_origin():
+    """A pre-TurnOrigin marker can continue normal discussion but not Planning."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="legacy-resume")
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:legacy-resume",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+        resume_turn_origin=None,
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.turn_origin is None
+    assert event.event_id is None
+    assert event.message_id is None
+    assert event.timestamp is None
+    assert event._hermes_preserve_missing_turn_origin is True
 
 
 @pytest.mark.asyncio
@@ -1839,7 +1992,10 @@ async def test_auto_resume_sentinel_cleaned_on_task_failure():
 
 
 @pytest.mark.asyncio
-async def test_auto_resume_runs_agent_exactly_once_through_full_path():
+@pytest.mark.parametrize("restore_exact_origin", [False, True])
+async def test_auto_resume_runs_agent_exactly_once_through_full_path(
+    restore_exact_origin: bool,
+):
     """Full-path regression: the pre-claim must NOT make auto-resume a no-op.
 
     The two tests above mock ``adapter.handle_message`` outright, so they
@@ -1879,6 +2035,11 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
         resume_pending=True,
         resume_reason="restart_interrupted",
         last_resume_marked_at=datetime.now(),
+        resume_turn_origin=(
+            _resume_origin(Platform.TELEGRAM).to_dict()
+            if restore_exact_origin
+            else None
+        ),
     )
     runner.session_store._entries = {session_key: pending_entry}
 
@@ -1903,9 +2064,11 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
 
     # Count how many times an actual agent run is started for this session.
     agent_runs: list[str] = []
+    observed_origins = []
 
     async def _fake_run(event, source, _quick_key, run_generation):
         agent_runs.append(_quick_key)
+        observed_origins.append(event.turn_origin)
         return "RESUMED OK"
 
     runner._handle_message_with_agent = _fake_run
@@ -1934,6 +2097,12 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     # Exactly one agent run for the resumed session — not zero (the
     # pre-claim did not swallow the resume) and not two (no duplicate).
     assert agent_runs == [session_key]
+    if restore_exact_origin:
+        assert observed_origins[0].to_dict() == _resume_origin(
+            Platform.TELEGRAM
+        ).to_dict()
+    else:
+        assert observed_origins == [None]
     # No leaked sentinel and no orphaned queued event.
     assert session_key not in runner._running_agents
     assert session_key not in getattr(adapter, "_pending_messages", {})

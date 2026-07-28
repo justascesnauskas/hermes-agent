@@ -102,6 +102,14 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    live_semantic_exact_attempt_provider_route_mapping,
+    provider_rejection_error,
+    provider_rejection_evidence,
+    semantic_exact_attempt_encoding_contract,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +174,14 @@ class DingTalkAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="dingtalk",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="dingtalk-webhook-logical-v1",
+        max_logical_units=20_000,
+        length_semantics="unicode_codepoints",
+        wire_encoding="dingtalk-session-webhook-markdown-json-v1",
+    )
 
     @property
     def SUPPORTS_MESSAGE_EDITING(self) -> bool:  # noqa: N802
@@ -824,6 +840,215 @@ class DingTalkAdapter(BasePlatformAdapter):
         return msg_type, media_urls, media_types
 
     # -- Outbound messaging -------------------------------------------------
+
+    def bind_semantic_exact_attempt_provider_route(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str | None = None,
+        reply_to: str | None = None,
+    ) -> Dict[str, str]:
+        """Prove a live session route without persisting its secret URL."""
+
+        del reply_to
+        if not chat_id or thread_id is not None:
+            raise ValueError("DingTalk semantic delivery route invalid")
+        webhook_info = self._get_valid_webhook(chat_id)
+        if (
+            webhook_info is None
+            or _DINGTALK_WEBHOOK_RE.match(webhook_info[0]) is None
+        ):
+            raise LookupError("DingTalk session webhook unavailable")
+        return {"transport": "session_webhook"}
+
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """POST one session-webhook message with no card/reaction fallback."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+            provider_route = (
+                live_semantic_exact_attempt_provider_route_mapping(
+                    request.provider_route
+                )
+            )
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+            provider_delivery_token,
+        )
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        try:
+            normalized = self._normalize_markdown(request.content)
+            normalized.encode("utf-8")
+        except (AttributeError, UnicodeEncodeError, ValueError):
+            normalized = ""
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or provider_route != {"transport": "session_webhook"}
+            or not request.chat_id
+            or request.thread_id is not None
+            or not isinstance(request.content, str)
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+            or not normalized.strip()
+            or len(normalized) > self.MAX_MESSAGE_LENGTH
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        webhook_info = self._get_valid_webhook(request.chat_id)
+        if (
+            self._http_client is None
+            or webhook_info is None
+            or _DINGTALK_WEBHOOK_RE.match(webhook_info[0]) is None
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_route_unavailable",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+        session_webhook, _ = webhook_info
+        payload = {
+            "msgtype": "markdown",
+            "markdown": {
+                "title": "Hermes",
+                "text": normalized,
+            },
+        }
+        try:
+            response = await self._http_client.post(
+                session_webhook,
+                json=payload,
+                timeout=15.0,
+                follow_redirects=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"DingTalk semantic transport failed: {exc}",
+            )
+
+        status = int(response.status_code)
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+        response_body = getattr(response, "text", None)
+        if not isinstance(response_body, (str, bytes)):
+            response_body = (
+                data if data is not None else "unparseable response"
+            )
+        if 200 <= status < 300:
+            if (
+                not isinstance(data, dict)
+                or data.get("errcode") != 0
+            ):
+                rejection = provider_rejection_evidence(
+                    provider="DingTalk",
+                    status=status,
+                    body=response_body,
+                )
+                if (
+                    isinstance(data, dict)
+                    and data.get("errcode") is not None
+                ):
+                    return SendResult(
+                        success=False,
+                        error=provider_rejection_error(rejection),
+                        raw_response={
+                            "provider_write_attempted": False,
+                            "provider_retryable": False,
+                            "provider_rejection": rejection,
+                        },
+                    )
+                return SendResult(
+                    success=False,
+                    error="semantic_delivery_provider_receipt_invalid",
+                    raw_response={
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            stable_token = provider_delivery_token(
+                request.delivery_id,
+                provider="dingtalk",
+                target=request.delivery_target,
+                unit=request.delivery_unit,
+            )
+            return SendResult(
+                success=True,
+                message_id=(
+                    f"dt_{stable_token.removeprefix('dh_')[:24]}"
+                ),
+                raw_response=data,
+            )
+        rejection = provider_rejection_evidence(
+            provider="DingTalk",
+            status=status,
+            body=response_body,
+        )
+        if status == 429:
+            retry_after = (getattr(response, "headers", {}) or {}).get(
+                "Retry-After"
+            )
+            try:
+                retry_after_value = float(retry_after)
+            except (TypeError, ValueError):
+                retry_after_value = None
+            return SendResult(
+                success=False,
+                error="DingTalk semantic delivery rate limited",
+                retryable=True,
+                retry_after=retry_after_value,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                    "retry_after": retry_after_value,
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        if status == 408 or status >= 500:
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        return SendResult(
+            success=False,
+            error=provider_rejection_error(rejection),
+            raw_response={
+                "provider_write_attempted": False,
+                "provider_retryable": False,
+                "status": status,
+                "provider_rejection": rejection,
+            },
+        )
 
     async def send(
         self,
@@ -1727,6 +1952,8 @@ def register(ctx) -> None:
         allow_all_env="DINGTALK_ALLOW_ALL_USERS",
         cron_deliver_env_var="DINGTALK_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=True,
         emoji="🐳",
         allow_update_command=True,
     )

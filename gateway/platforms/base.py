@@ -1864,7 +1864,17 @@ class MessageEvent:
         message_id = self.message_id or getattr(source, "message_id", None)
         sender_id = getattr(source, "user_id", None)
         chat_type = getattr(source, "chat_type", None)
-        source_timestamp = serialize_source_timestamp(self.timestamp)
+        # ``MessageEvent.timestamp`` also serves as a local display/arrival
+        # clock and historically defaults to ``datetime.now()``.  Arrival
+        # time is not provider identity: a redelivery or restart would mint a
+        # different semantic key.  Adapters opt in only when they possess an
+        # authoritative provider timestamp; otherwise source_timestamp is
+        # deliberately absent and the stable message/update id owns identity.
+        source_timestamp = serialize_source_timestamp(
+            metadata.get("provider_source_timestamp")
+            if isinstance(metadata, dict)
+            else None
+        )
 
         explicit_event_id = self.event_id or metadata.get("event_id")
         event_id = str(explicit_event_id).strip() if explicit_event_id else None
@@ -4413,6 +4423,37 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
+        semantic_strategy = None
+        semantic_contract = str(
+            (metadata or {}).get("semantic_delivery_contract") or ""
+        ).strip()
+        semantic_delivery_id = str(
+            (metadata or {}).get("semantic_delivery_id") or ""
+        ).strip()
+        if semantic_contract or semantic_delivery_id:
+            from hermes_cli.semantic_delivery import (
+                SEMANTIC_DELIVERY_CONTRACT,
+                replay_strategy,
+            )
+
+            if (
+                not semantic_contract
+                or not semantic_delivery_id
+                or semantic_contract != SEMANTIC_DELIVERY_CONTRACT
+            ):
+                return SendResult(
+                    success=False,
+                    error="semantic_delivery_identity_invalid",
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                    },
+                )
+            semantic_strategy = replay_strategy(
+                str(getattr(self.platform, "value", self.platform)),
+                content,
+            )
+
         result = await self.send(
             chat_id=chat_id,
             content=content,
@@ -4429,6 +4470,12 @@ class BasePlatformAdapter(ABC):
 
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
+
+        if semantic_strategy == "none":
+            # No native idempotency key exists. One exact attempt is the only
+            # safe automatic behavior; the durable ledger resolves what comes
+            # next without a blind retry, fallback, or failure-notice send.
+            return result
 
         # Timeout errors are not safe to retry (message may have been
         # delivered) and not formatting errors — return the failure as-is.
@@ -4473,6 +4520,8 @@ class BasePlatformAdapter(ABC):
             else:
                 # All retries exhausted (loop completed without break) — notify user
                 logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, max_retries, error_str)
+                if semantic_strategy is not None:
+                    return result
                 notice = (
                     "\u26a0\ufe0f Message delivery failed after multiple attempts. "
                     "Please try again \u2014 your request was processed but the response could not be sent."
@@ -4482,6 +4531,11 @@ class BasePlatformAdapter(ABC):
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
+
+        if semantic_strategy is not None:
+            # Semantic bytes are hash-bound. A transformed fallback would be a
+            # different message under the same delivery identity.
+            return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
@@ -4950,29 +5004,30 @@ class BasePlatformAdapter(ABC):
         # Normalize origin once, after topic recovery has finalized the
         # platform-neutral chat/thread lane. Every adapter reaches this shared
         # boundary, so new providers inherit TurnOriginV1 without bespoke code.
-        try:
-            source_account_id = getattr(
-                getattr(event, "source", None),
-                "gateway_account_id",
-                None,
-            )
-            if not source_account_id:
-                adapter_extra = getattr(self.config, "extra", None)
-                if isinstance(adapter_extra, dict):
-                    source_account_id = adapter_extra.get(
-                        "gateway_account_id"
-                    )
-            event.ensure_turn_origin(
-                gateway_account_id=source_account_id
-            )
-        except Exception:
-            # Origin is observability context; a malformed optional provider
-            # field must never make the user message undeliverable.
-            logger.warning(
-                "[%s] Could not normalize turn origin; continuing without it",
-                self.name,
-                exc_info=True,
-            )
+        if not getattr(event, "_hermes_preserve_missing_turn_origin", False):
+            try:
+                source_account_id = getattr(
+                    getattr(event, "source", None),
+                    "gateway_account_id",
+                    None,
+                )
+                if not source_account_id:
+                    adapter_extra = getattr(self.config, "extra", None)
+                    if isinstance(adapter_extra, dict):
+                        source_account_id = adapter_extra.get(
+                            "gateway_account_id"
+                        )
+                event.ensure_turn_origin(
+                    gateway_account_id=source_account_id
+                )
+            except Exception:
+                # Origin is observability context; a malformed optional provider
+                # field must never make the user message undeliverable.
+                logger.warning(
+                    "[%s] Could not normalize turn origin; continuing without it",
+                    self.name,
+                    exc_info=True,
+                )
 
         session_key = build_session_key(
             event.source,
@@ -5192,6 +5247,46 @@ class BasePlatformAdapter(ABC):
             if getattr(result, "success", False):
                 delivery_succeeded = True
 
+        _turn_delivery_confirmed = False
+        _turn_execution_committed = False
+        _preserve_preview_delivery_intent = False
+
+        async def _confirm_turn_delivery_once() -> None:
+            nonlocal _turn_delivery_confirmed
+            if _turn_delivery_confirmed:
+                return
+            callback = getattr(
+                event,
+                "_hermes_confirm_turn_delivery",
+                None,
+            )
+            if not callable(callback):
+                return
+            result = callback()
+            if inspect.isawaitable(result):
+                await result
+            _turn_delivery_confirmed = True
+
+        async def _commit_turn_execution_once() -> None:
+            """Hand durable delivery ownership off without rerunning the turn."""
+
+            nonlocal _turn_execution_committed
+            if _turn_execution_committed:
+                return
+            callback = getattr(
+                event,
+                "_hermes_commit_turn_execution",
+                None,
+            )
+            if not callable(callback):
+                raise RuntimeError(
+                    "gateway.turn_execution_commit_callback_missing"
+                )
+            result = callback()
+            if inspect.isawaitable(result):
+                await result
+            _turn_execution_committed = True
+
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
         # Fall back to a new Event only if the entry was removed externally.
@@ -5399,12 +5494,25 @@ class BasePlatformAdapter(ABC):
                         except OSError:
                             pass
 
+                _preview_delivery_adapter = None
+                if (
+                    text_content
+                    and not _tts_caption_delivered
+                    and _preview_delivery_pending
+                ):
+                    _preview_delivery_adapter = (
+                        self._final_delivery_adapter(event.source)
+                    )
+
                 # Send the text portion. A reconnect may have replaced this
                 # adapter while its in-flight handler was still producing a
                 # final response; that response is a new message, so resolve
                 # the current transport before sending it.
                 if text_content and not _tts_caption_delivered:
-                    delivery_adapter = self._final_delivery_adapter(event.source)
+                    delivery_adapter = (
+                        _preview_delivery_adapter
+                        or self._final_delivery_adapter(event.source)
+                    )
                     logger.info(
                         "[%s] Sending response (%d chars) to %s",
                         delivery_adapter.name,
@@ -5421,9 +5529,15 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
+                    if (
+                        not _preview_delivery_pending
+                        and not is_ephemeral_response
+                        and not str(
                         event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                        ).lstrip().startswith(
+                            ("/", self.typed_command_prefix or "!")
+                        )
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,
@@ -5453,32 +5567,109 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
-                    _record_delivery(result)
                     if _preview_delivery_pending:
-                        try:
-                            from datetime import UTC as _UTC, datetime as _datetime
-                            from hermes_cli.planning_preview_delivery import (
-                                complete_preview_delivery,
-                            )
+                        from datetime import UTC as _UTC, datetime as _datetime
+                        from hermes_cli.planning_preview_delivery import (
+                            PreviewDeliveryClaim,
+                            deliver_preview_for_source,
+                            discard_preview_delivery_intent,
+                            preview_delivery_next_action,
+                        )
 
-                            await complete_preview_delivery(
+                        try:
+                            _preview_flow = await deliver_preview_for_source(
                                 session_key,
                                 _preview_delivery_generation,
                                 delivered_content=text_content,
-                                result=result,
-                                delivered_at=_datetime.now(_UTC).isoformat(),
+                                source=event.source,
+                                adapter=delivery_adapter,
+                                metadata=_final_thread_metadata,
+                                reply_to=_reply_anchor,
+                                delivered_at=(
+                                    _datetime.now(_UTC).isoformat()
+                                ),
+                                turn_execution_ref=str(
+                                    getattr(
+                                        event,
+                                        "_hermes_turn_execution_ref",
+                                        "",
+                                    )
+                                    or ""
+                                ),
+                                turn_execution_committed=(
+                                    _commit_turn_execution_once
+                                ),
                             )
+                            result = _preview_flow.result
+                            if _preview_flow.acknowledged:
+                                await _confirm_turn_delivery_once()
+                            if result is None:
+                                if _preview_flow.action in {
+                                    "in_flight",
+                                    "planning_ineligible",
+                                    "turn_execution_commit_failed",
+                                    "turn_execution_commit_callback_missing",
+                                }:
+                                    # The complete semantic outbox owns
+                                    # delivery, but the provider write has not
+                                    # happened in this handler. Keep the
+                                    # process-local intent/state so a live
+                                    # in-flight owner or a queue-retirement
+                                    # retry can converge without reopening the
+                                    # model turn or manufacturing a generic
+                                    # recovery message.
+                                    _preserve_preview_delivery_intent = (
+                                        _preview_flow.action
+                                        != "planning_ineligible"
+                                    )
+                                    result = SendResult(
+                                        success=False,
+                                        error=_preview_flow.action,
+                                    )
+                                else:
+                                    recovery_text = (
+                                        preview_delivery_next_action(
+                                            PreviewDeliveryClaim(
+                                                action=_preview_flow.action
+                                            )
+                                        )
+                                    )
+                                    discard_preview_delivery_intent(
+                                        session_key,
+                                        _preview_delivery_generation,
+                                    )
+                                    _preview_delivery_pending = False
+                                    result = (
+                                        await delivery_adapter._send_with_retry(
+                                            chat_id=event.source.chat_id,
+                                            content=recovery_text,
+                                            reply_to=_reply_anchor,
+                                            metadata=_final_thread_metadata,
+                                        )
+                                    )
                         except Exception:
                             logger.debug(
-                                "Planning preview delivery receipt failed closed",
+                                "Planning preview multi-unit delivery failed "
+                                "closed",
                                 exc_info=True,
                             )
+                            result = SendResult(
+                                success=False,
+                                error="planning_preview_delivery_failed",
+                            )
+                    else:
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_final_thread_metadata,
+                        )
+                    _record_delivery(result)
+                    if (
+                        not _preview_delivery_pending
+                        and getattr(result, "success", False)
+                    ):
+                        await _confirm_turn_delivery_once()
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
@@ -5758,10 +5949,11 @@ class BasePlatformAdapter(ABC):
                     discard_preview_delivery_intent,
                 )
 
-                discard_preview_delivery_intent(
-                    session_key,
-                    _callback_generation,
-                )
+                if not _preserve_preview_delivery_intent:
+                    discard_preview_delivery_intent(
+                        session_key,
+                        _callback_generation,
+                    )
             except Exception:
                 pass
             # Some adapters keep platform-level typing tasks.  If callback

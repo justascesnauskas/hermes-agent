@@ -98,6 +98,14 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_media_bytes,
 )
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    live_semantic_exact_attempt_provider_route_mapping,
+    provider_rejection_error,
+    provider_rejection_evidence,
+    semantic_exact_attempt_encoding_contract,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -695,6 +703,14 @@ class TeamsAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = 28000  # Teams text message limit (~28 KB)
     splits_long_messages = True  # send() chunks via truncate_message()
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="teams",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="teams-logical-v1",
+        max_logical_units=28000,
+        length_semantics="unicode_codepoints",
+        wire_encoding="teams-botframework-markdown-json-v1",
+    )
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("teams"))
@@ -1151,6 +1167,301 @@ class TeamsAdapter(BasePlatformAdapter):
             logger.error("[teams] send_exec_approval failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e), retryable=True)
 
+    @staticmethod
+    def _semantic_reply_id(
+        *,
+        thread_id: Optional[str],
+        reply_to: Optional[str],
+    ) -> Optional[str]:
+        """Resolve one immutable Teams thread root without route fallback."""
+
+        if thread_id is not None and reply_to is not None:
+            if thread_id != reply_to:
+                raise ValueError("Teams semantic thread route is ambiguous")
+        reply_id = reply_to if reply_to is not None else thread_id
+        if reply_id is None:
+            return None
+        if (
+            not isinstance(reply_id, str)
+            or not reply_id.isdigit()
+            or reply_id == "0"
+            or len(reply_id) > 128
+        ):
+            raise ValueError("Teams semantic reply ID is invalid")
+        return reply_id
+
+    def bind_semantic_exact_attempt_provider_route(
+        self,
+        *,
+        chat_id: str,
+        thread_id: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Freeze the one ActivitySender route before durable staging."""
+
+        reply_id = self._semantic_reply_id(
+            thread_id=thread_id,
+            reply_to=reply_to,
+        )
+        if (
+            not isinstance(chat_id, str)
+            or not chat_id
+            or len(chat_id) > 1024
+            or _TEAMS_CONV_ID_RE.fullmatch(chat_id) is None
+            or self._app is None
+            or getattr(self._app, "activity_sender", None) is None
+            or not callable(
+                getattr(
+                    getattr(
+                        self._app.activity_sender,
+                        "_client",
+                        None,
+                    ),
+                    "post",
+                    None,
+                )
+            )
+            or _validate_teams_service_url(
+                str(
+                    getattr(
+                        getattr(self._app, "api", None),
+                        "service_url",
+                        "",
+                    )
+                    or ""
+                )
+            )
+            is None
+        ):
+            raise ValueError("Teams semantic delivery route unavailable")
+        return {
+            "message_mode": "thread_reply" if reply_id else "conversation",
+            "transport": "activity_sender",
+        }
+
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Use one SDK ActivitySender POST and require a real activity ID."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+            reply_id = self._semantic_reply_id(
+                thread_id=request.thread_id,
+                reply_to=request.reply_to,
+            )
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+            exact_provider_message_id,
+        )
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        expected_route = {
+            "message_mode": (
+                "thread_reply" if reply_id else "conversation"
+            ),
+            "transport": "activity_sender",
+        }
+        try:
+            request.content.encode("utf-8", errors="strict")
+            content_is_utf8 = True
+        except (AttributeError, UnicodeEncodeError):
+            content_is_utf8 = False
+        app = self._app
+        route = live_semantic_exact_attempt_provider_route_mapping(
+            request.provider_route
+        )
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or not request.delivery_id
+            or not request.delivery_target
+            or not isinstance(request.chat_id, str)
+            or not request.chat_id
+            or len(request.chat_id) > 1024
+            or _TEAMS_CONV_ID_RE.fullmatch(request.chat_id) is None
+            or not isinstance(request.content, str)
+            or not content_is_utf8
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+            or route != expected_route
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if (
+            app is None
+            or getattr(app, "activity_sender", None) is None
+            or not callable(
+                getattr(
+                    getattr(app.activity_sender, "_client", None),
+                    "post",
+                    None,
+                )
+            )
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_route_unavailable",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+
+        service_url = _validate_teams_service_url(
+            str(
+                getattr(
+                    getattr(app, "api", None),
+                    "service_url",
+                    "",
+                )
+                or ""
+            )
+        )
+        if service_url is None:
+            return SendResult(
+                success=False,
+                error="semantic_delivery_route_unavailable",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+        activities_url = (
+            f"{service_url}v3/conversations/"
+            f"{quote(request.chat_id, safe='')}/activities"
+        )
+        activity = {
+            "type": "message",
+            "text": request.content,
+            "textFormat": "markdown",
+        }
+        if reply_id is not None:
+            activities_url += f"/{quote(reply_id, safe='')}"
+            activity["replyToId"] = reply_id
+
+        try:
+            response = await app.activity_sender._client.post(
+                activities_url,
+                json=activity,
+                follow_redirects=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            try:
+                import httpx
+            except ImportError:  # pragma: no cover - Hermes depends on httpx
+                httpx = None  # type: ignore[assignment]
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+            if (
+                httpx is not None
+                and isinstance(exc, httpx.HTTPStatusError)
+                and isinstance(status, int)
+            ):
+                rejection_body = getattr(response, "content", None)
+                if not isinstance(rejection_body, (bytes, str)):
+                    rejection_body = str(exc)
+                rejection = provider_rejection_evidence(
+                    provider="Teams",
+                    status=status,
+                    body=rejection_body,
+                )
+                if status == 429:
+                    retry_after = None
+                    try:
+                        retry_after = float(
+                            response.headers.get("Retry-After")
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                    return SendResult(
+                        success=False,
+                        error=provider_rejection_error(rejection),
+                        retryable=True,
+                        retry_after=retry_after,
+                        raw_response={
+                            "provider_write_attempted": False,
+                            "provider_retryable": True,
+                            "retry_after": retry_after,
+                            "status": status,
+                            "provider_rejection": rejection,
+                        },
+                    )
+                if 400 <= status < 500 and status != 408:
+                    return SendResult(
+                        success=False,
+                        error=provider_rejection_error(rejection),
+                        raw_response={
+                            "provider_write_attempted": False,
+                            "provider_retryable": False,
+                            "status": status,
+                            "provider_rejection": rejection,
+                        },
+                    )
+            return SendResult(
+                success=False,
+                error=f"Teams semantic transport failed: {exc}",
+            )
+
+        try:
+            response_payload = response.json()
+        except Exception:
+            response_payload = None
+        message_id = exact_provider_message_id(
+            response_payload.get("id")
+            if isinstance(response_payload, dict)
+            else None
+        )
+        if (
+            not message_id
+            or message_id == "DO_NOT_USE_PLACEHOLDER_ID"
+        ):
+            rejection = provider_rejection_evidence(
+                provider="Teams",
+                status=int(getattr(response, "status_code", 200) or 200),
+                body=(
+                    getattr(response, "content", None)
+                    if isinstance(
+                        getattr(response, "content", None),
+                        (bytes, str),
+                    )
+                    else response_payload
+                ),
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_rejection": rejection,
+                },
+            )
+        return SendResult(
+            success=True,
+            message_id=message_id,
+            raw_response={
+                "provider_activity_id": message_id,
+                "transport": "activity_sender",
+            },
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -1431,6 +1742,8 @@ def register(ctx) -> None:
         # this hook, deliver=teams cron jobs fail with "No live adapter"
         # when cron runs separately from the gateway.
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=True,
         # Auth env vars for _is_user_authorized() integration
         allowed_users_env="TEAMS_ALLOWED_USERS",
         allow_all_env="TEAMS_ALLOW_ALL_USERS",

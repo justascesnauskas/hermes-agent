@@ -30,7 +30,10 @@ _RECORD_SCHEMA_VERSION = "1.0"
 _TOKEN_PREFIX = "artrec_v2_"
 _TOKEN_RE = re.compile(r"^artrec_v2_([0-9a-f]{64})$")
 _METADATA_FILENAME = "recovery.json"
+_COMPLETION_FILENAME = "completion.json"
+_COMPLETION_SCHEMA_VERSION = "1.0"
 _SPOOL_RELATIVE_PATH = Path("planning-v2") / "artifact-ingress"
+_TOMBSTONES_DIRECTORY = ".acknowledged-tombstones"
 _COPY_CHUNK_BYTES = 1024 * 1024
 _SCOPE_FIELDS = (
     "provider",
@@ -152,6 +155,81 @@ def _record_path(root: Path, digest: str) -> Path:
     return root / digest
 
 
+def _tombstone_path(root: Path, digest: str) -> Path:
+    return root / _TOMBSTONES_DIRECTORY / digest
+
+
+def _has_acknowledged_tombstone(root: Path, digest: str) -> bool:
+    path = _tombstone_path(root, digest)
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise PlanningV2ConfigError(
+            "planning.artifact_recovery_corrupt",
+            detail="Hermes could not inspect an artifact ACK tombstone.",
+        ) from exc
+    if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode):
+        raise PlanningV2ConfigError(
+            "planning.artifact_recovery_corrupt",
+            detail="An artifact ACK tombstone is not a safe directory.",
+        )
+    return True
+
+
+def _materialize_acknowledged_tombstone(
+    root: Path,
+    digest: str,
+    *,
+    completion_receipt: Optional[Mapping[str, Any]] = None,
+) -> None:
+    tombstone_root = root / _TOMBSTONES_DIRECTORY
+    _secure_directory(tombstone_root)
+    tombstone = tombstone_root / digest
+    try:
+        tombstone.mkdir(mode=0o700)
+    except FileExistsError:
+        if not _has_acknowledged_tombstone(root, digest):
+            raise PlanningV2ConfigError(
+                "planning.artifact_recovery_corrupt"
+            )
+    except OSError as exc:
+        raise PlanningV2ConfigError(
+            "planning.artifact_spool_write_failed",
+            detail=(
+                "Hermes could not durably record the acknowledged artifact "
+                "before removing its private byte snapshot."
+            ),
+        ) from exc
+    completion_path = tombstone / _COMPLETION_FILENAME
+    if completion_receipt is not None:
+        expected = dict(completion_receipt)
+        if completion_path.exists():
+            try:
+                current = json.loads(
+                    completion_path.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise PlanningV2ConfigError(
+                    "planning.artifact_recovery_corrupt",
+                    detail="The artifact completion receipt is corrupt.",
+                ) from exc
+            if current != expected:
+                raise PlanningV2ConfigError(
+                    "planning.artifact_recovery_contract_conflict",
+                    detail=(
+                        "The acknowledged artifact already has a different "
+                        "immutable completion receipt."
+                    ),
+                )
+        else:
+            _write_metadata(completion_path, expected)
+            _fsync_directory(tombstone)
+    _fsync_directory(tombstone_root)
+    _fsync_directory(root)
+
+
 def _snapshot_filename(source: Path, digest: str) -> str:
     filename = source.name
     if (
@@ -178,12 +256,19 @@ def _remove_staging_directory(path: Path) -> None:
 
 
 def _remove_acknowledged_directory(path: Path) -> bool:
-    """Delete one already-retired record without touching live records."""
+    """Tombstone, then delete one retired record without touching live rows."""
 
-    if not path.name.startswith(".acknowledged-"):
+    match = re.fullmatch(
+        r"\.acknowledged-([0-9a-f]{64})-[^-]+-[0-9a-f]+",
+        path.name,
+    )
+    if match is None:
         return False
     try:
         metadata = _read_metadata(path)
+        digest = match.group(1)
+        if _metadata_digest(metadata) != digest:
+            return False
         snapshot_filename = metadata.get("snapshotFilename")
         if (
             not isinstance(snapshot_filename, str)
@@ -194,6 +279,9 @@ def _remove_acknowledged_directory(path: Path) -> bool:
         allowed = {_METADATA_FILENAME, snapshot_filename}
         if any(child.name not in allowed for child in path.iterdir()):
             return False
+        # The empty directory marker is the durable no-resurrection fence.
+        # It is committed before either the journal metadata or bytes vanish.
+        _materialize_acknowledged_tombstone(path.parent, digest)
         (path / snapshot_filename).unlink(missing_ok=True)
         (path / _METADATA_FILENAME).unlink(missing_ok=True)
         path.rmdir()
@@ -351,6 +439,172 @@ def _metadata_digest(metadata: Mapping[str, Any]) -> Optional[str]:
     if not isinstance(idempotency_key, str) or not idempotency_key.strip():
         return None
     return hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+
+
+def _scope_digest(
+    *,
+    thread_id: str,
+    origin: Mapping[str, Any],
+) -> str:
+    payload = {
+        "threadId": thread_id,
+        "origin": {
+            name: origin.get(name)
+            for name in _SCOPE_FIELDS
+        },
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _completion_text(value: Any) -> Optional[str]:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 2_000
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return None
+    return value
+
+
+def _normalize_completion(
+    completion: Mapping[str, Any],
+    *,
+    thread_id: str,
+) -> dict[str, Any]:
+    expected_root = {
+        "ok",
+        "action",
+        "threadId",
+        "artifact",
+        "storageMode",
+        "uploadDisposition",
+        "uploadReplayed",
+        "inputStored",
+        "inputReplayed",
+        "previewInvalidated",
+    }
+    artifact = completion.get("artifact")
+    if (
+        set(completion) != expected_root
+        or completion.get("ok") is not True
+        or completion.get("action") != "upload_artifact"
+        or completion.get("threadId") != thread_id
+        or not isinstance(artifact, Mapping)
+    ):
+        raise PlanningV2ConfigError(
+            "planning.artifact_recovery_completion_invalid"
+        )
+    required_artifact = {
+        "schemaVersion",
+        "artifactId",
+        "artifactRef",
+        "sourceReference",
+        "referenceId",
+        "checksum",
+        "sizeBytes",
+        "contentType",
+        "role",
+        "position",
+        "required",
+    }
+    artifact_keys = set(artifact)
+    if (
+        not required_artifact.issubset(artifact_keys)
+        or artifact_keys - (required_artifact | {"filename"})
+        or artifact.get("schemaVersion") != "1.0"
+        or any(
+            _completion_text(artifact.get(name)) is None
+            for name in (
+                "artifactId",
+                "artifactRef",
+                "sourceReference",
+                "referenceId",
+                "checksum",
+                "contentType",
+                "role",
+            )
+        )
+        or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(artifact.get("checksum") or ""),
+        )
+        or isinstance(artifact.get("sizeBytes"), bool)
+        or not isinstance(artifact.get("sizeBytes"), int)
+        or artifact["sizeBytes"] < 0
+        or isinstance(artifact.get("position"), bool)
+        or not isinstance(artifact.get("position"), int)
+        or artifact["position"] < 1
+        or not isinstance(artifact.get("required"), bool)
+        or (
+            "filename" in artifact
+            and (
+                _completion_text(artifact["filename"]) is None
+                or Path(str(artifact["filename"])).name
+                != artifact["filename"]
+                or artifact["filename"] in {".", ".."}
+            )
+        )
+        or any(
+            not isinstance(completion.get(name), bool)
+            for name in (
+                "uploadReplayed",
+                "inputStored",
+                "inputReplayed",
+                "previewInvalidated",
+            )
+        )
+        or completion.get("inputStored") is not True
+        or _completion_text(completion.get("uploadDisposition")) is None
+        or (
+            completion.get("storageMode") is not None
+            and _completion_text(completion.get("storageMode")) is None
+        )
+    ):
+        raise PlanningV2ConfigError(
+            "planning.artifact_recovery_completion_invalid"
+        )
+    normalized_artifact = {
+        name: artifact[name]
+        for name in sorted(artifact)
+    }
+    return {
+        "ok": True,
+        "action": "upload_artifact",
+        "threadId": thread_id,
+        "artifact": normalized_artifact,
+        "storageMode": completion.get("storageMode"),
+        "uploadDisposition": completion["uploadDisposition"],
+        "uploadReplayed": bool(completion["uploadReplayed"]),
+        "inputStored": True,
+        "inputReplayed": bool(completion["inputReplayed"]),
+        "previewInvalidated": bool(completion["previewInvalidated"]),
+    }
+
+
+def _completion_receipt(
+    *,
+    record: ArtifactRecoveryRecord,
+    completion: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": _COMPLETION_SCHEMA_VERSION,
+        "scopeDigest": _scope_digest(
+            thread_id=record.thread_id,
+            origin=record.origin,
+        ),
+        "completion": _normalize_completion(
+            completion,
+            thread_id=record.thread_id,
+        ),
+    }
 
 
 def _decode_record(
@@ -541,7 +795,20 @@ def _assert_existing_contract(
         "attachmentIdentity": record.attachment_identity,
         "ingressOrdinal": record.ingress_ordinal,
     }
-    if actual != dict(expected):
+    comparable_expected = dict(expected)
+    if (
+        actual["attachmentIdentity"]
+        and actual["attachmentIdentity"]
+        == comparable_expected.get("attachmentIdentity")
+        and actual["ingressOrdinal"]
+        == comparable_expected.get("ingressOrdinal")
+    ):
+        # Provider ingress identity owns replay. Role and position are
+        # model-facing labels that can be rephrased on a later retry; the
+        # first durable snapshot remains authoritative for those labels.
+        comparable_expected["role"] = actual["role"]
+        comparable_expected["position"] = actual["position"]
+    if actual != comparable_expected:
         raise PlanningV2ConfigError(
             "planning.artifact_recovery_contract_conflict",
             detail=(
@@ -590,6 +857,27 @@ def register_artifact_recovery(
         _fsync_directory(root.parent)
         _cleanup_acknowledged_records(root)
         final_path = _record_path(root, digest)
+        if _has_acknowledged_tombstone(root, digest):
+            if final_path.exists():
+                acknowledged_path = root / (
+                    f".acknowledged-{digest}-{os.getpid()}-"
+                    f"{secrets.token_hex(6)}"
+                )
+                try:
+                    os.rename(final_path, acknowledged_path)
+                    _fsync_directory(root)
+                except OSError as exc:
+                    raise PlanningV2ConfigError(
+                        "planning.artifact_recovery_corrupt",
+                        detail=(
+                            "A completed artifact receipt could not retire "
+                            "its remaining private byte snapshot."
+                        ),
+                    ) from exc
+                _remove_acknowledged_directory(acknowledged_path)
+            # An identical provider-event retry has already converged with
+            # Dev Hub. Never reopen the source path or recreate its byte spool.
+            return token
         if final_path.exists():
             existing = _decode_record(
                 token=token,
@@ -789,9 +1077,82 @@ def list_artifact_recoveries(
     return tuple(records)
 
 
+def load_artifact_recovery_completion(
+    token: str,
+    *,
+    current_origin: PlanningOriginPayload,
+    hermes_home: Optional[Path] = None,
+) -> Optional[dict[str, Any]]:
+    """Return a scoped, byte-free completion replay, when one is durable."""
+
+    digest = _digest_from_token(token)
+    root = _spool_root(hermes_home)
+    completion_path = (
+        _tombstone_path(root, digest) / _COMPLETION_FILENAME
+    )
+    with _store_lock:
+        if not _has_acknowledged_tombstone(root, digest):
+            return None
+        try:
+            path_stat = completion_path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise PlanningV2ConfigError(
+                "planning.artifact_recovery_corrupt"
+            ) from exc
+        if not stat.S_ISREG(path_stat.st_mode) or stat.S_ISLNK(
+            path_stat.st_mode
+        ):
+            raise PlanningV2ConfigError(
+                "planning.artifact_recovery_corrupt"
+            )
+        try:
+            receipt = json.loads(
+                completion_path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PlanningV2ConfigError(
+                "planning.artifact_recovery_corrupt"
+            ) from exc
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt)
+            != {
+                "schemaVersion",
+                "scopeDigest",
+                "completion",
+            }
+            or receipt.get("schemaVersion")
+            != _COMPLETION_SCHEMA_VERSION
+            or not isinstance(receipt.get("completion"), Mapping)
+        ):
+            raise PlanningV2ConfigError(
+                "planning.artifact_recovery_corrupt"
+            )
+        completion = _normalize_completion(
+            receipt["completion"],
+            thread_id=str(receipt["completion"].get("threadId") or ""),
+        )
+        expected_scope = _scope_digest(
+            thread_id=completion["threadId"],
+            origin=current_origin,
+        )
+        if receipt.get("scopeDigest") != expected_scope:
+            raise PlanningV2ConfigError(
+                "planning.artifact_recovery_scope_mismatch",
+                detail=(
+                    "The acknowledged artifact belongs to another "
+                    "conversation or user."
+                ),
+            )
+        return completion
+
+
 def acknowledge_artifact_recovery(
     token: str,
     *,
+    completion: Optional[Mapping[str, Any]] = None,
     hermes_home: Optional[Path] = None,
 ) -> bool:
     """Atomically retire and then remove one acknowledged local snapshot."""
@@ -802,7 +1163,41 @@ def acknowledge_artifact_recovery(
     with _store_lock:
         if not record_path.exists():
             _cleanup_acknowledged_records(root)
+            if _has_acknowledged_tombstone(root, digest):
+                if completion is not None:
+                    existing = (
+                        _tombstone_path(root, digest)
+                        / _COMPLETION_FILENAME
+                    )
+                    if not existing.exists():
+                        raise PlanningV2ConfigError(
+                            "planning.artifact_recovery_unavailable",
+                            detail=(
+                                "The acknowledged byte snapshot is already "
+                                "retired and cannot bind a new completion."
+                            ),
+                        )
+                return True
             return True
+        record = _decode_record(
+            token=token,
+            digest=digest,
+            record_path=record_path,
+            verify_snapshot=False,
+        )
+        completion_receipt = (
+            _completion_receipt(
+                record=record,
+                completion=completion,
+            )
+            if completion is not None
+            else None
+        )
+        _materialize_acknowledged_tombstone(
+            root,
+            digest,
+            completion_receipt=completion_receipt,
+        )
         acknowledged_path = root / (
             f".acknowledged-{digest}-{os.getpid()}-{secrets.token_hex(6)}"
         )
@@ -824,6 +1219,7 @@ __all__ = [
     "acknowledge_artifact_recovery",
     "list_artifact_recoveries",
     "load_artifact_recovery",
+    "load_artifact_recovery_completion",
     "load_registered_artifact_recovery",
     "register_artifact_recovery",
 ]

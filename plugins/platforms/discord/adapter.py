@@ -113,6 +113,11 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    provider_rejection_error,
+    provider_rejection_evidence,
+)
 
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker, convert_table_to_bullets
 from utils import atomic_json_write, env_float, env_int
@@ -841,6 +846,21 @@ class DiscordAdapter(BasePlatformAdapter):
 
     # Auto-disconnect from voice channel after this many seconds of inactivity
     VOICE_TIMEOUT = 300
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="discord",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="discord-logical-v1",
+        max_logical_units=900,
+        length_semantics="unicode_codepoints",
+        wire_encoding="discord-rest-message-json-v1",
+    )
+
+    async def send_semantic_exact_attempt(self, request):
+        from gateway.semantic_exact_attempt import (
+            semantic_exact_attempt_via_send,
+        )
+
+        return await semantic_exact_attempt_via_send(self, request)
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
@@ -2876,6 +2896,257 @@ class DiscordAdapter(BasePlatformAdapter):
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
 
+    async def _send_semantic_exact(
+        self,
+        target_channel_id: str,
+        content: str,
+        *,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Perform one Discord Create Message request with enforced nonce.
+
+        ``discord.py`` exposes ``nonce`` on ``Messageable.send`` but does not
+        expose Discord's ``enforce_nonce`` field.  Going through the SDK would
+        therefore lose the only provider-side duplicate guard available for
+        this bounded semantic delivery contract.  This path deliberately uses
+        one direct REST request and never retries, redirects, chunks, or falls
+        back to another target.
+        """
+
+        try:
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(
+                formatted,
+                self.MAX_MESSAGE_LENGTH,
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"semantic_delivery_format_failed: {exc}",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if not formatted.strip():
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_empty",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if len(chunks) != 1:
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_requires_multiple_writes",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+
+        token = str(self.config.token or "").strip()
+        if not token:
+            return SendResult(
+                success=False,
+                error="semantic_delivery_credential_unavailable",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+
+        from hermes_cli.semantic_delivery import provider_delivery_token
+
+        semantic_delivery_id = str(
+            (metadata or {}).get("semantic_delivery_id") or ""
+        ).strip()
+        semantic_target = str(
+            (metadata or {}).get("semantic_delivery_target")
+            or f"discord:{target_channel_id}"
+        )
+        semantic_unit = (metadata or {}).get("semantic_delivery_unit", 0)
+        payload: Dict[str, Any] = {
+            "content": chunks[0],
+            "nonce": provider_delivery_token(
+                semantic_delivery_id,
+                provider="discord",
+                target=semantic_target,
+                unit=f"{semantic_unit}:0",
+            ),
+            "enforce_nonce": True,
+        }
+        if reply_to and self._reply_to_mode != "off":
+            payload["message_reference"] = {
+                "message_id": str(reply_to),
+                "fail_if_not_exists": False,
+            }
+
+        try:
+            import aiohttp
+            from gateway.platforms.base import (
+                proxy_kwargs_for_aiohttp,
+                resolve_proxy_url,
+            )
+
+            proxy_url = resolve_proxy_url(
+                "DISCORD_PROXY",
+                target_hosts=["discord.com"],
+            )
+            session_kwargs, request_kwargs = proxy_kwargs_for_aiohttp(
+                proxy_url
+            )
+            url = (
+                "https://discord.com/api/v10/channels/"
+                f"{target_channel_id}/messages"
+            )
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+                **session_kwargs,
+            ) as session:
+                async with session.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bot {token}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    allow_redirects=False,
+                    **request_kwargs,
+                ) as response:
+                    status = int(
+                        getattr(response, "status", 0) or 0
+                    )
+                    try:
+                        data = await _standalone_read_json_limited(
+                            response,
+                            _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
+                        )
+                    except Exception as exc:
+                        if 200 <= status < 300:
+                            rejection = provider_rejection_evidence(
+                                provider="Discord",
+                                status=status,
+                                body=getattr(
+                                    exc,
+                                    "response_body",
+                                    {
+                                        "json_error_type": (
+                                            type(exc).__name__
+                                        ),
+                                        "json_error": str(exc),
+                                    },
+                                ),
+                            )
+                            return SendResult(
+                                success=False,
+                                error=provider_rejection_error(rejection),
+                                raw_response={
+                                    "provider_write_attempted": True,
+                                    "provider_retryable": False,
+                                    "provider_rejection": rejection,
+                                },
+                            )
+                        if status:
+                            retryable = status == 429 or status >= 500
+                            rejection = provider_rejection_evidence(
+                                provider="Discord",
+                                status=status,
+                                body=getattr(
+                                    exc,
+                                    "response_body",
+                                    {
+                                        "json_error_type": (
+                                            type(exc).__name__
+                                        ),
+                                        "json_error": str(exc),
+                                    },
+                                ),
+                            )
+                            return SendResult(
+                                success=False,
+                                error=provider_rejection_error(rejection),
+                                retryable=retryable,
+                                raw_response={
+                                    "provider_write_attempted": False,
+                                    "provider_retryable": retryable,
+                                    "provider_rejection": rejection,
+                                },
+                            )
+                        raise
+
+                    if 200 <= status < 300:
+                        message_id = _exact_discord_snowflake(
+                            data.get("id")
+                        )
+                        if not message_id:
+                            rejection = provider_rejection_evidence(
+                                provider="Discord",
+                                status=status,
+                                body=data,
+                            )
+                            return SendResult(
+                                success=False,
+                                error=provider_rejection_error(rejection),
+                                raw_response={
+                                    "provider_write_attempted": True,
+                                    "provider_retryable": False,
+                                    "provider_rejection": rejection,
+                                },
+                            )
+                        return SendResult(
+                            success=True,
+                            message_id=message_id,
+                            raw_response=data,
+                            continuation_message_ids=(message_id,),
+                        )
+
+                    retryable = status == 429 or status >= 500
+                    rejection = provider_rejection_evidence(
+                        provider="Discord",
+                        status=status,
+                        body=data,
+                    )
+                    retry_after = None
+                    if status == 429:
+                        retry_after_value = data.get("retry_after")
+                        if retry_after_value is None:
+                            headers = getattr(response, "headers", {}) or {}
+                            retry_after_value = headers.get("Retry-After")
+                        try:
+                            retry_after = float(
+                                retry_after_value or 0
+                            ) or None
+                        except (TypeError, ValueError):
+                            retry_after = None
+                    return SendResult(
+                        success=False,
+                        error=provider_rejection_error(rejection),
+                        retryable=retryable,
+                        retry_after=retry_after,
+                        raw_response={
+                            "provider_write_attempted": False,
+                            "provider_retryable": retryable,
+                            "provider_rejection": rejection,
+                        },
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The connection can fail after Discord accepted the POST. Omit
+            # write flags so the ledger records an ambiguous outcome.
+            return SendResult(
+                success=False,
+                error=_standalone_sanitize_error(
+                    f"Discord semantic send transport failed: {exc}"
+                ),
+                raw_response={},
+            )
+
     async def send(
         self,
         chat_id: str,
@@ -2891,8 +3162,58 @@ class DiscordAdapter(BasePlatformAdapter):
         Forum channels (type 15) reject direct messages — a thread post is
         created automatically.
         """
+        semantic_contract = str(
+            (metadata or {}).get("semantic_delivery_contract") or ""
+        ).strip()
+        semantic_delivery_id = str(
+            (metadata or {}).get("semantic_delivery_id") or ""
+        ).strip()
+        if bool(semantic_contract) != bool(semantic_delivery_id):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_identity_incomplete",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if semantic_contract:
+            from hermes_cli.semantic_delivery import (
+                SEMANTIC_DELIVERY_CONTRACT,
+            )
+
+            if semantic_contract != SEMANTIC_DELIVERY_CONTRACT:
+                return SendResult(
+                    success=False,
+                    error="semantic_delivery_contract_unsupported",
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                    },
+                )
+            if not content or not content.strip():
+                return SendResult(
+                    success=False,
+                    error="semantic_delivery_message_empty",
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                    },
+                )
         if not self._client:
-            return SendResult(success=False, error="Not connected")
+            return SendResult(
+                success=False,
+                error="Not connected",
+                retryable=bool(semantic_contract),
+                raw_response=(
+                    {
+                        "provider_write_attempted": False,
+                        "provider_retryable": True,
+                    }
+                    if semantic_contract
+                    else None
+                ),
+            )
 
         try:
             # Determine target channel: thread_id in metadata takes precedence.
@@ -2905,21 +3226,87 @@ class DiscordAdapter(BasePlatformAdapter):
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
                 channel = self._client.get_channel(int(thread_id))
-                if not channel:
+                if not channel and not semantic_contract:
                     channel = await self._client.fetch_channel(int(thread_id))
                 if not channel:
-                    return SendResult(success=False, error=f"Thread {thread_id} not found")
+                    return SendResult(
+                        success=False,
+                        error=f"Thread {thread_id} not found",
+                        retryable=bool(semantic_contract),
+                        raw_response=(
+                            {
+                                "provider_write_attempted": False,
+                                "provider_retryable": True,
+                            }
+                            if semantic_contract
+                            else None
+                        ),
+                    )
             else:
                 # Get the parent channel
                 channel = self._client.get_channel(int(chat_id))
-                if not channel:
+                if not channel and not semantic_contract:
                     channel = await self._client.fetch_channel(int(chat_id))
                 if not channel:
-                    return SendResult(success=False, error=f"Channel {chat_id} not found")
+                    return SendResult(
+                        success=False,
+                        error=f"Channel {chat_id} not found",
+                        retryable=bool(semantic_contract),
+                        raw_response=(
+                            {
+                                "provider_write_attempted": False,
+                                "provider_retryable": True,
+                            }
+                            if semantic_contract
+                            else None
+                        ),
+                    )
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
+                if semantic_delivery_id:
+                    # Discord forum creation does not document nonce enforcement
+                    # for the starter message. Never claim bounded idempotency.
+                    return SendResult(
+                        success=False,
+                        error="semantic_delivery_forum_not_idempotent",
+                        raw_response={
+                            "provider_write_attempted": False,
+                            "provider_retryable": False,
+                        },
+                    )
                 result = await self._send_to_forum(channel, content)
+                await asyncio.to_thread(
+                    self._record_discord_response,
+                    reply_to=reply_to,
+                    result=result,
+                    content=content,
+                    final=final_delivery,
+                )
+                return result
+
+            if semantic_contract:
+                # The cache lookup above already validated this as a Discord
+                # snowflake. Re-serialize the integer so no caller-controlled
+                # path syntax reaches the direct REST URL.
+                target_channel_id = str(int(thread_id or chat_id))
+                result = await self._send_semantic_exact(
+                    target_channel_id,
+                    content,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+                if result.success and result.message_id:
+                    if nonconversational:
+                        self._nonconversational_messages.mark_many(
+                            [result.message_id]
+                        )
+                    elif not _looks_like_nonconversational_history_message(
+                        content
+                    ):
+                        self._last_self_message_id[target_channel_id] = (
+                            result.message_id
+                        )
                 await asyncio.to_thread(
                     self._record_discord_response,
                     reply_to=reply_to,
@@ -2951,11 +3338,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                send_kwargs: Dict[str, Any] = {
+                    "content": chunk,
+                    "reference": chunk_reference,
+                }
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -2974,10 +3362,8 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        send_kwargs["reference"] = None
+                        msg = await channel.send(**send_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -2994,7 +3380,8 @@ class DiscordAdapter(BasePlatformAdapter):
             result = SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
-                raw_response={"message_ids": message_ids}
+                raw_response={"message_ids": message_ids},
+                continuation_message_ids=tuple(message_ids),
             )
             await asyncio.to_thread(
                 self._record_discord_response,
@@ -3007,7 +3394,39 @@ class DiscordAdapter(BasePlatformAdapter):
 
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
-            result = SendResult(success=False, error=str(e))
+            if semantic_contract:
+                try:
+                    status = int(
+                        getattr(e, "status", None)
+                        or getattr(e, "status_code", None)
+                        or 0
+                    )
+                except (TypeError, ValueError):
+                    status = 0
+                raw_response: Dict[str, Any] = {}
+                retryable = False
+                retry_after = None
+                if status == 429:
+                    raw_response = {
+                        "provider_write_attempted": False,
+                        "provider_retryable": True,
+                    }
+                    retryable = True
+                    retry_after = getattr(e, "retry_after", None)
+                elif 400 <= status < 500:
+                    raw_response = {
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                    }
+                result = SendResult(
+                    success=False,
+                    error=str(e),
+                    retryable=retryable,
+                    retry_after=retry_after,
+                    raw_response=raw_response,
+                )
+            else:
+                result = SendResult(success=False, error=str(e))
             await asyncio.to_thread(
                 self._record_discord_response,
                 reply_to=reply_to,
@@ -5539,6 +5958,19 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
         """Build a MessageEvent from a Discord slash command interaction."""
+        interaction_id = str(interaction.id)
+        interaction_created_at = getattr(interaction, "created_at", None)
+        if not isinstance(interaction_created_at, dt.datetime):
+            # Discord interaction ids are snowflakes. Recover their provider
+            # timestamp without consulting the local clock so a redelivery
+            # after process death receives the exact same TurnOrigin.
+            snowflake_ms = (
+                (int(interaction_id) >> 22) + 1420070400000
+            )
+            interaction_created_at = dt.datetime.fromtimestamp(
+                snowflake_ms / 1000,
+                tz=dt.timezone.utc,
+            )
         is_dm = isinstance(interaction.channel, discord.DMChannel)
         is_thread = isinstance(interaction.channel, discord.Thread)
         thread_id = None
@@ -5569,6 +6001,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            message_id=interaction_id,
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
@@ -5579,6 +6012,13 @@ class DiscordAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             raw_message=interaction,
+            message_id=interaction_id,
+            platform_update_id=int(interaction_id),
+            timestamp=interaction_created_at,
+            event_id=f"discord-interaction:{interaction_id}",
+            metadata={
+                "provider_source_timestamp": interaction_created_at,
+            },
             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
         )
 
@@ -5663,6 +6103,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            message_id=str(interaction.id),
         )
 
         _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
@@ -5674,6 +6115,41 @@ class DiscordAdapter(BasePlatformAdapter):
             message_type=MessageType.TEXT,
             source=source,
             raw_message=interaction,
+            message_id=str(interaction.id),
+            platform_update_id=int(interaction.id),
+            timestamp=(
+                interaction.created_at
+                if isinstance(
+                    getattr(interaction, "created_at", None),
+                    dt.datetime,
+                )
+                else dt.datetime.fromtimestamp(
+                    (
+                        (int(interaction.id) >> 22)
+                        + 1420070400000
+                    )
+                    / 1000,
+                    tz=dt.timezone.utc,
+                )
+            ),
+            event_id=f"discord-interaction:{interaction.id}",
+            metadata={
+                "provider_source_timestamp": (
+                    interaction.created_at
+                    if isinstance(
+                        getattr(interaction, "created_at", None),
+                        dt.datetime,
+                    )
+                    else dt.datetime.fromtimestamp(
+                        (
+                            (int(interaction.id) >> 22)
+                            + 1420070400000
+                        )
+                        / 1000,
+                        tz=dt.timezone.utc,
+                    )
+                )
+            },
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
         )
@@ -8891,6 +9367,18 @@ _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES = 1 * 1024 * 1024
 _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES = 8 * 1024
 
 
+def _exact_discord_snowflake(value: Any) -> str | None:
+    """Return one opaque Discord snowflake without coercion or mutation."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(character < "0" or character > "9" for character in value)
+    ):
+        return None
+    return value
+
+
 def _remember_channel_is_forum(chat_id: str, is_forum: bool) -> None:
     _DISCORD_CHANNEL_TYPE_PROBE_CACHE[str(chat_id)] = bool(is_forum)
 
@@ -8989,16 +9477,59 @@ async def _standalone_read_text_limited(resp: Any, limit_bytes: int) -> str:
     return body.decode(_standalone_response_encoding(resp), "replace")
 
 
+class _StandaloneJSONBodyError(ValueError):
+    """JSON parse failure carrying the already-bounded provider body."""
+
+    def __init__(self, message: str, response_body: Any):
+        super().__init__(message)
+        self.response_body = response_body
+
+
 async def _standalone_read_json_limited(resp: Any, limit_bytes: int) -> dict:
     body, truncated = await _standalone_read_response_bytes_limited(resp, limit_bytes)
     if body is None:
-        return await resp.json()
+        try:
+            data = await resp.json()
+        except Exception as exc:
+            try:
+                response_body = await resp.text()
+            except Exception:
+                response_body = {
+                    "json_error_type": type(exc).__name__,
+                    "json_error": str(exc),
+                }
+            raise _StandaloneJSONBodyError(
+                "Discord API response is not valid JSON",
+                response_body,
+            ) from exc
+        if not isinstance(data, dict):
+            raise _StandaloneJSONBodyError(
+                "Discord API JSON response is not an object",
+                data,
+            )
+        return data
     if truncated:
-        raise ValueError(f"Discord API JSON response exceeds {limit_bytes} bytes")
+        raise _StandaloneJSONBodyError(
+            f"Discord API JSON response exceeds {limit_bytes} bytes",
+            body,
+        )
     if not body:
         return {}
-    data = json.loads(body.decode(_standalone_response_encoding(resp), "replace"))
-    return data if isinstance(data, dict) else {}
+    try:
+        data = json.loads(
+            body.decode(_standalone_response_encoding(resp), "replace")
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise _StandaloneJSONBodyError(
+            "Discord API response is not valid JSON",
+            body,
+        ) from exc
+    if not isinstance(data, dict):
+        raise _StandaloneJSONBodyError(
+            "Discord API JSON response is not an object",
+            body,
+        )
+    return data
 
 
 async def _standalone_send(
@@ -9010,6 +9541,11 @@ async def _standalone_send(
     media_files: Optional[list] = None,
     force_document: bool = False,
     caption: Optional[str] = None,
+    delivery_contract: Optional[str] = None,
+    delivery_id: Optional[str] = None,
+    delivery_target: Optional[str] = None,
+    delivery_unit: int = 0,
+    semantic_exact_attempt: bool = False,
 ) -> Dict[str, Any]:
     """Send via Discord REST API without a live gateway adapter.
 
@@ -9031,13 +9567,67 @@ async def _standalone_send(
     try:
         import aiohttp
     except ImportError:
-        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+        return {
+            "error": "aiohttp not installed. Run: pip install aiohttp",
+            "provider_write_attempted": False,
+            "provider_retryable": True,
+        }
 
     token = (getattr(pconfig, "token", None) or os.getenv("DISCORD_BOT_TOKEN", "")).strip()
     if not token:
-        return {"error": "Discord standalone send: DISCORD_BOT_TOKEN is not set"}
+        return {
+            "error": (
+                "Discord standalone send: DISCORD_BOT_TOKEN is not set"
+            ),
+            "provider_write_attempted": False,
+            "provider_retryable": True,
+        }
 
     try:
+        delivery_contract = str(delivery_contract or "").strip()
+        delivery_id = str(delivery_id or "").strip()
+        if bool(delivery_contract) != bool(delivery_id):
+            return {
+                "error": "semantic_delivery_identity_incomplete",
+                "provider_write_attempted": False,
+                "provider_retryable": False,
+            }
+        if delivery_contract:
+            from hermes_cli.semantic_delivery import (
+                SEMANTIC_DELIVERY_CONTRACT,
+                provider_delivery_token,
+            )
+
+            if (
+                delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+                or not semantic_exact_attempt
+            ):
+                return {
+                    "error": "semantic_delivery_contract_unsupported",
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                }
+            if media_files:
+                return {
+                    "error": "semantic_delivery_media_shape_unsupported",
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                }
+
+            semantic_target = str(
+                delivery_target or f"discord:{thread_id or chat_id}"
+            )
+
+            def _semantic_nonce(part: str) -> str:
+                return provider_delivery_token(
+                    delivery_id,
+                    provider="discord",
+                    target=semantic_target,
+                    unit=f"{delivery_unit}:{part}",
+                )
+        else:
+            _semantic_nonce = None
+
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
         _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
@@ -9045,6 +9635,7 @@ async def _standalone_send(
         json_headers = {**auth_headers, "Content-Type": "application/json"}
         media_files = media_files or []
         last_data = None
+        message_ids: list[str] = []
         warnings = []
 
         # Thread endpoint: Discord threads are channels; send directly to the thread ID.
@@ -9087,6 +9678,12 @@ async def _standalone_send(
                         logger.debug("Failed to probe channel type for %s", chat_id, exc_info=True)
 
             if is_forum:
+                if delivery_id:
+                    return {
+                        "error": "semantic_delivery_forum_not_idempotent",
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                    }
                 thread_name = _derive_forum_thread_name(message)
                 thread_url = f"https://discord.com/api/v10/channels/{chat_id}/threads"
 
@@ -9168,6 +9765,7 @@ async def _standalone_send(
                     "chat_id": chat_id,
                     "thread_id": thread_id_created,
                     "message_id": starter_msg_id,
+                    "message_ids": [starter_msg_id] if starter_msg_id else [],
                 }
                 if warnings:
                     result["warnings"] = warnings
@@ -9178,17 +9776,85 @@ async def _standalone_send(
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             # Send text message (skip if empty and media is present)
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
+                message_payload = {"content": message}
+                if _semantic_nonce is not None:
+                    message_payload.update(
+                        {
+                            "nonce": _semantic_nonce("text"),
+                            "enforce_nonce": True,
+                        }
+                    )
+                async with session.post(
+                    url,
+                    headers=json_headers,
+                    json=message_payload,
+                    **_req_kw,
+                ) as resp:
                     if resp.status not in {200, 201}:
                         body = await _standalone_read_text_limited(
                             resp,
                             _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
                         )
-                        return {"error": f"Discord API error ({resp.status}): {body}"}
-                    last_data = await _standalone_read_json_limited(
-                        resp,
-                        _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
-                    )
+                        if delivery_contract:
+                            rejection = provider_rejection_evidence(
+                                provider="Discord",
+                                status=int(resp.status),
+                                body=body,
+                            )
+                            retryable = (
+                                resp.status in {408, 429}
+                                or resp.status >= 500
+                            )
+                            return {
+                                "error": provider_rejection_error(rejection),
+                                "provider_write_attempted": False,
+                                "provider_retryable": retryable,
+                                "provider_rejection": rejection,
+                            }
+                        return {
+                            "error": (
+                                f"Discord API error ({resp.status}): {body}"
+                            ),
+                            "provider_write_attempted": True,
+                        }
+                    try:
+                        last_data = await _standalone_read_json_limited(
+                            resp,
+                            _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
+                        )
+                    except _StandaloneJSONBodyError as exc:
+                        if not delivery_contract:
+                            raise
+                        rejection = provider_rejection_evidence(
+                            provider="Discord",
+                            status=int(resp.status),
+                            body=exc.response_body,
+                        )
+                        return {
+                            "error": provider_rejection_error(rejection),
+                            "provider_write_attempted": True,
+                            "provider_retryable": False,
+                            "provider_rejection": rejection,
+                        }
+                    if delivery_contract:
+                        message_id = _exact_discord_snowflake(
+                            last_data.get("id")
+                        )
+                        if message_id is None:
+                            rejection = provider_rejection_evidence(
+                                provider="Discord",
+                                status=int(resp.status),
+                                body=last_data,
+                            )
+                            return {
+                                "error": provider_rejection_error(rejection),
+                                "provider_write_attempted": True,
+                                "provider_retryable": False,
+                                "provider_rejection": rejection,
+                            }
+                        message_ids.append(message_id)
+                    elif last_data.get("id"):
+                        message_ids.append(str(last_data["id"]))
 
             # Send each media file as a separate multipart upload. When a
             # MEDIA:<path> caption was supplied, ride it as the message content
@@ -9197,7 +9863,7 @@ async def _standalone_send(
             # still needs delivering, so a missing file falls back to a plain
             # message rather than silently dropping the text.
             caption_pending = bool(caption)
-            for media_path, _is_voice in media_files:
+            for media_index, (media_path, _is_voice) in enumerate(media_files):
                 if not os.path.exists(media_path):
                     warning = f"Media file not found, skipping: {media_path}"
                     logger.warning(warning)
@@ -9206,12 +9872,29 @@ async def _standalone_send(
                         try:
                             async with session.post(
                                 url, headers=json_headers,
-                                json={"content": caption}, **_req_kw,
+                                json={
+                                    "content": caption,
+                                    **(
+                                        {
+                                            "nonce": _semantic_nonce(
+                                                f"caption:{media_index}"
+                                            ),
+                                            "enforce_nonce": True,
+                                        }
+                                        if _semantic_nonce is not None
+                                        else {}
+                                    ),
+                                },
+                                **_req_kw,
                             ) as resp:
                                 if resp.status in {200, 201}:
                                     last_data = await _standalone_read_json_limited(
                                         resp, _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
                                     )
+                                    if last_data.get("id"):
+                                        message_ids.append(
+                                            str(last_data["id"])
+                                        )
                                     caption_pending = False
                         except Exception:
                             logger.warning("Discord caption-fallback send failed for missing media")
@@ -9219,13 +9902,25 @@ async def _standalone_send(
                 try:
                     form = aiohttp.FormData()
                     filename = os.path.basename(media_path)
+                    multipart_payload: Dict[str, Any] = {}
                     if caption_pending:
+                        multipart_payload["content"] = caption
+                        caption_pending = False
+                    if _semantic_nonce is not None:
+                        multipart_payload.update(
+                            {
+                                "nonce": _semantic_nonce(
+                                    f"media:{media_index}"
+                                ),
+                                "enforce_nonce": True,
+                            }
+                        )
+                    if multipart_payload:
                         form.add_field(
                             "payload_json",
-                            json.dumps({"content": caption}),
+                            json.dumps(multipart_payload),
                             content_type="application/json",
                         )
-                        caption_pending = False
                     with open(media_path, "rb") as f:
                         form.add_field("files[0]", f, filename=filename)
                         async with session.post(url, headers=auth_headers, data=form, **_req_kw) as resp:
@@ -9242,6 +9937,8 @@ async def _standalone_send(
                                 resp,
                                 _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
                             )
+                            if last_data.get("id"):
+                                message_ids.append(str(last_data["id"]))
                 except Exception as e:
                     warning = _standalone_sanitize_error(f"Failed to send media {media_path}: {e}")
                     logger.error(warning)
@@ -9253,12 +9950,23 @@ async def _standalone_send(
                 return {"error": error, "warnings": warnings}
             return {"error": error}
 
-        result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id")}
+        result = {
+            "success": True,
+            "platform": "discord",
+            "chat_id": chat_id,
+            "message_id": last_data.get("id"),
+            "message_ids": message_ids,
+        }
         if warnings:
             result["warnings"] = warnings
         return result
     except Exception as e:
-        return {"error": _standalone_sanitize_error(f"Discord send failed: {e}")}
+        return {
+            "error": _standalone_sanitize_error(
+                f"Discord send failed: {e}"
+            ),
+            "provider_write_attempted": None,
+        }
 
 
 # ── Plugin entry point ────────────────────────────────────────────────────────
@@ -9556,6 +10264,9 @@ def register(ctx) -> None:
         # hook, ``deliver=discord`` cron jobs fail with "No live adapter"
         # when cron runs separately from the gateway.  Mirrors Teams pattern.
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=True,
+        standalone_semantic_exact_attempt_fn=_standalone_send,
+        live_semantic_exact_attempt=True,
         # Discord hard limit per message
         max_message_length=2000,
         # Display

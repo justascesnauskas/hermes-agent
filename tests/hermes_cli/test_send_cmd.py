@@ -399,3 +399,388 @@ def test_load_hermes_env_handles_missing_files(tmp_path, monkeypatch):
 
     # Should not raise.
     send_cmd._load_hermes_env()
+
+
+def test_semantic_send_and_status_are_exact_account_scoped(
+    fake_tool,
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from hermes_cli.semantic_delivery import (
+        SEMANTIC_DELIVERY_CONTRACT,
+        semantic_delivery_scope_id,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    monkeypatch.setattr(
+        send_cmd,
+        "_delivery_account_is_configured",
+        lambda provider, account: (
+            provider,
+            account,
+        ) == ("slack", "slack-primary"),
+    )
+    scope_id = semantic_delivery_scope_id()
+    send_args = _parse(
+        [
+            "--to",
+            "slack:C123",
+            "--json",
+            "--delivery-contract",
+            SEMANTIC_DELIVERY_CONTRACT,
+            "--delivery-id",
+            "delivery-cli-exact",
+            "--delivery-scope-id",
+            scope_id,
+            "--gateway-account-id",
+            "slack-primary",
+            "one exact message",
+        ]
+    )
+    with pytest.raises(SystemExit) as send_exit:
+        send_cmd.cmd_send(send_args)
+    assert send_exit.value.code == 0
+    send_payload = json.loads(capsys.readouterr().out)
+    assert send_payload["gateway_account_id"] == "slack-primary"
+    assert send_payload["delivery_scope_id"] == scope_id
+    assert len(fake_tool.calls) == 1
+
+    status_args = _parse(
+        [
+            "--json",
+            "--delivery-status",
+            "--delivery-contract",
+            SEMANTIC_DELIVERY_CONTRACT,
+            "--delivery-id",
+            "delivery-cli-exact",
+            "--delivery-scope-id",
+            scope_id,
+            "--delivery-provider",
+            "slack",
+            "--gateway-account-id",
+            "slack-primary",
+        ]
+    )
+    with pytest.raises(SystemExit) as status_exit:
+        send_cmd.cmd_send(status_args)
+    assert status_exit.value.code == 0
+    status_payload = json.loads(capsys.readouterr().out)
+    assert status_payload["outcome"] == "delivered"
+    assert status_payload["gateway_account_id"] == "slack-primary"
+    assert len(fake_tool.calls) == 1
+
+
+def test_semantic_authority_change_is_typed_before_provider(
+    fake_tool,
+    monkeypatch,
+    capsys,
+):
+    from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+    monkeypatch.setattr(
+        send_cmd,
+        "_delivery_account_is_configured",
+        lambda _provider, _account: False,
+    )
+    args = _parse(
+        [
+            "--to",
+            "slack:C123",
+            "--json",
+            "--delivery-contract",
+            SEMANTIC_DELIVERY_CONTRACT,
+            "--delivery-id",
+            "delivery-cli-authority",
+            "--delivery-scope-id",
+            "scope_" + ("a" * 48),
+            "--gateway-account-id",
+            "slack-missing",
+            "one exact message",
+        ]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "delivery_contract": SEMANTIC_DELIVERY_CONTRACT,
+        "delivery_id": "delivery-cli-authority",
+        "delivery_scope_id": "scope_" + ("a" * 48),
+        "error": "semantic_delivery_authority_changed",
+        "gateway_account_id": "slack-missing",
+        "outcome": "retryable",
+        "provider": "slack",
+        "provider_write_attempted": False,
+        "provider_write_started": False,
+        "replay_strategy": "none",
+        "replayed": False,
+        "target": "slack:C123",
+    }
+    assert fake_tool.calls == []
+
+
+def test_semantic_scope_change_echoes_requested_and_current_scope(
+    fake_tool,
+    monkeypatch,
+    capsys,
+):
+    from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+    monkeypatch.setattr(
+        send_cmd,
+        "_delivery_account_is_configured",
+        lambda _provider, _account: True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.semantic_delivery.semantic_delivery_scope_id",
+        lambda: "scope_" + ("b" * 48),
+    )
+    args = _parse(
+        [
+            "--to",
+            "slack:C123",
+            "--json",
+            "--delivery-contract",
+            SEMANTIC_DELIVERY_CONTRACT,
+            "--delivery-id",
+            "delivery-cli-stale-scope",
+            "--delivery-scope-id",
+            "scope_" + ("a" * 48),
+            "--gateway-account-id",
+            "slack-primary",
+            "one exact message",
+        ]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["outcome"] == "retryable"
+    assert payload["error"] == "semantic_delivery_authority_changed"
+    assert payload["delivery_scope_id"] == "scope_" + ("a" * 48)
+    assert payload["current_delivery_scope_id"] == "scope_" + ("b" * 48)
+    assert fake_tool.calls == []
+
+
+def test_delivery_status_requires_explicit_provider(
+    monkeypatch,
+    capsys,
+):
+    from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    args = _parse(
+        [
+            "--delivery-status",
+            "--delivery-contract",
+            SEMANTIC_DELIVERY_CONTRACT,
+            "--delivery-id",
+            "delivery-status-no-provider",
+            "--delivery-scope-id",
+            "scope_" + ("a" * 48),
+            "--gateway-account-id",
+            "slack-primary",
+        ]
+    )
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 2
+    assert "--delivery-provider" in capsys.readouterr().err
+
+
+def test_delivery_provider_is_rejected_outside_status(
+    fake_tool,
+    capsys,
+):
+    args = _parse(
+        [
+            "--to",
+            "slack:C123",
+            "--delivery-provider",
+            "slack",
+            "one exact message",
+        ]
+    )
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 2
+    assert "--delivery-status" in capsys.readouterr().err
+    assert fake_tool.calls == []
+
+
+def test_in_flight_result_is_never_translated_to_success(capsys):
+    exit_code = send_cmd._emit_result(
+        json.dumps(
+            {
+                "delivery_contract": "hermes-semantic-delivery/1",
+                "delivery_id": "delivery-in-flight",
+                "error": "semantic_delivery_in_flight",
+                "gateway_account_id": "slack-primary",
+                "outcome": "in_flight",
+            }
+        ),
+        json_mode=True,
+        quiet=False,
+    )
+
+    assert exit_code == 1
+    assert json.loads(capsys.readouterr().out)["outcome"] == "in_flight"
+
+
+def test_list_rejects_delivery_provider_before_short_circuit(
+    monkeypatch,
+    capsys,
+):
+    called: list[str] = []
+    monkeypatch.setattr(
+        send_cmd,
+        "_list_targets",
+        lambda *_args, **_kwargs: called.append("listed") or 0,
+    )
+    args = _parse(["--list", "--delivery-provider", "slack"])
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 2
+    assert "semantic delivery" in capsys.readouterr().err
+    assert called == []
+
+
+def test_delivery_identity_transport_bounds_are_exact():
+    assert send_cmd._DELIVERY_PROVIDER.fullmatch("a" * 120)
+    assert send_cmd._DELIVERY_PROVIDER.fullmatch("a" * 121) is None
+    assert send_cmd._valid_gateway_account_id("a" * 500)
+    assert not send_cmd._valid_gateway_account_id("a" * 501)
+
+
+def test_delivery_registry_omits_enabled_incapable_provider(
+    monkeypatch,
+):
+    from gateway.config import Platform
+
+    class UnknownPlatform:
+        value = "unknown-transport"
+
+    config = type(
+        "Config",
+        (),
+        {
+            "platforms": {
+                Platform.SIGNAL: type(
+                    "PlatformConfig",
+                    (),
+                    {
+                        "enabled": True,
+                        "extra": {
+                            "gateway_account_id": "signal-primary",
+                        },
+                    },
+                )(),
+                UnknownPlatform(): type(
+                    "PlatformConfig",
+                    (),
+                    {
+                        "enabled": True,
+                        "extra": {
+                            "gateway_account_id": "unsupported-primary",
+                        },
+                    },
+                )(),
+            }
+        },
+    )()
+    monkeypatch.setattr(
+        "gateway.config.load_gateway_config",
+        lambda: config,
+    )
+
+    assert send_cmd._configured_delivery_accounts() == [
+        ("signal", "signal-primary"),
+    ]
+
+
+def test_delivery_scopes_rejects_list_mode(capsys):
+    args = _parse(["--list", "--delivery-scopes"])
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 2
+    assert "another send mode" in capsys.readouterr().err
+
+
+def test_parallel_registry_results_are_sorted_deterministically(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+    monkeypatch.setattr(
+        send_cmd,
+        "_semantic_registry_profiles",
+        lambda _root_home: ["writer", "default"],
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root",
+        lambda: tmp_path,
+    )
+
+    def child(profile, root_home):
+        assert root_home == tmp_path
+        account = f"{profile}-account"
+        scope_character = "a" if profile == "default" else "b"
+        return profile, {
+            "delivery_contract": SEMANTIC_DELIVERY_CONTRACT,
+            "accounts": [
+                {
+                    "profile": profile,
+                    "provider": "slack",
+                    "gateway_account_id": account,
+                    "delivery_scope_id": (
+                        "scope_" + (scope_character * 48)
+                    ),
+                }
+            ],
+        }
+
+    monkeypatch.setattr(send_cmd, "_registry_profile_child", child)
+
+    payload = send_cmd._all_delivery_scope_registry()
+
+    assert [
+        row["profile"] for row in payload["accounts"]
+    ] == ["default", "writer"]
+
+
+def test_parallel_registry_child_failure_rejects_whole_discovery(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        send_cmd,
+        "_semantic_registry_profiles",
+        lambda _root_home: ["default", "broken"],
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root",
+        lambda: tmp_path,
+    )
+
+    def child(profile, _root_home):
+        if profile == "broken":
+            raise RuntimeError("child failed")
+        return profile, {
+            "delivery_contract": "hermes-semantic-delivery/1",
+            "accounts": [],
+        }
+
+    monkeypatch.setattr(send_cmd, "_registry_profile_child", child)
+
+    with pytest.raises(RuntimeError, match="child failed"):
+        send_cmd._all_delivery_scope_registry()

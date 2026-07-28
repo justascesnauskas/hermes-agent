@@ -10,6 +10,8 @@ Uses slack-bolt (Python) with Socket Mode for:
 
 import asyncio
 import contextvars
+from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
@@ -38,6 +40,11 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from agent.secret_scope import UnscopedSecretError, get_secret
 from gateway.config import Platform, PlatformConfig
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    provider_rejection_error,
+    provider_rejection_evidence,
+)
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -73,6 +80,36 @@ _slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "_slash_user_id",
     default=None,
 )
+
+
+def _slash_command_origin_identity(
+    command: dict,
+) -> tuple[str, None]:
+    """Return a stable, non-secret Slack interaction id.
+
+    Slash payloads do not contain an authoritative provider timestamp.  The
+    stable trigger/response identity is sufficient; fabricating a clock from a
+    digest would misrepresent provenance.
+    """
+
+    seed = str(
+        command.get("trigger_id")
+        or command.get("response_url")
+        or json.dumps(
+            {
+                "api_app_id": command.get("api_app_id"),
+                "channel_id": command.get("channel_id"),
+                "command": command.get("command"),
+                "team_id": command.get("team_id"),
+                "text": command.get("text"),
+                "user_id": command.get("user_id"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return f"slack-interaction:{digest}", None
 
 
 @dataclass
@@ -430,6 +467,21 @@ class SlackAdapter(BasePlatformAdapter):
     # "!" to "/" for known commands (see _handle_slack_message), so "!" is
     # the prefix that works everywhere — instruction text must show it.
     typed_command_prefix = "!"
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="slack",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="slack-logical-v1",
+        max_logical_units=16_000,
+        length_semantics="unicode_codepoints",
+        wire_encoding="slack-mrkdwn-blocks-v1",
+    )
+
+    async def send_semantic_exact_attempt(self, request):
+        from gateway.semantic_exact_attempt import (
+            semantic_exact_attempt_via_send,
+        )
+
+        return await semantic_exact_attempt_via_send(self, request)
 
     # Slack has both halves the ``in_channel`` continuable-cron surface needs:
     # a flat-reply outbound gate (``reply_in_thread: false`` → ``_resolve_thread_ts``
@@ -1399,6 +1451,233 @@ class SlackAdapter(BasePlatformAdapter):
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
 
+    async def _send_semantic_exact(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Perform one direct Slack Web API write with no SDK retry surface."""
+
+        from hermes_cli.semantic_delivery import exact_provider_message_id
+
+        try:
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(
+                formatted,
+                self.MAX_MESSAGE_LENGTH,
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"semantic_delivery_format_failed: {exc}",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if not formatted.strip():
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_empty",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if len(chunks) != 1:
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_requires_multiple_writes",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+
+        team_id = self._metadata_team_id(metadata)
+        client = self._get_client(chat_id, team_id=team_id)
+        token = str(
+            getattr(client, "token", None)
+            or self.config.token
+            or ""
+        ).strip()
+        if not token:
+            return SendResult(
+                success=False,
+                error="semantic_delivery_credential_unavailable",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+
+        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        payload: Dict[str, Any] = {
+            "channel": chat_id,
+            "text": chunks[0],
+            "mrkdwn": True,
+        }
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
+
+        try:
+            from gateway.platforms.base import proxy_kwargs_for_aiohttp
+
+            client_proxy = getattr(client, "proxy", None)
+            adapter_proxy = getattr(self, "_proxy_url", None)
+            proxy_url = (
+                client_proxy.strip()
+                if isinstance(client_proxy, str)
+                and client_proxy.strip()
+                else (
+                    adapter_proxy.strip()
+                    if isinstance(adapter_proxy, str)
+                    and adapter_proxy.strip()
+                    else None
+                )
+            )
+            session_kwargs, request_kwargs = proxy_kwargs_for_aiohttp(
+                proxy_url
+            )
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+                **session_kwargs,
+            ) as session:
+                async with session.post(
+                    "https://slack.com/api/chat.postMessage",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    **request_kwargs,
+                ) as response:
+                    status = int(
+                        getattr(response, "status", 0) or 0
+                    )
+                    try:
+                        data = await response.json()
+                    except Exception as exc:
+                        try:
+                            response_body = await response.text()
+                        except Exception:
+                            response_body = {
+                                "json_error_type": type(exc).__name__,
+                                "json_error": str(exc),
+                            }
+                        rejection = provider_rejection_evidence(
+                            provider="Slack",
+                            status=status,
+                            body=response_body,
+                        )
+                        if 200 <= status < 300:
+                            return SendResult(
+                                success=False,
+                                error=provider_rejection_error(rejection),
+                                raw_response={
+                                    "provider_write_attempted": True,
+                                    "provider_retryable": False,
+                                    "provider_rejection": rejection,
+                                },
+                            )
+                        retryable = status == 429 or status >= 500
+                        return SendResult(
+                            success=False,
+                            error=provider_rejection_error(rejection),
+                            retryable=retryable,
+                            raw_response={
+                                "provider_write_attempted": False,
+                                "provider_retryable": retryable,
+                                "provider_rejection": rejection,
+                            },
+                    )
+                    if isinstance(data, dict) and data.get("ok"):
+                        message_id = exact_provider_message_id(
+                            data.get("ts")
+                        )
+                        if not message_id:
+                            rejection = provider_rejection_evidence(
+                                provider="Slack",
+                                status=status,
+                                body=data,
+                            )
+                            return SendResult(
+                                success=False,
+                                error=provider_rejection_error(rejection),
+                                raw_response={
+                                    "provider_write_attempted": True,
+                                    "provider_retryable": False,
+                                    "provider_rejection": rejection,
+                                },
+                            )
+                        self._bot_message_ts.add(message_id)
+                        if thread_ts:
+                            self._bot_message_ts.add(thread_ts)
+                        return SendResult(
+                            success=True,
+                            message_id=message_id,
+                            raw_response=data,
+                        )
+                    if not isinstance(data, dict):
+                        rejection = provider_rejection_evidence(
+                            provider="Slack",
+                            status=status,
+                            body=data,
+                        )
+                        return SendResult(
+                            success=False,
+                            error=provider_rejection_error(rejection),
+                            raw_response={
+                                "provider_rejection": rejection,
+                            },
+                        )
+                    rejection = provider_rejection_evidence(
+                        provider="Slack",
+                        status=status,
+                        body=data,
+                    )
+                    error_code = str(
+                        data.get("error") or "unknown"
+                    )
+                    retryable = _standalone_post_rejection_retryable(
+                        error_code,
+                        status,
+                    )
+                    retry_after = None
+                    if status == 429:
+                        headers = getattr(response, "headers", {}) or {}
+                        try:
+                            retry_after = float(
+                                headers.get("Retry-After", 0) or 0
+                            ) or None
+                        except (TypeError, ValueError):
+                            retry_after = None
+                    return SendResult(
+                        success=False,
+                        error=provider_rejection_error(rejection),
+                        retryable=retryable,
+                        retry_after=retry_after,
+                        raw_response={
+                            "provider_write_attempted": False,
+                            "provider_retryable": retryable,
+                            "provider_rejection": rejection,
+                        },
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The connection can fail after Slack accepted the POST. No
+            # attempted/retryability flags means the ledger records ambiguity.
+            return SendResult(
+                success=False,
+                error=f"Slack send failed: {exc}",
+                raw_response={},
+            )
+
     async def send(
         self,
         chat_id: str,
@@ -1407,8 +1686,56 @@ class SlackAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a message to a Slack channel or DM."""
+        semantic_contract = str(
+            (metadata or {}).get("semantic_delivery_contract") or ""
+        ).strip()
+        semantic_delivery_id = str(
+            (metadata or {}).get("semantic_delivery_id") or ""
+        ).strip()
+        if bool(semantic_contract) != bool(semantic_delivery_id):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_identity_incomplete",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if semantic_contract:
+            from hermes_cli.semantic_delivery import (
+                SEMANTIC_DELIVERY_CONTRACT,
+            )
+
+            if semantic_contract != SEMANTIC_DELIVERY_CONTRACT:
+                return SendResult(
+                    success=False,
+                    error="semantic_delivery_contract_unsupported",
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                    },
+                )
         if not self._app:
-            return SendResult(success=False, error="Not connected")
+            return SendResult(
+                success=False,
+                error="Not connected",
+                retryable=bool(semantic_contract),
+                raw_response=(
+                    {
+                        "provider_write_attempted": False,
+                        "provider_retryable": True,
+                    }
+                    if semantic_contract
+                    else None
+                ),
+            )
+        if semantic_contract:
+            return await self._send_semantic_exact(
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
 
         thread_ts = None
         try:
@@ -3751,12 +4078,21 @@ class SlackAdapter(BasePlatformAdapter):
             except Exception:  # pragma: no cover - defensive
                 reply_to_text = None
 
+        try:
+            provider_timestamp = datetime.fromtimestamp(
+                float(ts),
+                tz=timezone.utc,
+            )
+        except (TypeError, ValueError, OSError, OverflowError):
+            provider_timestamp = None
+
         msg_event = MessageEvent(
             text=text,
             message_type=msg_type,
             source=source,
             raw_message=event,
             message_id=ts,
+            timestamp=provider_timestamp,
             media_urls=media_urls,
             media_types=media_types,
             reply_to_message_id=thread_ts if thread_ts != ts else None,
@@ -3767,6 +4103,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
+                "provider_source_timestamp": provider_timestamp,
             },
         )
 
@@ -4529,6 +4866,9 @@ class SlackAdapter(BasePlatformAdapter):
         user_id = command.get("user_id", "")
         channel_id = command.get("channel_id", "")
         team_id = command.get("team_id", "")
+        interaction_id, interaction_timestamp = (
+            _slash_command_origin_identity(command)
+        )
 
         # Track which workspace owns this channel
         if team_id and channel_id:
@@ -4572,6 +4912,7 @@ class SlackAdapter(BasePlatformAdapter):
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
             scope_id=team_id or None,
+            message_id=interaction_id,
         )
 
         event = MessageEvent(
@@ -4581,6 +4922,9 @@ class SlackAdapter(BasePlatformAdapter):
             ),
             source=source,
             raw_message=command,
+            message_id=interaction_id,
+            timestamp=interaction_timestamp or datetime.now(timezone.utc),
+            event_id=interaction_id,
         )
 
         # Stash the Slack response_url so the first reply for this
@@ -4911,6 +5255,104 @@ class SlackAdapter(BasePlatformAdapter):
 # ──────────────────────────────────────────────────────────────────────────
 
 
+_SLACK_RETRYABLE_POST_ERRORS = frozenset(
+    {
+        "fatal_error",
+        "internal_error",
+        "ratelimited",
+        "request_timeout",
+        "service_unavailable",
+        "temporarily_unavailable",
+    }
+)
+_SLACK_STANDALONE_RESPONSE_LIMIT_BYTES = 64 * 1024
+
+
+class _SlackStandaloneResponseError(ValueError):
+    """Malformed provider response with a bounded evidence body."""
+
+    def __init__(self, message: str, response_body: Any):
+        super().__init__(message)
+        self.response_body = response_body
+
+
+async def _read_slack_standalone_json(resp: Any) -> tuple[dict, Any]:
+    """Read one bounded Slack JSON object and retain its evidence source."""
+
+    content = getattr(resp, "content", None)
+    iter_chunked = getattr(content, "iter_chunked", None)
+    raw_body: bytes | None = None
+    if callable(iter_chunked):
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in iter_chunked(8192):
+            if not isinstance(chunk, (bytes, bytearray)):
+                raise _SlackStandaloneResponseError(
+                    "Slack response stream yielded non-bytes",
+                    {"chunk_type": type(chunk).__name__},
+                )
+            total += len(chunk)
+            chunks.append(bytes(chunk))
+            if total > _SLACK_STANDALONE_RESPONSE_LIMIT_BYTES:
+                close = getattr(resp, "close", None)
+                if callable(close):
+                    close()
+                raise _SlackStandaloneResponseError(
+                    "Slack response exceeds bounded JSON limit",
+                    b"".join(chunks)[
+                        :_SLACK_STANDALONE_RESPONSE_LIMIT_BYTES
+                    ],
+                )
+        raw_body = b"".join(chunks)
+
+    if raw_body is None:
+        try:
+            data = await resp.json()
+        except Exception as exc:
+            try:
+                response_body = await resp.text()
+            except Exception:
+                response_body = {
+                    "json_error_type": type(exc).__name__,
+                    "json_error": str(exc),
+                }
+            raise _SlackStandaloneResponseError(
+                "Slack response is not valid JSON",
+                response_body,
+            ) from exc
+        if not isinstance(data, dict):
+            raise _SlackStandaloneResponseError(
+                "Slack JSON response is not an object",
+                data,
+            )
+        return data, data
+
+    try:
+        data = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise _SlackStandaloneResponseError(
+            "Slack response is not valid UTF-8 JSON",
+            raw_body,
+        ) from exc
+    if not isinstance(data, dict):
+        raise _SlackStandaloneResponseError(
+            "Slack JSON response is not an object",
+            raw_body,
+        )
+    return data, raw_body
+
+
+def _standalone_post_rejection_retryable(
+    error_code: str,
+    status: int,
+) -> bool:
+    return (
+        status == 429
+        or status >= 500
+        or error_code.strip().lower() in _SLACK_RETRYABLE_POST_ERRORS
+    )
+
+
 async def _standalone_send(
     pconfig,
     chat_id,
@@ -4919,6 +5361,11 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    delivery_contract=None,
+    delivery_id=None,
+    delivery_target=None,
+    delivery_unit=0,
+    semantic_exact_attempt=False,
 ):
     """Out-of-process Slack delivery via the Web API ``chat.postMessage``.
 
@@ -4931,9 +5378,43 @@ async def _standalone_send(
     throwaway ``SlackAdapter`` instance's ``format_message`` — so cron-delivered
     Slack messages render identically to gateway-delivered ones.
     """
+    delivery_contract = str(delivery_contract or "").strip()
+    delivery_id = str(delivery_id or "").strip()
+    if bool(delivery_contract) != bool(delivery_id):
+        return {
+            "error": "semantic_delivery_identity_incomplete",
+            "provider_write_attempted": False,
+            "provider_retryable": False,
+        }
+    if delivery_contract:
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+            exact_provider_message_id,
+        )
+
+        if (
+            delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or not semantic_exact_attempt
+        ):
+            return {
+                "error": "semantic_delivery_contract_unsupported",
+                "provider_write_attempted": False,
+                "provider_retryable": False,
+            }
+        if media_files:
+            return {
+                "error": "semantic_delivery_media_shape_unsupported",
+                "provider_write_attempted": False,
+                "provider_retryable": False,
+            }
+
     token = getattr(pconfig, "token", None) or os.getenv("SLACK_BOT_TOKEN", "")
     if not token:
-        return {"error": "Slack send failed: SLACK_BOT_TOKEN not configured"}
+        return {
+            "error": "Slack send failed: SLACK_BOT_TOKEN not configured",
+            "provider_write_attempted": False,
+            "provider_retryable": True,
+        }
 
     formatted = message
     if message:
@@ -4949,7 +5430,11 @@ async def _standalone_send(
     try:
         import aiohttp
     except ImportError:
-        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+        return {
+            "error": "aiohttp not installed. Run: pip install aiohttp",
+            "provider_write_attempted": False,
+            "provider_retryable": True,
+        }
 
     try:
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
@@ -4970,17 +5455,81 @@ async def _standalone_send(
             async with session.post(
                 url, headers=headers, json=payload, **_req_kw
             ) as resp:
-                data = await resp.json()
-                if data.get("ok"):
+                status = int(getattr(resp, "status", 0) or 0)
+                try:
+                    data, response_body = await _read_slack_standalone_json(
+                        resp
+                    )
+                except _SlackStandaloneResponseError as exc:
+                    rejection = provider_rejection_evidence(
+                        provider="Slack",
+                        status=status,
+                        body=exc.response_body,
+                    )
+                    retryable = status == 429 or status >= 500
+                    return {
+                        "error": provider_rejection_error(rejection),
+                        **(
+                            {
+                                "provider_write_attempted": True,
+                                "provider_retryable": False,
+                            }
+                            if 200 <= status < 300
+                            else {
+                                "provider_write_attempted": False,
+                                "provider_retryable": retryable,
+                            }
+                        ),
+                        "provider_rejection": rejection,
+                    }
+                if data.get("ok") is True:
+                    message_id = data.get("ts")
+                    if delivery_contract:
+                        message_id = exact_provider_message_id(message_id)
+                        if message_id is None:
+                            rejection = provider_rejection_evidence(
+                                provider="Slack",
+                                status=status,
+                                body=response_body,
+                            )
+                            return {
+                                "error": provider_rejection_error(rejection),
+                                "provider_write_attempted": True,
+                                "provider_retryable": False,
+                                "provider_rejection": rejection,
+                            }
                     return {
                         "success": True,
                         "platform": "slack",
                         "chat_id": chat_id,
-                        "message_id": data.get("ts"),
+                        "message_id": message_id,
                     }
-                return {"error": f"Slack API error: {data.get('error', 'unknown')}"}
+                rejection = provider_rejection_evidence(
+                    provider="Slack",
+                    status=status,
+                    body=response_body,
+                )
+                error_code = str(data.get("error") or "unknown")
+                return {
+                    "error": provider_rejection_error(rejection),
+                    # Slack's authoritative ``ok:false`` response proves this
+                    # request produced no message receipt. Only a transport
+                    # exception after POST remains outcome-ambiguous.
+                    "provider_write_attempted": False,
+                    "provider_retryable": (
+                        _standalone_post_rejection_retryable(
+                            error_code,
+                            int(getattr(resp, "status", 0) or 0),
+                        )
+                    ),
+                    "provider_rejection": rejection,
+                }
     except Exception as e:
-        return {"error": f"Slack send failed: {e}"}
+        return {
+            "error": f"Slack send failed: {e}",
+            # The exception can occur after chat.postMessage reached Slack.
+            "provider_write_attempted": None,
+        }
 
 
 def interactive_setup() -> None:
@@ -5182,6 +5731,9 @@ def register(ctx) -> None:
         # deliver=slack cron jobs fail with "No live adapter" when cron runs
         # separately from the gateway. Replaces the _send_slack helper.
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=True,
+        standalone_semantic_exact_attempt_fn=_standalone_send,
+        live_semantic_exact_attempt=True,
         # Slack API allows 40,000 chars; leave margin (matches the legacy
         # SlackAdapter.MAX_MESSAGE_LENGTH).
         max_message_length=39000,

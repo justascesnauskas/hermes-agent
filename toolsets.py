@@ -284,7 +284,10 @@ TOOLSETS = {
             "separate from normal Hermes conversation and the existing "
             "Kanban/tasking flow."
         ),
-        "tools": ["agent_ops_planning_v2"],
+        "tools": [
+            "agent_ops_task_plan",
+            "agent_ops_task_approve_apply",
+        ],
         "includes": [],
     },
 

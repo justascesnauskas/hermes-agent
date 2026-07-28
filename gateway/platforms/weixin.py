@@ -66,6 +66,23 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
+from gateway.platform_registry import declare_semantic_exact_attempt
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    live_semantic_exact_attempt_provider_route_mapping,
+    provider_rejection_error,
+    provider_rejection_evidence,
+    semantic_exact_attempt_encoding_contract,
+)
+
+
+declare_semantic_exact_attempt(
+    "weixin",
+    standalone=False,
+    live=True,
+    owner=__name__,
+)
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 from agent.secret_scope import get_secret
@@ -1143,6 +1160,14 @@ class WeixinAdapter(BasePlatformAdapter):
     splits_long_messages = True  # send() chunks via _split_text()
 
     MAX_MESSAGE_LENGTH = 2000
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="weixin",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="weixin-ilink-logical-v1",
+        max_logical_units=2_000,
+        length_semantics="unicode_codepoints",
+        wire_encoding="weixin-ilink-final-text-json-v1",
+    )
 
     # WeChat does not support editing sent messages — streaming must use the
     # fallback "send-final-only" path so the cursor (▉) is never left visible.
@@ -1837,6 +1862,249 @@ class WeixinAdapter(BasePlatformAdapter):
                     await asyncio.sleep(wait)
         assert last_error is not None
         raise last_error
+
+    def bind_semantic_exact_attempt_provider_route(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str | None = None,
+        reply_to: str | None = None,
+    ) -> Dict[str, str]:
+        del reply_to
+        if not chat_id or thread_id is not None:
+            raise ValueError("Weixin semantic delivery route invalid")
+        return {"transport": "ilink_text"}
+
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Send one iLink final-text request with a stable client identity."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+            provider_route = (
+                live_semantic_exact_attempt_provider_route_mapping(
+                    request.provider_route
+                )
+            )
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+            provider_delivery_token,
+        )
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        try:
+            formatted = self.format_message(request.content)
+            formatted.encode("utf-8")
+        except (AttributeError, UnicodeEncodeError, ValueError):
+            formatted = ""
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or provider_route != {"transport": "ilink_text"}
+            or not request.chat_id
+            or request.thread_id is not None
+            or not isinstance(request.content, str)
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+            or not formatted.strip()
+            or len(formatted) > self.MAX_MESSAGE_LENGTH
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        session = self._send_session
+        if (
+            session is None
+            or getattr(session, "closed", False)
+            or not self._token
+            or not self._account_id
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_transport_unavailable",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+
+        stable_token = provider_delivery_token(
+            request.delivery_id,
+            provider="weixin",
+            target=request.delivery_target,
+            unit=request.delivery_unit,
+        )
+        client_id = f"hermes-weixin-{stable_token.removeprefix('dh_')[:32]}"
+        context_token = self._token_store.get(
+            self._account_id,
+            request.chat_id,
+        )
+        message: Dict[str, Any] = {
+            "from_user_id": "",
+            "to_user_id": request.chat_id,
+            "client_id": client_id,
+            "message_type": MSG_TYPE_BOT,
+            "message_state": MSG_STATE_FINISH,
+            "item_list": [
+                {
+                    "type": ITEM_TEXT,
+                    "text_item": {"text": formatted},
+                }
+            ],
+        }
+        if context_token:
+            message["context_token"] = context_token
+        body = _json_dumps(
+            {
+                "msg": message,
+                "base_info": _base_info(),
+            }
+        )
+        url = f"{self._base_url.rstrip('/')}/{EP_SEND_MESSAGE}"
+        try:
+            async def _post_once():
+                async with session.post(
+                    url,
+                    data=body,
+                    headers=_headers(self._token, body),
+                    allow_redirects=False,
+                ) as response:
+                    status = int(response.status)
+                    raw = await response.text()
+                    return status, dict(response.headers), raw
+
+            status, response_headers, raw = await asyncio.wait_for(
+                _post_once(),
+                timeout=API_TIMEOUT_MS / 1000,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"Weixin semantic transport failed: {exc}",
+            )
+
+        try:
+            data = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            data = None
+        if 200 <= status < 300:
+            if not isinstance(data, dict):
+                rejection = provider_rejection_evidence(
+                    provider="Weixin",
+                    status=status,
+                    body=raw,
+                )
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    raw_response={
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            ret = data.get("ret")
+            errcode = data.get("errcode")
+            successful = (
+                ret in (None, 0)
+                and errcode in (None, 0)
+            )
+            if successful:
+                return SendResult(
+                    success=True,
+                    message_id=client_id,
+                    raw_response=data,
+                )
+            retryable = (
+                ret in {RATE_LIMIT_ERRCODE, SESSION_EXPIRED_ERRCODE}
+                or errcode
+                in {RATE_LIMIT_ERRCODE, SESSION_EXPIRED_ERRCODE}
+            )
+            rejection = provider_rejection_evidence(
+                provider="Weixin",
+                status=status,
+                body=raw,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                retryable=retryable,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": retryable,
+                    "provider_rejection": rejection,
+                    **(
+                        {"retry_after": 30.0}
+                        if retryable
+                        else {}
+                    ),
+                },
+                retry_after=30.0 if retryable else None,
+            )
+        if status == 429:
+            rejection = provider_rejection_evidence(
+                provider="Weixin",
+                status=status,
+                body=raw,
+            )
+            retry_after = response_headers.get("Retry-After")
+            try:
+                retry_after_value = float(retry_after)
+            except (TypeError, ValueError):
+                retry_after_value = None
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                retryable=True,
+                retry_after=retry_after_value,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                    "retry_after": retry_after_value,
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        rejection = provider_rejection_evidence(
+            provider="Weixin",
+            status=status,
+            body=raw,
+        )
+        if status == 408 or status >= 500:
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        return SendResult(
+            success=False,
+            error=provider_rejection_error(rejection),
+            raw_response={
+                "provider_write_attempted": False,
+                "provider_retryable": False,
+                "status": status,
+                "provider_rejection": rejection,
+            },
+        )
 
     async def send(
         self,

@@ -47,6 +47,14 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    live_semantic_exact_attempt_provider_route_mapping,
+    provider_rejection_error,
+    provider_rejection_evidence,
+    semantic_exact_attempt_encoding_contract,
+)
 from plugins.platforms.wecom.wecom_crypto import WXBizMsgCrypt, WeComCryptoError
 
 logger = logging.getLogger(__name__)
@@ -68,6 +76,15 @@ def check_wecom_callback_requirements() -> bool:
 
 
 class WecomCallbackAdapter(BasePlatformAdapter):
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="wecom_callback",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="wecom-callback-logical-v1",
+        max_logical_units=2048,
+        length_semantics="unicode_codepoints",
+        wire_encoding="wecom-callback-text-json-v1",
+    )
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WECOM_CALLBACK)
         extra = config.extra or {}
@@ -199,6 +216,350 @@ class WecomCallbackAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Outbound: proactive send via access-token API
     # ------------------------------------------------------------------
+
+    def bind_semantic_exact_attempt_provider_route(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str | None = None,
+        reply_to: str | None = None,
+    ) -> Dict[str, str]:
+        """Freeze the callback app; never rediscover or choose app zero."""
+
+        if thread_id is not None or reply_to is not None:
+            raise ValueError("WeCom callback semantic route invalid")
+        if (
+            not isinstance(chat_id, str)
+            or chat_id.count(":") != 1
+            or len(chat_id) > 256
+        ):
+            raise ValueError("WeCom callback semantic route invalid")
+        corp_id, user_id = chat_id.split(":", 1)
+        if (
+            not corp_id
+            or not user_id
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in chat_id
+            )
+        ):
+            raise ValueError("WeCom callback semantic route invalid")
+
+        mapped_name = self._user_app_map.get(chat_id)
+        app = self._get_app_by_name(mapped_name) if mapped_name else None
+        matching = [
+            candidate
+            for candidate in self._apps
+            if str(candidate.get("corp_id") or "") == corp_id
+        ]
+        if app is None and len(matching) == 1:
+            app = matching[0]
+        if (
+            app is None
+            or app not in matching
+            or not str(app.get("name") or "").strip()
+        ):
+            raise LookupError("WeCom callback app route unavailable")
+        return {
+            "app": str(app["name"]),
+            "corp_id": corp_id,
+        }
+
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Perform one message/send POST; token repair is next-attempt only."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+            provider_route = (
+                live_semantic_exact_attempt_provider_route_mapping(
+                    request.provider_route
+                )
+            )
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+            exact_provider_message_id,
+        )
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        chat_parts = (
+            request.chat_id.split(":", 1)
+            if isinstance(request.chat_id, str)
+            and request.chat_id.count(":") == 1
+            else []
+        )
+        corp_id = chat_parts[0] if len(chat_parts) == 2 else ""
+        user_id = chat_parts[1] if len(chat_parts) == 2 else ""
+        app_name = provider_route.get("app", "")
+        app = self._get_app_by_name(app_name)
+        try:
+            request.content.encode("utf-8", errors="strict")
+            content_is_utf8 = True
+            agent_id = int(str((app or {}).get("agent_id") or ""))
+        except (AttributeError, TypeError, UnicodeEncodeError, ValueError):
+            content_is_utf8 = False
+            agent_id = 0
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or set(provider_route) != {"app", "corp_id"}
+            or provider_route.get("corp_id") != corp_id
+            or app is None
+            or str(app.get("corp_id") or "") != corp_id
+            or not corp_id
+            or not user_id
+            or len(request.chat_id) > 256
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in request.chat_id
+            )
+            or request.thread_id is not None
+            or request.reply_to is not None
+            or not isinstance(request.content, str)
+            or not content_is_utf8
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+            or agent_id <= 0
+            or getattr(self, "_http_client", None) is None
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+
+        try:
+            token = await self._get_access_token(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"WeCom callback semantic auth failed: {exc}",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+        payload = {
+            "touser": user_id,
+            "msgtype": "text",
+            "agentid": agent_id,
+            "text": {"content": request.content},
+            "safe": 0,
+        }
+        try:
+            response = await self._http_client.post(
+                (
+                    "https://qyapi.weixin.qq.com/cgi-bin/message/send"
+                    f"?access_token={token}"
+                ),
+                json=payload,
+                timeout=20.0,
+                follow_redirects=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"WeCom callback semantic transport failed: {exc}",
+            )
+
+        status = int(response.status_code)
+        response_body = getattr(response, "content", None)
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+        if not isinstance(response_body, (bytes, str)):
+            response_body = data
+        if 200 <= status < 300:
+            errcode = data.get("errcode") if isinstance(data, dict) else None
+            if (
+                isinstance(errcode, int)
+                and not isinstance(errcode, bool)
+                and errcode == 0
+            ):
+                message_id = exact_provider_message_id(
+                    data.get("msgid")
+                )
+                if message_id:
+                    return SendResult(
+                        success=True,
+                        message_id=message_id,
+                        raw_response=data,
+                    )
+                rejection = provider_rejection_evidence(
+                    provider="WeCom Callback",
+                    status=status,
+                    body=response_body,
+                )
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    raw_response={
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            if errcode in {40001, 42001}:
+                rejection = provider_rejection_evidence(
+                    provider="WeCom Callback",
+                    status=status,
+                    body=response_body,
+                )
+                self._access_tokens.pop(app_name, None)
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    retryable=True,
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": True,
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            if errcode == 45009:
+                rejection = provider_rejection_evidence(
+                    provider="WeCom Callback",
+                    status=status,
+                    body=response_body,
+                )
+                retry_after = (
+                    getattr(response, "headers", {}) or {}
+                ).get("Retry-After")
+                try:
+                    retry_after_value = float(retry_after)
+                except (TypeError, ValueError):
+                    retry_after_value = None
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    retryable=True,
+                    retry_after=retry_after_value,
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": True,
+                        "retry_after": retry_after_value,
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            if (
+                isinstance(errcode, int)
+                and not isinstance(errcode, bool)
+                and (
+                    500 <= errcode < 600
+                    or 50_000 <= errcode < 60_000
+                )
+            ):
+                rejection = provider_rejection_evidence(
+                    provider="WeCom Callback",
+                    status=status,
+                    body=response_body,
+                )
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    raw_response={
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            if isinstance(data, dict) and isinstance(errcode, int):
+                rejection = provider_rejection_evidence(
+                    provider="WeCom Callback",
+                    status=status,
+                    body=response_body,
+                )
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            rejection = provider_rejection_evidence(
+                provider="WeCom Callback",
+                status=status,
+                body=response_body,
+            )
+            return SendResult(
+                success=False,
+                error="semantic_delivery_provider_receipt_invalid",
+                raw_response={
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        if status == 429:
+            rejection = provider_rejection_evidence(
+                provider="WeCom Callback",
+                status=status,
+                body=response_body,
+            )
+            retry_after = (
+                getattr(response, "headers", {}) or {}
+            ).get("Retry-After")
+            try:
+                retry_after_value = float(retry_after)
+            except (TypeError, ValueError):
+                retry_after_value = None
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                retryable=True,
+                retry_after=retry_after_value,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                    "retry_after": retry_after_value,
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        rejection = provider_rejection_evidence(
+            provider="WeCom Callback",
+            status=status,
+            body=response_body,
+        )
+        if status == 408 or status >= 500:
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        return SendResult(
+            success=False,
+            error=provider_rejection_error(rejection),
+            raw_response={
+                "provider_write_attempted": False,
+                "provider_retryable": False,
+                "status": status,
+                "provider_rejection": rejection,
+            },
+        )
 
     async def send(
         self,
@@ -425,6 +786,8 @@ class WecomCallbackAdapter(BasePlatformAdapter):
                 "corpid": app.get("corp_id"),
                 "corpsecret": app.get("corp_secret"),
             },
+            timeout=20.0,
+            follow_redirects=False,
         )
         data = resp.json()
         if data.get("errcode") != 0:

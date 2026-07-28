@@ -54,11 +54,17 @@ DEFAULT_DEV_HUB_URL = "http://127.0.0.1:4570"
 DEFAULT_TIMEOUT_SECONDS = 20.0
 DEFAULT_TRANSPORT_RETRIES = 1
 DEFAULT_LEASE_SECONDS = 300
+DEFAULT_CURRENT_THREAD_PAGE_SIZE = 50
+MAX_CURRENT_THREAD_PAGE_SIZE = 200
 MAX_PREVIEW_PAGE_SIZE = 200
+MAX_DELIVERY_ATTENTION_PAGE_SIZE = 200
+MAX_APPLY_STATUS_PAGE_SIZE = 100
 DEFAULT_ARTIFACT_CHUNK_BYTES = 8 * 1024 * 1024
 _ARTIFACT_ROLE_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,119}$")
 _ARTIFACT_UPLOAD_ID_RE = re.compile(r"^planning-upload-[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_DELIVERY_ATTENTION_TOKEN_RE = re.compile(r"^pdra_[0-9a-f]{48}$")
+_APPLY_RECOVERY_TOKEN_RE = re.compile(r"^par_[0-9a-f]{64}$")
 
 
 class PlanningOriginPayload(TypedDict):
@@ -278,7 +284,10 @@ class PlanningThreadMutation(PlanningThreadProjection, total=False):
 class PlanningThreadResolution(TypedDict):
     match: Literal["none", "one", "ambiguous"]
     matchCount: int
+    returnedCount: int
     threads: list[PlanningThreadDTO]
+    hasMore: bool
+    nextCursor: Optional[str]
 
 
 class PlanningCancelDTO(TypedDict):
@@ -287,6 +296,79 @@ class PlanningCancelDTO(TypedDict):
     thread: PlanningThreadDTO
     event: dict[str, Any]
     cancelled: dict[str, int]
+
+
+class PlanningDeliveryAttentionItem(TypedDict):
+    resolutionToken: str
+    kind: str
+    eventType: str
+    generation: int
+    target: dict[str, Any]
+    message: str
+    actions: list[dict[str, str]]
+
+
+class PlanningDeliveryAttentionDTO(TypedDict):
+    status: Literal["clear", "action_required"]
+    count: int
+    returnedCount: int
+    hasMore: bool
+    nextAfterResolutionToken: Optional[str]
+    requiresExplicitToken: bool
+    items: list[PlanningDeliveryAttentionItem]
+
+
+class PlanningDeliveryAttentionProjection(TypedDict):
+    ok: bool
+    threadId: str
+    deliveryAttention: PlanningDeliveryAttentionDTO
+    authorizedBinding: dict[str, str]
+
+
+class PlanningDeliveryResolutionDTO(TypedDict):
+    ok: bool
+    replayed: bool
+    threadId: str
+    resolution: dict[str, Any]
+
+
+class PlanningApplyStatusItem(TypedDict, total=False):
+    recoveryToken: str
+    state: str
+    progress: dict[str, Any]
+    nextAction: Literal["automatic_resume", "revise", "none"]
+    message: str
+    requiresFreshPreviewApproval: bool
+    reusesOriginalOperation: bool
+    automaticWhenJiraPreflightPasses: bool
+    recoveryReason: Optional[str]
+    requestedAt: str
+    updatedAt: str
+
+
+class PlanningApplyStatusDTO(TypedDict):
+    count: int
+    actionableCount: int
+    automaticResumeCount: int
+    revisionRequiredCount: int
+    returnedCount: int
+    hasMore: bool
+    nextAfterRecoveryToken: Optional[str]
+    items: list[PlanningApplyStatusItem]
+
+
+class PlanningApplyStatusProjection(TypedDict):
+    ok: bool
+    threadId: str
+    applyStatus: PlanningApplyStatusDTO
+
+
+class PlanningApplyRecoveryDTO(TypedDict):
+    ok: bool
+    threadId: str
+    recovery: dict[str, Any]
+    nextAction: Literal["wait_for_apply", "create_preview"]
+    replayed: bool
 
 
 class PlanningEventsProjection(TypedDict):
@@ -522,16 +604,23 @@ def _text(value: Any) -> str:
 def _runtime_env(name: str, *, prefer_dotenv: bool = False) -> str:
     """Resolve Agent Ops values without bypassing profile-scoped secrets."""
 
-    try:
-        if prefer_dotenv:
-            from hermes_cli.config import get_env_value_prefer_dotenv
+    from agent.secret_scope import get_secret, is_multiplex_active
 
-            return _text(get_env_value_prefer_dotenv(name))
-        from hermes_cli.config import get_env_value
+    if is_multiplex_active():
+        # One profile scope is authoritative for the complete Agent Ops
+        # identity tuple, not only the bearer token. Never pair a scoped token
+        # with another profile's process-global runner id or API URL. An
+        # unscoped multiplex read intentionally propagates
+        # UnscopedSecretError instead of falling back to os.environ.
+        return _text(get_secret(name))
 
-        return _text(get_env_value(name))
-    except Exception:
-        return _text(os.environ.get(name))
+    if prefer_dotenv:
+        from hermes_cli.config import get_env_value_prefer_dotenv
+
+        return _text(get_env_value_prefer_dotenv(name))
+    from hermes_cli.config import get_env_value
+
+    return _text(get_env_value(name))
 
 
 def _clean_base_url(raw: str) -> str:
@@ -1594,31 +1683,505 @@ class PlanningV2Client:
             },
         )
         threads = payload["threads"]
+        thread_ids = [
+            _text(thread.get("threadId"))
+            for thread in threads
+            if isinstance(thread, Mapping)
+        ]
         if any(
             not isinstance(thread, Mapping)
             or not _text(thread.get("threadId"))
             or not _text(thread.get("title"))
             for thread in threads
-        ):
+        ) or len(thread_ids) != len(set(thread_ids)):
             cls._shape_error(
                 response,
                 context="planning current thread response",
-                detail="every thread requires a threadId and title",
+                detail=(
+                    "every thread requires a unique threadId and a title"
+                ),
             )
         count = payload["matchCount"]
         expected_match = (
             "none" if count == 0 else "one" if count == 1 else "ambiguous"
         )
+        pagination_fields = {
+            "returnedCount",
+            "hasMore",
+            "nextCursor",
+        }
+        present_pagination_fields = pagination_fields.intersection(payload)
+        if not present_pagination_fields:
+            if (
+                count < 0
+                or count != len(threads)
+                or payload["match"] != expected_match
+            ):
+                cls._shape_error(
+                    response,
+                    context="planning current thread response",
+                    detail="match, matchCount, and threads are inconsistent",
+                )
+            normalized_payload = dict(payload)
+            normalized_payload.update(
+                {
+                    "returnedCount": count,
+                    "hasMore": False,
+                    "nextCursor": None,
+                }
+            )
+            return PlanningV2Response(
+                status=response.status,
+                payload=normalized_payload,
+                transport_attempts=response.transport_attempts,
+            )
+        if present_pagination_fields != pagination_fields:
+            cls._shape_error(
+                response,
+                context="planning current thread response",
+                detail="pagination fields must be returned together",
+            )
+        returned = payload["returnedCount"]
+        has_more = payload["hasMore"]
+        next_cursor = payload["nextCursor"]
         if (
-            count < 0
-            or count != len(threads)
-            or payload["match"] != expected_match
+            not isinstance(returned, int)
+            or isinstance(returned, bool)
+            or not isinstance(has_more, bool)
+            or (
+                next_cursor is not None
+                and (
+                    not isinstance(next_cursor, str)
+                    or not next_cursor
+                    or next_cursor != next_cursor.strip()
+                    or len(next_cursor) > 1024
+                )
+            )
         ):
             cls._shape_error(
                 response,
                 context="planning current thread response",
-                detail="match, matchCount, and threads are inconsistent",
+                detail="pagination fields have invalid types or values",
             )
+        if (
+            count < 0
+            or returned < 0
+            or returned != len(threads)
+            or returned > count
+            or payload["match"] != expected_match
+            or (has_more and (returned == 0 or next_cursor is None))
+            or (not has_more and next_cursor is not None)
+            or (count == 0 and (returned != 0 or has_more))
+        ):
+            cls._shape_error(
+                response,
+                context="planning current thread response",
+                detail=(
+                    "match, counts, threads, and continuation are inconsistent"
+                ),
+            )
+        return response
+
+    @classmethod
+    def _validate_delivery_attention(
+        cls,
+        response: PlanningV2Response[Any],
+        *,
+        thread_id: str,
+        origin: PlanningOriginPayload,
+    ) -> PlanningV2Response[Any]:
+        payload = cls._require_fields(
+            response,
+            context="planning delivery attention response",
+            fields={
+                "ok": bool,
+                "threadId": str,
+                "deliveryAttention": dict,
+                "authorizedBinding": dict,
+            },
+        )
+        attention = payload["deliveryAttention"]
+        binding = payload["authorizedBinding"]
+        required = {
+            "status": str,
+            "count": int,
+            "returnedCount": int,
+            "hasMore": bool,
+            "requiresExplicitToken": bool,
+            "items": list,
+        }
+        for name, expected in required.items():
+            value = attention.get(name)
+            valid = isinstance(value, expected)
+            if expected is int and isinstance(value, bool):
+                valid = False
+            if not valid:
+                cls._shape_error(
+                    response,
+                    context="planning delivery attention response",
+                    detail=f"deliveryAttention.{name} has an invalid type",
+                )
+        count = attention["count"]
+        returned = attention["returnedCount"]
+        items = attention["items"]
+        next_token = attention.get("nextAfterResolutionToken")
+        if (
+            payload["ok"] is not True
+            or payload["threadId"] != _text(thread_id)
+            or count < 0
+            or returned < 0
+            or returned != len(items)
+            or returned > count
+            or attention["status"]
+            != ("action_required" if count else "clear")
+            or attention["requiresExplicitToken"] is not (count > 1)
+            or (
+                next_token is not None
+                and (
+                    not isinstance(next_token, str)
+                    or _DELIVERY_ATTENTION_TOKEN_RE.fullmatch(next_token)
+                    is None
+                )
+            )
+            or (
+                attention["hasMore"]
+                and (
+                    not items
+                    or next_token
+                    != items[-1].get("resolutionToken")
+                )
+            )
+            or (not attention["hasMore"] and next_token is not None)
+            or binding.get("provider") != origin["provider"]
+            or binding.get("gatewayAccountId")
+            != origin["gatewayAccountId"]
+        ):
+            cls._shape_error(
+                response,
+                context="planning delivery attention response",
+                detail="attention identity, pagination, or binding is inconsistent",
+            )
+        seen: set[str] = set()
+        expected_actions = {
+            (
+                "mark_delivered",
+                "user_observed_original_delivery",
+            ),
+            (
+                "resend_acknowledged",
+                "user_accepts_possible_duplicate",
+            ),
+        }
+        for item in items:
+            if not isinstance(item, Mapping):
+                cls._shape_error(
+                    response,
+                    context="planning delivery attention response",
+                    detail="every attention item must be an object",
+                )
+            token = item.get("resolutionToken")
+            target = item.get("target")
+            actions = item.get("actions")
+            generation = item.get("generation")
+            if (
+                not isinstance(token, str)
+                or _DELIVERY_ATTENTION_TOKEN_RE.fullmatch(token) is None
+                or token in seen
+                or not _text(item.get("kind"))
+                or not _text(item.get("eventType"))
+                or not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation < 1
+                or not isinstance(target, Mapping)
+                or not _text(target.get("provider"))
+                or not _text(target.get("gatewayAccountId"))
+                or not _text(target.get("chatId"))
+                or not isinstance(actions, list)
+                or {
+                    (
+                        str(action.get("action") or ""),
+                        str(action.get("acknowledgement") or ""),
+                    )
+                    for action in actions
+                    if isinstance(action, Mapping)
+                }
+                != expected_actions
+            ):
+                cls._shape_error(
+                    response,
+                    context="planning delivery attention response",
+                    detail="an attention item is invalid or duplicated",
+                )
+            seen.add(token)
+        return response
+
+    @classmethod
+    def _validate_delivery_resolution(
+        cls,
+        response: PlanningV2Response[Any],
+        *,
+        thread_id: str,
+        resolution_token: str,
+        action: str,
+        acknowledgement: str,
+    ) -> PlanningV2Response[Any]:
+        payload = cls._require_fields(
+            response,
+            context="planning delivery resolution response",
+            fields={
+                "ok": bool,
+                "replayed": bool,
+                "threadId": str,
+                "resolution": dict,
+            },
+        )
+        resolution = payload["resolution"]
+        if (
+            payload["ok"] is not True
+            or payload["threadId"] != _text(thread_id)
+            or resolution.get("resolutionToken") != resolution_token
+            or resolution.get("action") != action
+            or resolution.get("acknowledgement") != acknowledgement
+            or resolution.get("status")
+            not in {"attested_delivered", "resend_scheduled"}
+            or not isinstance(resolution.get("target"), Mapping)
+            or not isinstance(resolution.get("generation"), int)
+            or isinstance(resolution.get("generation"), bool)
+            or int(resolution["generation"]) < 1
+            or not _text(resolution.get("resolvedAt"))
+        ):
+            cls._shape_error(
+                response,
+                context="planning delivery resolution response",
+                detail="resolution identity or result is inconsistent",
+            )
+        expected_status = (
+            "attested_delivered"
+            if action == "mark_delivered"
+            else "resend_scheduled"
+        )
+        if resolution["status"] != expected_status:
+            cls._shape_error(
+                response,
+                context="planning delivery resolution response",
+                detail="resolution status does not match the selected action",
+            )
+        return response
+
+    @classmethod
+    def _validate_apply_status(
+        cls,
+        response: PlanningV2Response[Any],
+        *,
+        thread_id: str,
+    ) -> PlanningV2Response[Any]:
+        payload = cls._require_fields(
+            response,
+            context="planning apply status response",
+            fields={
+                "ok": bool,
+                "threadId": str,
+                "applyStatus": dict,
+            },
+        )
+        status = payload["applyStatus"]
+        for name, expected in {
+            "count": int,
+            "actionableCount": int,
+            "automaticResumeCount": int,
+            "revisionRequiredCount": int,
+            "returnedCount": int,
+            "hasMore": bool,
+            "items": list,
+        }.items():
+            value = status.get(name)
+            valid = isinstance(value, expected)
+            if expected is int and isinstance(value, bool):
+                valid = False
+            if not valid:
+                cls._shape_error(
+                    response,
+                    context="planning apply status response",
+                    detail=f"applyStatus.{name} has an invalid type",
+                )
+        next_token = status.get("nextAfterRecoveryToken")
+        if next_token is not None and (
+            not isinstance(next_token, str)
+            or _APPLY_RECOVERY_TOKEN_RE.fullmatch(next_token) is None
+        ):
+            cls._shape_error(
+                response,
+                context="planning apply status response",
+                detail="applyStatus continuation token is invalid",
+            )
+        items = status["items"]
+        if (
+            payload["ok"] is not True
+            or payload["threadId"] != _text(thread_id)
+            or status["count"] < 0
+            or status["actionableCount"] < 0
+            or status["automaticResumeCount"] < 0
+            or status["revisionRequiredCount"] < 0
+            or status["actionableCount"] > status["count"]
+            or status["actionableCount"]
+            != (
+                status["automaticResumeCount"]
+                + status["revisionRequiredCount"]
+            )
+            or status["returnedCount"] != len(items)
+            or status["count"] < len(items)
+            or (
+                status["hasMore"] is True
+                and (
+                    not items
+                    or next_token != items[-1].get("recoveryToken")
+                )
+            )
+            or (status["hasMore"] is False and next_token is not None)
+        ):
+            cls._shape_error(
+                response,
+                context="planning apply status response",
+                detail="apply status identity, count, or continuation is inconsistent",
+            )
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, Mapping):
+                cls._shape_error(
+                    response,
+                    context="planning apply status response",
+                    detail="apply status items must be objects",
+                )
+            token = item.get("recoveryToken")
+            next_action = item.get("nextAction")
+            recovery_reason = item.get("recoveryReason")
+            if (
+                not isinstance(token, str)
+                or _APPLY_RECOVERY_TOKEN_RE.fullmatch(token) is None
+                or token in seen
+                or not _text(item.get("state"))
+                or not isinstance(item.get("progress"), Mapping)
+                or next_action not in {"automatic_resume", "revise", "none"}
+                or not _text(item.get("message"))
+                or not _text(item.get("requestedAt"))
+                or not _text(item.get("updatedAt"))
+                or (
+                    recovery_reason is not None
+                    and not isinstance(recovery_reason, str)
+                )
+                or any(
+                    name in item and not isinstance(item.get(name), bool)
+                    for name in (
+                        "requiresFreshPreviewApproval",
+                        "reusesOriginalOperation",
+                        "automaticWhenJiraPreflightPasses",
+                    )
+                )
+            ):
+                cls._shape_error(
+                    response,
+                    context="planning apply status response",
+                    detail="an apply status item is invalid or duplicated",
+                )
+            seen.add(token)
+        return response
+
+    @classmethod
+    def _validate_apply_recovery(
+        cls,
+        response: PlanningV2Response[Any],
+        *,
+        thread_id: str,
+    ) -> PlanningV2Response[Any]:
+        payload = cls._require_fields(
+            response,
+            context="planning apply recovery response",
+            fields={
+                "ok": bool,
+                "threadId": str,
+                "recovery": dict,
+                "nextAction": str,
+                "replayed": bool,
+            },
+        )
+        recovery = payload["recovery"]
+        action = recovery.get("action")
+        forbidden_identity_fields = {
+            "applyBindingId",
+            "approvalId",
+            "commandId",
+            "operationId",
+            "planId",
+        }
+        if any(name in payload or name in recovery for name in forbidden_identity_fields):
+            cls._shape_error(
+                response,
+                context="planning apply recovery response",
+                detail="internal apply identities must not cross the chat recovery wire",
+            )
+        if (
+            payload["ok"] is not True
+            or payload["threadId"] != _text(thread_id)
+            or action not in {"automatic_resume", "revise"}
+        ):
+            cls._shape_error(
+                response,
+                context="planning apply recovery response",
+                detail="apply recovery identity or action is inconsistent",
+            )
+        if action == "automatic_resume":
+            integer_fields = (
+                "failedEffectsResumed",
+                "publishedEffectsPreserved",
+                "pendingEffectsPreserved",
+            )
+            if (
+                payload["nextAction"] != "wait_for_apply"
+                or recovery.get("state")
+                not in {"resumed", "already_in_progress"}
+                or any(
+                    not isinstance(recovery.get(name), int)
+                    or isinstance(recovery.get(name), bool)
+                    or int(recovery[name]) < 0
+                    for name in integer_fields
+                )
+                or recovery.get("reusedOriginalOperation") is not True
+                or recovery.get("createdPlan") is not False
+                or recovery.get("createdCommand") is not False
+                or recovery.get("createdApproval") is not False
+            ):
+                cls._shape_error(
+                    response,
+                    context="planning apply recovery response",
+                    detail="original-operation resume result is inconsistent",
+                )
+        else:
+            candidate_keys = recovery.get("candidateJiraKeys")
+            input_sequence = recovery.get("inputSequence")
+            identity_count = recovery.get("knownJiraIdentityCount")
+            if (
+                payload["nextAction"] != "create_preview"
+                or recovery.get("state") != "revision_input_appended"
+                or not isinstance(input_sequence, int)
+                or isinstance(input_sequence, bool)
+                or input_sequence < 1
+                or not isinstance(recovery.get("snapshotCreated"), bool)
+                or not isinstance(identity_count, int)
+                or isinstance(identity_count, bool)
+                or identity_count < 0
+                or not isinstance(candidate_keys, list)
+                or any(
+                    not isinstance(key, str) or not key.strip()
+                    for key in candidate_keys
+                )
+                or recovery.get("oldOperationImmutable") is not True
+                or recovery.get("requiresFreshPreviewApproval") is not True
+            ):
+                cls._shape_error(
+                    response,
+                    context="planning apply recovery response",
+                    detail="same-thread corrective revision result is inconsistent",
+                )
         return response
 
     @classmethod
@@ -2622,18 +3185,269 @@ class PlanningV2Client:
         self,
         *,
         origin: PlanningOriginPayload,
+        cursor: Optional[str] = None,
+        page_size: int = DEFAULT_CURRENT_THREAD_PAGE_SIZE,
     ) -> PlanningV2Response[PlanningThreadResolution]:
-        """Resolve the exact active thread set for the current channel origin."""
+        """Resolve one exact keyset page for the current channel origin."""
 
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or not 1 <= page_size <= MAX_CURRENT_THREAD_PAGE_SIZE
+        ):
+            raise PlanningV2ConfigError(
+                "planning.current_thread_page_size_invalid"
+            )
+        body: dict[str, Any] = {"origin": dict(origin)}
+        if cursor is not None:
+            exact_cursor = _text(cursor)
+            if (
+                not exact_cursor
+                or exact_cursor != cursor
+                or len(exact_cursor) > 1024
+            ):
+                raise PlanningV2ConfigError(
+                    "planning.current_thread_cursor_invalid"
+                )
+            body["cursor"] = exact_cursor
+            body["pageSize"] = page_size
+        elif page_size != DEFAULT_CURRENT_THREAD_PAGE_SIZE:
+            body["pageSize"] = page_size
         response = self._request(
             "POST",
             f"{PLANNING_V2_PREFIX}/threads/resolve-current",
-            body={"origin": dict(origin)},
+            body=body,
             retry_safe=True,
         )
         return cast(
             PlanningV2Response[PlanningThreadResolution],
             self._validate_thread_resolution(response),
+        )
+
+    def get_delivery_attention(
+        self,
+        thread_id: str,
+        *,
+        origin: PlanningOriginPayload,
+        after_resolution_token: Optional[str] = None,
+        limit: int = 50,
+    ) -> PlanningV2Response[PlanningDeliveryAttentionProjection]:
+        """Read one exact page of unresolved provider-delivery decisions."""
+
+        exact_thread_id = _text(thread_id)
+        if not exact_thread_id:
+            raise PlanningV2ConfigError("planning.thread_id_required")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_DELIVERY_ATTENTION_PAGE_SIZE
+        ):
+            raise PlanningV2ConfigError(
+                "planning.delivery_attention_page_size_invalid"
+            )
+        body: dict[str, Any] = {
+            "origin": dict(origin),
+            "limit": limit,
+        }
+        if after_resolution_token is not None:
+            token = _text(after_resolution_token)
+            if _DELIVERY_ATTENTION_TOKEN_RE.fullmatch(token) is None:
+                raise PlanningV2ConfigError(
+                    "planning.delivery_attention_cursor_invalid"
+                )
+            body["afterResolutionToken"] = token
+        response = self._request(
+            "POST",
+            (
+                f"{PLANNING_V2_PREFIX}/threads/"
+                f"{self._quoted(exact_thread_id)}/delivery-attention"
+            ),
+            body=body,
+            # This POST is contractually read-only. Repeating the exact
+            # bound-origin query cannot create a provider or Hub effect.
+            retry_safe=True,
+        )
+        return cast(
+            PlanningV2Response[PlanningDeliveryAttentionProjection],
+            self._validate_delivery_attention(
+                response,
+                thread_id=exact_thread_id,
+                origin=origin,
+            ),
+        )
+
+    def resolve_delivery_attention(
+        self,
+        thread_id: str,
+        *,
+        origin: PlanningOriginPayload,
+        resolution_token: str,
+        action: Literal["mark_delivered", "resend_acknowledged"],
+        reason: str,
+    ) -> PlanningV2Response[PlanningDeliveryResolutionDTO]:
+        """Apply one explicit human delivery decision on its bound turn."""
+
+        exact_thread_id = _text(thread_id)
+        token = _text(resolution_token)
+        exact_reason = str(reason)
+        if not exact_thread_id:
+            raise PlanningV2ConfigError("planning.thread_id_required")
+        if _DELIVERY_ATTENTION_TOKEN_RE.fullmatch(token) is None:
+            raise PlanningV2ConfigError(
+                "planning.delivery_resolution_token_invalid"
+            )
+        acknowledgements = {
+            "mark_delivered": "user_observed_original_delivery",
+            "resend_acknowledged": "user_accepts_possible_duplicate",
+        }
+        acknowledgement = acknowledgements.get(action)
+        if acknowledgement is None:
+            raise PlanningV2ConfigError(
+                "planning.delivery_resolution_action_invalid"
+            )
+        if (
+            not exact_reason
+            or exact_reason != exact_reason.strip()
+        ):
+            raise PlanningV2ConfigError(
+                "planning.delivery_resolution_reason_invalid",
+                detail=(
+                    "The exact current user decision must be a non-empty "
+                    "trimmed string."
+                ),
+            )
+        response = self._request(
+            "POST",
+            (
+                f"{PLANNING_V2_PREFIX}/threads/"
+                f"{self._quoted(exact_thread_id)}"
+                "/delivery-attention/resolve"
+            ),
+            body={
+                "origin": dict(origin),
+                "resolutionToken": token,
+                "action": action,
+                "acknowledgement": acknowledgement,
+                "reason": exact_reason,
+            },
+            # The Hub deduplicates by the exact provider event and rejects a
+            # changed replay, so a lost response can safely repeat this write.
+            retry_safe=True,
+        )
+        return cast(
+            PlanningV2Response[PlanningDeliveryResolutionDTO],
+            self._validate_delivery_resolution(
+                response,
+                thread_id=exact_thread_id,
+                resolution_token=token,
+                action=action,
+                acknowledgement=acknowledgement,
+            ),
+        )
+
+    def get_apply_status(
+        self,
+        thread_id: str,
+        *,
+        origin: PlanningOriginPayload,
+        after_recovery_token: Optional[str] = None,
+        limit: int = 20,
+    ) -> PlanningV2Response[PlanningApplyStatusProjection]:
+        """Read one exact page of the current chat's Jira apply lifecycle."""
+
+        exact_thread_id = _text(thread_id)
+        if not exact_thread_id:
+            raise PlanningV2ConfigError("planning.thread_id_required")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_APPLY_STATUS_PAGE_SIZE
+        ):
+            raise PlanningV2ConfigError(
+                "planning.apply_status_page_size_invalid"
+            )
+        body: dict[str, Any] = {
+            "origin": dict(origin),
+            "limit": limit,
+        }
+        if after_recovery_token is not None:
+            token = _text(after_recovery_token)
+            if _APPLY_RECOVERY_TOKEN_RE.fullmatch(token) is None:
+                raise PlanningV2ConfigError(
+                    "planning.apply_status_cursor_invalid"
+                )
+            body["afterRecoveryToken"] = token
+        response = self._request(
+            "POST",
+            (
+                f"{PLANNING_V2_PREFIX}/threads/"
+                f"{self._quoted(exact_thread_id)}/apply-status"
+            ),
+            body=body,
+            # This POST is authorization-bound but read-only.
+            retry_safe=True,
+        )
+        return cast(
+            PlanningV2Response[PlanningApplyStatusProjection],
+            self._validate_apply_status(
+                response,
+                thread_id=exact_thread_id,
+            ),
+        )
+
+    def resolve_apply_recovery(
+        self,
+        thread_id: str,
+        *,
+        origin: PlanningOriginPayload,
+        reason: str,
+        recovery_token: Optional[str] = None,
+    ) -> PlanningV2Response[PlanningApplyRecoveryDTO]:
+        """Resume or correct one exact apply from the originating user turn."""
+
+        exact_thread_id = _text(thread_id)
+        exact_reason = str(reason)
+        if not exact_thread_id:
+            raise PlanningV2ConfigError("planning.thread_id_required")
+        if (
+            not exact_reason
+            or exact_reason != exact_reason.strip()
+        ):
+            raise PlanningV2ConfigError(
+                "planning.apply_recovery_reason_invalid",
+                detail=(
+                    "The exact current human request must be a non-empty "
+                    "trimmed string."
+                ),
+            )
+        body: dict[str, Any] = {
+            "origin": dict(origin),
+            "reason": exact_reason,
+        }
+        if recovery_token is not None:
+            token = _text(recovery_token)
+            if _APPLY_RECOVERY_TOKEN_RE.fullmatch(token) is None:
+                raise PlanningV2ConfigError(
+                    "planning.apply_recovery_token_invalid"
+                )
+            body["recoveryToken"] = token
+        response = self._request(
+            "POST",
+            (
+                f"{PLANNING_V2_PREFIX}/threads/"
+                f"{self._quoted(exact_thread_id)}/apply-recovery"
+            ),
+            body=body,
+            # Dev Hub binds the exact provider event to one immutable request,
+            # so a lost response safely replays the original recovery receipt.
+            retry_safe=True,
+        )
+        return cast(
+            PlanningV2Response[PlanningApplyRecoveryDTO],
+            self._validate_apply_recovery(
+                response,
+                thread_id=exact_thread_id,
+            ),
         )
 
     def cancel_thread(
@@ -2656,7 +3470,6 @@ class PlanningV2Client:
             if (
                 not exact_reason
                 or exact_reason != exact_reason.strip()
-                or len(exact_reason) > 500
             ):
                 raise PlanningV2ConfigError(
                     "planning.cancel_reason_invalid"
@@ -3866,7 +4679,10 @@ class PlanningV2Client:
 
 __all__ = [
     "DEFAULT_ARTIFACT_CHUNK_BYTES",
+    "DEFAULT_CURRENT_THREAD_PAGE_SIZE",
     "DEFAULT_LEASE_SECONDS",
+    "MAX_APPLY_STATUS_PAGE_SIZE",
+    "MAX_CURRENT_THREAD_PAGE_SIZE",
     "MAX_PREVIEW_PAGE_SIZE",
     "PLANNING_V2_PREFIX",
     "PlanningClaimProjection",
@@ -3882,6 +4698,10 @@ __all__ = [
     "PlanningArtifactUploadDTO",
     "PlanningOriginPayload",
     "PlanningApplyDTO",
+    "PlanningApplyRecoveryDTO",
+    "PlanningApplyStatusDTO",
+    "PlanningApplyStatusItem",
+    "PlanningApplyStatusProjection",
     "PlanningPreviewPage",
     "PlanningPreviewReviewMutation",
     "PlanningPreviewReviewReceiptDTO",

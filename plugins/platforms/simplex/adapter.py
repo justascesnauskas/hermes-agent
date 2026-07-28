@@ -46,6 +46,7 @@ is present, so the gateway will not attempt to instantiate the adapter.
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -66,6 +67,14 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    live_semantic_exact_attempt_provider_route_mapping,
+    provider_protocol_rejection_evidence,
+    provider_rejection_error,
+    semantic_exact_attempt_encoding_contract,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +86,7 @@ WS_RETRY_DELAY_INITIAL = 2.0
 WS_RETRY_DELAY_MAX = 60.0
 HEALTH_CHECK_INTERVAL = 30.0
 HEALTH_CHECK_STALE_THRESHOLD = 300.0
+SIMPLEX_EXACT_ACK_TIMEOUT_SECONDS = 30.0
 
 # Correlation ID prefix for requests we send so we can ignore our own echoes.
 _CORR_PREFIX = "hermes-"
@@ -142,6 +152,14 @@ class SimplexAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="simplex",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="simplex-logical-v1",
+        max_logical_units=8000,
+        length_semantics="unicode_codepoints",
+        wire_encoding="simplex-api-send-messages-json-v1",
+    )
 
     def __init__(self, config: PlatformConfig, **kwargs):
         platform = Platform("simplex")
@@ -798,6 +816,258 @@ class SimplexAdapter(BasePlatformAdapter):
     # Outbound — text
     # ------------------------------------------------------------------
 
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Send one APISendMessages command and require its correlated ACK."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+            provider_route = (
+                live_semantic_exact_attempt_provider_route_mapping(
+                    request.provider_route
+                )
+            )
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        if request.chat_id.startswith("group:"):
+            target_type = "group"
+            target_id = request.chat_id[6:]
+            send_ref = f"#{target_id}"
+            expected_direction = "groupSnd"
+        else:
+            target_type = "direct"
+            target_id = request.chat_id
+            send_ref = f"@{target_id}"
+            expected_direction = "directSnd"
+        try:
+            numeric_target = int(target_id)
+            request.content.encode("utf-8", errors="strict")
+            content_is_utf8 = True
+        except (AttributeError, TypeError, UnicodeEncodeError, ValueError):
+            numeric_target = 0
+            content_is_utf8 = False
+        ws = getattr(self, "_ws", None)
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or provider_route
+            or not request.delivery_id
+            or not request.delivery_target
+            or not target_id.isdigit()
+            or str(numeric_target) != target_id
+            or not 0 < numeric_target <= 9_223_372_036_854_775_807
+            or request.thread_id is not None
+            or request.reply_to is not None
+            or not isinstance(request.content, str)
+            or not content_is_utf8
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if ws is None or bool(getattr(ws, "closed", False)):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_route_unavailable",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+
+        composed = json.dumps(
+            [{"msgContent": {"type": "text", "text": request.content}}],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        command = f"/_send {send_ref} json {composed}"
+        corr_id = "hermes-semantic-" + hashlib.sha256(
+            (
+                f"simplex:{request.delivery_id}:{request.delivery_unit}"
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        if corr_id in self._pending_responses:
+            return SendResult(
+                success=False,
+                error="semantic_delivery_attempt_already_pending",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        frame = json.dumps(
+            {"corrId": corr_id, "cmd": command},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        future = asyncio.get_running_loop().create_future()
+        self._pending_responses[corr_id] = future
+        self._pending_corr_ids.add(corr_id)
+        try:
+            await ws.send(frame)
+            response = await asyncio.wait_for(
+                future,
+                timeout=SIMPLEX_EXACT_ACK_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"SimpleX semantic transport failed: {exc}",
+            )
+        finally:
+            if self._pending_responses.get(corr_id) is future:
+                self._pending_responses.pop(corr_id, None)
+            self._pending_corr_ids.discard(corr_id)
+
+        if not isinstance(response, dict):
+            rejection = provider_protocol_rejection_evidence(
+                provider="SimpleX",
+                protocol="simplex-json-websocket",
+                response=response,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_rejection": rejection,
+                },
+            )
+        response_type = response.get("type")
+        if response_type == "chatCmdError":
+            rejection = provider_protocol_rejection_evidence(
+                provider="SimpleX",
+                protocol="simplex-json-websocket",
+                response=response,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                    "provider_rejection": rejection,
+                },
+            )
+        chat_items = response.get("chatItems")
+        if (
+            response_type != "newChatItems"
+            or not isinstance(chat_items, list)
+            or len(chat_items) != 1
+            or not isinstance(chat_items[0], dict)
+        ):
+            rejection = provider_protocol_rejection_evidence(
+                provider="SimpleX",
+                protocol="simplex-json-websocket",
+                response=response,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_rejection": rejection,
+                },
+            )
+        acknowledged = chat_items[0]
+        chat_info = acknowledged.get("chatInfo")
+        chat_item = acknowledged.get("chatItem")
+        if not isinstance(chat_info, dict) or not isinstance(chat_item, dict):
+            rejection = provider_protocol_rejection_evidence(
+                provider="SimpleX",
+                protocol="simplex-json-websocket",
+                response=response,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_rejection": rejection,
+                },
+            )
+        if target_type == "group":
+            group_info = chat_info.get("groupInfo")
+            receipt_target = (
+                group_info.get("groupId")
+                if isinstance(group_info, dict)
+                else None
+            )
+        else:
+            contact = chat_info.get("contact")
+            receipt_target = (
+                contact.get("contactId")
+                if isinstance(contact, dict)
+                else None
+            )
+        meta = chat_item.get("meta")
+        direction = chat_item.get("chatDir")
+        content = chat_item.get("content")
+        msg_content = (
+            content.get("msgContent")
+            if isinstance(content, dict)
+            else None
+        )
+        item_id = meta.get("itemId") if isinstance(meta, dict) else None
+        item_status = (
+            meta.get("itemStatus") if isinstance(meta, dict) else None
+        )
+        status_type = (
+            item_status.get("type")
+            if isinstance(item_status, dict)
+            else None
+        )
+        if (
+            chat_info.get("type") != target_type
+            or isinstance(receipt_target, bool)
+            or receipt_target != numeric_target
+            or not isinstance(direction, dict)
+            or direction.get("type") != expected_direction
+            or not isinstance(msg_content, dict)
+            or msg_content.get("type") != "text"
+            or msg_content.get("text") != request.content
+            or isinstance(item_id, bool)
+            or not isinstance(item_id, int)
+            or item_id <= 0
+            or status_type not in {"sndNew", "sndSent", "sndRcvd"}
+        ):
+            rejection = provider_protocol_rejection_evidence(
+                provider="SimpleX",
+                protocol="simplex-json-websocket",
+                response=response,
+            )
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_rejection": rejection,
+                },
+            )
+        return SendResult(
+            success=True,
+            message_id=str(item_id),
+            raw_response={
+                **response,
+                "gateway_acceptance": status_type == "sndNew",
+            },
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -818,10 +1088,10 @@ class SimplexAdapter(BasePlatformAdapter):
         use the simple ``@<id> text`` form which has always worked in
         production.
 
-        The call is fire-and-forget at the WebSocket level: the daemon
-        doesn't always return a corrId reply for chat commands, and
-        waiting for one would serialise all outbound traffic behind a
-        30-second timeout.
+        This legacy conversational path remains fire-and-forget because its
+        display-name DM form is not an exact API contract. Planning delivery
+        uses ``send_semantic_exact_attempt`` above: one structured
+        ``APISendMessages`` command with a correlated ``newChatItems`` ACK.
         """
         _voice_exts = {".ogg", ".mp3", ".wav", ".m4a", ".opus"}
         media_paths = re.findall(r"MEDIA:(\S+)", content)
@@ -1283,6 +1553,8 @@ def register(ctx) -> None:
         check_fn=check_requirements,
         validate_config=validate_config,
         is_connected=is_connected,
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=True,
         required_env=["SIMPLEX_WS_URL"],
         install_hint=(
             "pip install websockets   # SimpleX adapter requires the "

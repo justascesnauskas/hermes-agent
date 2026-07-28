@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -62,6 +63,14 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.platforms.helpers import strip_markdown
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    live_semantic_exact_attempt_provider_route_mapping,
+    provider_rejection_error,
+    provider_rejection_evidence,
+    semantic_exact_attempt_encoding_contract,
+)
 
 from .auth import load_project_credentials
 
@@ -77,6 +86,9 @@ _DEFAULT_SIDECAR_BIND = "127.0.0.1"
 # limit, but the underlying iMessage protocol limits practical message
 # size to ~16 KB.  Keep a conservative cap that matches BlueBubbles.
 _MAX_MESSAGE_LENGTH = 8000
+_PHOTON_SEMANTIC_EXACT_ENCODING = "photon-spectrum-markdown-v1"
+_PHOTON_EXACT_DM_CHAT_GUID_RE = re.compile(r"^any;-;(\+\d{6,})$")
+_PHOTON_EXACT_E164_RE = re.compile(r"^\+\d{6,}$")
 
 # Dedup parameters — the gRPC stream is at-least-once, and a sidecar
 # reconnect can replay, so keep at least 1k ids for ~48h.
@@ -117,6 +129,44 @@ _DEFAULT_MENTION_PATTERNS = [
     r"(?<![\w@])@?hermes\s+agent\b[,:\-]?",
     r"(?<![\w@])@?hermes\b[,:\-]?",
 ]
+
+
+def _photon_semantic_exact_route_kind(space_id: str) -> Optional[str]:
+    if (
+        not isinstance(space_id, str)
+        or not space_id
+        or len(space_id) > 240
+        or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in space_id
+        )
+    ):
+        return None
+    if (
+        _PHOTON_EXACT_E164_RE.fullmatch(space_id)
+        or _PHOTON_EXACT_DM_CHAT_GUID_RE.fullmatch(space_id)
+    ):
+        return "dm_phone"
+    return "space_id"
+
+
+def _photon_semantic_exact_digest(
+    *,
+    space_id: str,
+    text: str,
+    delivery_id: str,
+    delivery_unit: int,
+) -> str:
+    canonical = "\x00".join(
+        (
+            _PHOTON_SEMANTIC_EXACT_ENCODING,
+            space_id,
+            delivery_id,
+            str(delivery_unit),
+            text,
+        )
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +328,14 @@ class PhotonAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = _MAX_MESSAGE_LENGTH
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="photon",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="photon-logical-v1",
+        max_logical_units=_MAX_MESSAGE_LENGTH,
+        length_semantics="unicode_codepoints",
+        wire_encoding=_PHOTON_SEMANTIC_EXACT_ENCODING,
+    )
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("photon"))
@@ -1097,6 +1155,227 @@ class PhotonAdapter(BasePlatformAdapter):
 
     # -- Outbound ----------------------------------------------------------
 
+    def bind_semantic_exact_attempt_provider_route(
+        self,
+        *,
+        chat_id: str,
+        thread_id: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Freeze the one deterministic Photon space-resolution branch."""
+
+        route_kind = _photon_semantic_exact_route_kind(chat_id)
+        if route_kind is None:
+            raise ValueError("Photon semantic exact route unavailable")
+        return {
+            "message_mode": "flat",
+            "space_kind": route_kind,
+            "transport": "photon_sidecar_exact",
+        }
+
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Perform one correlated Photon provider write through the sidecar."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+            provider_route = (
+                live_semantic_exact_attempt_provider_route_mapping(
+                    request.provider_route
+                )
+            )
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+            exact_provider_message_id,
+        )
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        route_kind = _photon_semantic_exact_route_kind(request.chat_id)
+        expected_route = {
+            "message_mode": "flat",
+            "space_kind": str(route_kind or ""),
+            "transport": "photon_sidecar_exact",
+        }
+        try:
+            request.content.encode("utf-8", errors="strict")
+            content_is_utf8 = True
+        except (AttributeError, UnicodeEncodeError):
+            content_is_utf8 = False
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or not request.delivery_id
+            or len(request.delivery_id) > 500
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in request.delivery_id
+            )
+            or not request.delivery_target
+            or route_kind is None
+            or provider_route != expected_route
+            or not isinstance(request.content, str)
+            or not content_is_utf8
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if self._http_client is None or not HTTPX_AVAILABLE:
+            return SendResult(
+                success=False,
+                error="semantic_delivery_route_unavailable",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+
+        content_digest = _photon_semantic_exact_digest(
+            space_id=request.chat_id,
+            text=request.content,
+            delivery_id=request.delivery_id,
+            delivery_unit=request.delivery_unit,
+        )
+        payload = {
+            "spaceId": request.chat_id,
+            "text": request.content,
+            "deliveryId": request.delivery_id,
+            "deliveryUnit": request.delivery_unit,
+            "routeKind": route_kind,
+            "wireEncoding": _PHOTON_SEMANTIC_EXACT_ENCODING,
+            "contentDigest": content_digest,
+        }
+        try:
+            sidecar_result = await self._semantic_exact_sidecar_post(payload)
+            if len(sidecar_result) == 3:
+                status, data, response_body = sidecar_result
+            else:
+                status, data = sidecar_result
+                response_body = data
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            safe_prewrite = bool(
+                HTTPX_AVAILABLE
+                and isinstance(
+                    exc,
+                    (
+                        httpx.ConnectError,
+                        httpx.ConnectTimeout,
+                        httpx.PoolTimeout,
+                    ),
+                )
+            )
+            return SendResult(
+                success=False,
+                error=f"Photon semantic exact transport failed: {exc}",
+                retryable=safe_prewrite,
+                raw_response=(
+                    {
+                        "provider_write_attempted": False,
+                        "provider_retryable": True,
+                    }
+                    if safe_prewrite
+                    else {}
+                ),
+            )
+
+        if 200 <= status < 300:
+            message_id = (
+                exact_provider_message_id(data.get("messageId"))
+                if isinstance(data, dict) and data.get("ok") is True
+                else None
+            )
+            receipt_valid = bool(
+                message_id is not None
+                and data.get("deliveryId") == request.delivery_id
+                and data.get("deliveryUnit") == request.delivery_unit
+                and data.get("routeKind") == route_kind
+                and data.get("wireEncoding")
+                == _PHOTON_SEMANTIC_EXACT_ENCODING
+                and data.get("contentDigest") == content_digest
+            )
+            if not receipt_valid:
+                rejection = provider_rejection_evidence(
+                    provider="Photon sidecar",
+                    status=status,
+                    body=response_body,
+                )
+                return SendResult(
+                    success=False,
+                    error="semantic_delivery_provider_receipt_invalid",
+                    raw_response={
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+            self._record_sent_message(message_id)
+            return SendResult(
+                success=True,
+                message_id=message_id,
+                raw_response={
+                    "provider_message_id": message_id,
+                    "transport": "photon_sidecar_exact",
+                },
+            )
+
+        rejection = provider_rejection_evidence(
+            provider="Photon sidecar",
+            status=status,
+            body=response_body,
+        )
+        if (
+            isinstance(data, dict)
+            and data.get("providerWriteAttempted") is False
+        ):
+            retryable = data.get("retryable") is True
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                retryable=retryable,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": retryable,
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        if status in {400, 401, 404, 405}:
+            return SendResult(
+                success=False,
+                error=provider_rejection_error(rejection),
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                    "status": status,
+                    "provider_rejection": rejection,
+                },
+            )
+        return SendResult(
+            success=False,
+            error=provider_rejection_error(rejection),
+            raw_response={
+                "status": status,
+                "provider_rejection": rejection,
+            },
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -1577,6 +1856,27 @@ class PhotonAdapter(BasePlatformAdapter):
             )
         return data
 
+    async def _semantic_exact_sidecar_post(
+        self,
+        body: Dict[str, Any],
+    ) -> tuple[int, Any, str]:
+        """One no-redirect local POST; the sidecar owns the provider write."""
+
+        url = (
+            f"http://{self._sidecar_bind}:{self._sidecar_port}/send-exact"
+        )
+        headers = {"X-Hermes-Sidecar-Token": self._sidecar_token}
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=False,
+        ) as client:
+            response = await client.post(url, json=body, headers=headers)
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+        return int(response.status_code), data, response.text
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1784,6 +2084,8 @@ def register(ctx) -> None:
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="PHOTON_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=True,
         allowed_users_env="PHOTON_ALLOWED_USERS",
         allow_all_env="PHOTON_ALLOW_ALL_USERS",
         max_message_length=_MAX_MESSAGE_LENGTH,

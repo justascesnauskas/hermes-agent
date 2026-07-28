@@ -13,6 +13,7 @@ from gateway.response_filters import (
     is_intentional_silence_agent_result,
     is_intentional_silence_response,
 )
+from hermes_cli.turn_origin import TurnOriginV1
 
 
 def _source():
@@ -76,6 +77,20 @@ def _runner(monkeypatch, tmp_path):
     return runner
 
 
+def _turn_origin() -> TurnOriginV1:
+    return TurnOriginV1(
+        provider="telegram",
+        gateway_account_id="telegram-main",
+        chat_id="-1001",
+        thread_id=None,
+        message_id="msg-42",
+        sender_id="12345",
+        chat_type="group",
+        source_timestamp="2026-07-28T08:00:00Z",
+        event_id="telegram-update-42",
+    )
+
+
 def test_exact_silence_tokens_are_intentional_silence():
     for token in ("[SILENT]", " SILENT ", "NO_REPLY", "no reply"):
         assert is_intentional_silence_response(token)
@@ -116,6 +131,98 @@ async def test_silence_token_suppresses_delivery_but_preserves_transcript(monkey
     appended = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
     assert {"role": "assistant", "content": "[SILENT]"}.items() <= appended[-1].items()
     assert [msg["role"] for msg in appended if msg.get("role") in {"user", "assistant"}] == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_intentional_silence_confirms_turn_without_preview(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _runner(monkeypatch, tmp_path)
+    event = _event()
+    origin = _turn_origin()
+    event.turn_origin = origin
+    runner.session_store.confirm_turn_delivery.return_value = True
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "[SILENT]",
+        "messages": [
+            {"role": "user", "content": "side chatter"},
+            {"role": "assistant", "content": "[SILENT]"},
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "failed": False,
+    })
+    monkeypatch.setattr(
+        "hermes_cli.planning_preview_delivery.has_preview_delivery_intent",
+        lambda _session_key, _generation: False,
+    )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        _source(),
+        "agent:main:telegram:group:-1001:12345",
+        1,
+    )
+
+    assert response == ""
+    runner.session_store.confirm_turn_delivery.assert_called_once_with(
+        "agent:main:telegram:group:-1001:12345",
+        expected_event_id=origin.event_id,
+    )
+    assert "agent:main:telegram:group:-1001:12345" not in (
+        runner._active_turn_origins
+    )
+
+
+@pytest.mark.asyncio
+async def test_preview_return_persists_clean_restart_delivery_marker(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _runner(monkeypatch, tmp_path)
+    event = _event()
+    origin = _turn_origin()
+    event.turn_origin = origin
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "Signed implementation preview",
+        "messages": [
+            {"role": "user", "content": "plan this"},
+            {
+                "role": "assistant",
+                "content": "Signed implementation preview",
+            },
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "failed": False,
+    })
+    monkeypatch.setattr(
+        "hermes_cli.planning_preview_delivery.has_preview_delivery_intent",
+        lambda session_key, generation: (
+            session_key == "agent:main:telegram:group:-1001:12345"
+            and generation == 7
+        ),
+    )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        _source(),
+        "agent:main:telegram:group:-1001:12345",
+        7,
+    )
+
+    assert response == "Signed implementation preview"
+    runner.session_store.mark_resume_pending.assert_called_once_with(
+        "agent:main:telegram:group:-1001:12345",
+        "planning_delivery_unconfirmed",
+        turn_origin=origin,
+    )
+    runner.session_store.confirm_turn_delivery.assert_not_called()
 
 
 @pytest.mark.asyncio

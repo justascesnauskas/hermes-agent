@@ -13,6 +13,7 @@ from plugins.platforms.dingtalk.adapter import (
 )
 from plugins.platforms.matrix.adapter import (
     _standalone_send as _matrix_standalone_send,
+    register as _register_matrix,
 )
 
 
@@ -28,6 +29,35 @@ async def _send_matrix(token, extra, chat_id, message):
     plugin's ``_standalone_send(pconfig, chat_id, message)``."""
     pconfig = SimpleNamespace(token=token, extra=extra or {})
     return await _matrix_standalone_send(pconfig, chat_id, message)
+
+
+async def _send_matrix_semantic(
+    resp,
+    *,
+    message="exact matrix message",
+    media_files=None,
+):
+    """Exercise Matrix's registry-shaped exact standalone entrypoint."""
+    from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+    session_ctx, session = _make_aiohttp_session(resp)
+    pconfig = SimpleNamespace(
+        token="syt_semantic",
+        extra={"homeserver": "https://matrix.example.com"},
+    )
+    with patch("aiohttp.ClientSession", return_value=session_ctx):
+        result = await _matrix_standalone_send(
+            pconfig,
+            "!room:example.com",
+            message,
+            delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+            delivery_id="delivery-matrix-standalone-exact",
+            delivery_target="matrix:!room:example.com",
+            delivery_unit=0,
+            semantic_exact_attempt=True,
+            media_files=media_files,
+        )
+    return result, session
 
 # ``_send_mattermost`` moved into the mattermost plugin
 # (``plugins/platforms/mattermost/adapter.py::_standalone_send``).  Keep a
@@ -243,6 +273,206 @@ class TestSendMatrix:
 
         assert len(txn_ids) == 2
         assert txn_ids[0] != txn_ids[1]
+
+
+class TestSendMatrixSemanticExact:
+    def test_media_is_rejected_before_provider_write(self):
+        resp = _make_aiohttp_resp(
+            200,
+            json_data={"event_id": "$must-not-send"},
+        )
+
+        result, session = asyncio.run(
+            _send_matrix_semantic(
+                resp,
+                media_files=["/tmp/semantic-attachment.png"],
+            )
+        )
+
+        assert result == {
+            "error": "semantic_delivery_media_shape_unsupported",
+            "provider_write_attempted": False,
+            "provider_retryable": False,
+        }
+        session.put.assert_not_called()
+
+    def test_preserves_native_event_id_exactly_without_generic_cap(self):
+        event_id = "$" + ("訊" * 10_000) + ":example.com"
+        resp = _make_aiohttp_resp(
+            200,
+            json_data={"event_id": event_id},
+        )
+
+        result, session = asyncio.run(_send_matrix_semantic(resp))
+
+        assert result == {
+            "success": True,
+            "platform": "matrix",
+            "chat_id": "!room:example.com",
+            "message_id": event_id,
+        }
+        assert session.put.call_count == 1
+        assert "/dh_" in session.put.call_args.args[0]
+        assert (
+            session.put.call_args.kwargs["allow_redirects"] is False
+        )
+
+    def test_rejects_non_native_or_malformed_matrix_event_ids(self):
+        class StringSubclass(str):
+            pass
+
+        invalid_event_ids = (
+            None,
+            42,
+            "$",
+            "event-without-dollar",
+            "$event with space",
+            "$event\x00control",
+            "$event\ud800surrogate",
+            StringSubclass("$subclass"),
+        )
+        for event_id in invalid_event_ids:
+            response_body = '{"event_id":"malformed"}'
+            resp = _make_aiohttp_resp(
+                200,
+                json_data={"event_id": event_id},
+                text_data=response_body,
+            )
+
+            result, session = asyncio.run(_send_matrix_semantic(resp))
+
+            assert (
+                result["error"]
+                == "semantic_delivery_provider_receipt_invalid"
+            )
+            assert result["provider_retryable"] is False
+            assert result.get("provider_write_attempted") is not False
+            rejection = result["provider_rejection"]
+            assert (
+                rejection["schema_version"]
+                == "hermes.provider-rejection-evidence/1"
+            )
+            assert rejection["provider"] == "Matrix"
+            assert rejection["status"] == 200
+            assert session.put.call_count == 1
+
+    def test_malformed_2xx_receipt_evidence_is_bounded_and_redacted(self):
+        secret = "ghp_" + ("m" * 80)
+        response_body = (
+            '{"token":"'
+            + secret
+            + '","detail":"'
+            + ("malformed Matrix receipt " * 40)
+            + '"}'
+        )
+        resp = _make_aiohttp_resp(
+            200,
+            json_data={"event_id": None},
+            text_data=response_body,
+        )
+
+        result, _ = asyncio.run(_send_matrix_semantic(resp))
+
+        rejection = result["provider_rejection"]
+        assert rejection["body_bytes"] == len(response_body.encode("utf-8"))
+        assert rejection["truncated"] is True
+        assert rejection["redacted"] is True
+        assert secret not in rejection["body_preview"]
+
+    def test_non_2xx_rejection_has_safe_structured_evidence(self):
+        secret = "ghp_" + ("n" * 80)
+        response_body = (
+            '{"token":"'
+            + secret
+            + '","detail":"'
+            + ("Matrix rejected request " * 40)
+            + '"}'
+        )
+        resp = _make_aiohttp_resp(
+            403,
+            text_data=response_body,
+        )
+
+        result, session = asyncio.run(_send_matrix_semantic(resp))
+
+        assert result["provider_write_attempted"] is False
+        assert result["provider_retryable"] is False
+        assert secret not in result["error"]
+        assert response_body not in result["error"]
+        rejection = result["provider_rejection"]
+        assert (
+            rejection["schema_version"]
+            == "hermes.provider-rejection-evidence/1"
+        )
+        assert rejection["status"] == 403
+        assert rejection["body_sha256"] in result["error"]
+        assert rejection["body_bytes"] == len(response_body.encode("utf-8"))
+        assert rejection["truncated"] is True
+        assert rejection["redacted"] is True
+        assert secret not in rejection["body_preview"]
+        assert session.put.call_count == 1
+
+    def test_http_outcome_ambiguity_is_not_marked_retryable(self):
+        response_body = '{"errcode":"M_UNKNOWN","error":"upstream lost"}'
+        for status in (408, 503):
+            resp = _make_aiohttp_resp(
+                status,
+                text_data=response_body,
+            )
+
+            result, session = asyncio.run(_send_matrix_semantic(resp))
+
+            assert result["provider_retryable"] is False
+            assert "provider_write_attempted" not in result
+            rejection = result["provider_rejection"]
+            assert rejection["status"] == status
+            assert rejection["body_sha256"] in result["error"]
+            assert session.put.call_count == 1
+
+    def test_transport_ambiguity_is_not_marked_retryable(self):
+        session_ctx, session = _make_aiohttp_session(
+            _make_aiohttp_resp(200)
+        )
+        session.put.side_effect = ConnectionResetError("lost after PUT")
+        pconfig = SimpleNamespace(
+            token="syt_semantic",
+            extra={"homeserver": "https://matrix.example.com"},
+        )
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+        with patch("aiohttp.ClientSession", return_value=session_ctx):
+            result = asyncio.run(
+                _matrix_standalone_send(
+                    pconfig,
+                    "!room:example.com",
+                    "exact matrix message",
+                    delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+                    delivery_id="delivery-matrix-transport-loss",
+                    delivery_target="matrix:!room:example.com",
+                    delivery_unit=0,
+                    semantic_exact_attempt=True,
+                )
+            )
+
+        assert result["provider_retryable"] is False
+        assert "provider_write_attempted" not in result
+        rejection = result["provider_rejection"]
+        assert (
+            rejection["schema_version"]
+            == "hermes.provider-protocol-rejection-evidence/1"
+        )
+        assert rejection["protocol"] == "matrix-client-server-http"
+        assert session.put.call_count == 1
+
+    def test_registry_declaration_matches_standalone_sender_contract(self):
+        ctx = SimpleNamespace(register_platform=MagicMock())
+
+        _register_matrix(ctx)
+
+        registration = ctx.register_platform.call_args.kwargs
+        assert registration["standalone_sender_fn"] is _matrix_standalone_send
+        assert registration["semantic_exact_attempt"] is True
+        assert registration["live_semantic_exact_attempt"] is True
 
 
 # ---------------------------------------------------------------------------

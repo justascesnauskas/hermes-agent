@@ -250,6 +250,10 @@ hermes profile export <name> [options]
 
 Exports a profile as a compressed tar.gz archive.
 
+The archive is portable profile data, not a copy of live messaging authority.
+Hermes excludes credentials, the semantic-delivery ledger/preview ACK outbox,
+and provider `gateway_account_id` values. The source profile is not modified.
+
 | Argument / Option | Description |
 |-------------------|-------------|
 | `<name>` | Profile to export. |
@@ -271,6 +275,11 @@ hermes profile import <archive> [options]
 ```
 
 Imports a profile from a tar.gz archive.
+
+Import always creates a new local profile instance. Hermes defensively removes
+delivery/ACK state and runtime markers even from older or hand-built archives,
+then provisions fresh provider account identities. This prevents an imported
+copy from sharing exactly-once delivery authority with the source profile.
 
 | Argument / Option | Description |
 |-------------------|-------------|

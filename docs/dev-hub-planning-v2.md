@@ -1,13 +1,14 @@
 # Dev Hub Planning V2 in Hermes
 
-Hermes exposes Dev Hub Planning V2 as one explicit, opt-in action. It does not
-replace Hermes conversation, intercept ordinary messages, shadow existing
-traffic, or replace the current Kanban/Agent Ops tasking tools.
+Hermes exposes Dev Hub Planning V2 through two explicit, opt-in gateway tools.
+It does not replace Hermes conversation, intercept ordinary messages, shadow
+existing traffic, or replace the current Kanban/Agent Ops tasking tools.
 
 ## Enablement
 
-The active Hermes profile must opt in for every surface that should expose the
-action. A cross-provider thread therefore enables both providers explicitly:
+The active Hermes profile must opt in for every messaging gateway that should
+expose the tools. A cross-provider thread therefore enables both providers
+explicitly:
 
 ```yaml
 platform_toolsets:
@@ -19,9 +20,10 @@ platform_toolsets:
     - planning_v2
 ```
 
-Use the same shape with `cli` and `hermes-cli` for the CLI surface. Planning V2
-is a configurable, default-off toolset; adding it for one provider does not
-enable it for another provider.
+Planning V2 is gateway-only and requires the exact live provider adapter bound
+to the current conversation turn. It is not exposed as a CLI planning surface.
+The `planning_v2` toolset is configurable and default-off; adding it for one
+provider does not enable it for another provider.
 
 The runner machine must provide the exact Dev Hub credentials:
 
@@ -33,7 +35,7 @@ AGENT_OPS_RUNNER_TOKEN=<runner bearer token>
 
 `AGENT_OPS_RUNNER_ID` is not the gateway relay instance id. Dev Hub attests
 that every planning origin's `gatewayInstanceId` equals the runner identity
-bound to the bearer token. The tool remains absent when either the profile
+bound to the bearer token. The tools remain absent when either the profile
 opt-in or credentials are missing.
 
 Each direct provider adapter also needs a stable, opaque account identifier.
@@ -62,17 +64,18 @@ different user. An explicit thread id never bypasses either ownership check.
 
 ## User flow
 
-The model-facing tool is `agent_ops_planning_v2`:
+The model-facing gateway tools are:
 
-| Action | Effect |
-|---|---|
-| `create` | Persist the current scoped gateway input as a new planning thread and, by default, start a run. |
-| `continue` | Append the current scoped gateway input to an explicit `thread_id`, bind that endpoint, invalidate a stale preview, and, by default, start a new run. |
-| `status` | Read concise thread, run, work-progress, needs-decision, and preview facts. |
-| `events` | Read semantic events after an explicit sequence cursor. |
-| `start_run` | Start or replay a run for an explicit thread, including recovery after a lost response. |
-| `preview` | Read one exact accepted-preview task page, including immutable hashes and the next-page action. |
-| `approve_apply` | Approve one exact accepted preview from a later explicit user turn and request the existing canonical apply operation. |
+| Tool | Intent | Effect |
+|---|---|---|
+| `agent_ops_task_plan` | `new` | Persist the current scoped gateway input as a new planning thread and start a run after attachments converge. |
+| `agent_ops_task_plan` | `revise` | Append the current scoped gateway input to the selected thread, bind that endpoint, invalidate a stale preview, and start a new run. |
+| `agent_ops_task_plan` | `retry` / `resume` | Continue the same durable upload, run, delivery, or apply recovery without inventing a replacement operation. |
+| `agent_ops_task_plan` | `status` | Read concise thread, run, work-progress, needs-decision, preview, delivery, and apply facts. |
+| `agent_ops_task_plan` | `show` | Schedule the selected immutable preview page, or every page, for provider-confirmed delivery. |
+| `agent_ops_task_plan` | `resolve_delivery` | Resolve one explicit delivery-attention item using its opaque token. |
+| `agent_ops_task_plan` | `cancel` | Cancel the exact current planning thread resolved for this gateway conversation. |
+| `agent_ops_task_approve_apply` | — | Approve one fully reviewed immutable preview from a later explicit user turn and request the canonical apply operation. |
 
 Cross-provider continuation is intentional and explicit. For example, a
 thread created from Discord can be continued from Slack by passing the same
@@ -111,13 +114,13 @@ artifact provider or a retention policy for abandoned planning requests.
 
 ## Exact preview approval
 
-Before approval, Hermes uses `preview` to show and review every task page in
-order. The response repeats the immutable preview and plan hashes on every
-page and returns a machine-readable `nextAction` while more tasks remain.
-Hermes follows that action until `hasMore` is false; it never treats the
-transport page size as a total-task limit. The client iterator likewise has no
-total task-count ceiling, so a 137-task plan is three ordinary pages rather
-than a truncated plan.
+Before approval, Hermes uses `agent_ops_task_plan` with intent `show` to deliver
+and review every task page in order. The response repeats the immutable preview
+and plan hashes on every page and returns a machine-readable `nextAction` while
+more tasks remain. Hermes follows that action until `hasMore` is false; it
+never treats the transport page size as a total-task limit. The client iterator
+likewise has no total task-count ceiling, so a 137-task plan is three ordinary
+pages rather than a truncated plan.
 
 Preview reads require runner authentication but no scoped gateway origin
 because they do not mutate thread state. Each page still reports
@@ -126,8 +129,9 @@ condition can make it false. Hermes does not ask for approval when eligibility
 is false, when any page remains unseen, or when any page reports a different
 preview or plan hash.
 
-After the complete review, `approve_apply` remains deliberately narrow. Hermes
-calls it only after Dev Hub has returned all three immutable values:
+After the complete review, `agent_ops_task_approve_apply` remains deliberately
+narrow. Hermes calls it only after Dev Hub has returned all three immutable
+values:
 
 - `preview_result_id`;
 - `expected_preview_hash`;
@@ -137,8 +141,7 @@ The user must explicitly approve that exact preview in a later conversation
 turn. A request to plan, approval-like wording from an earlier turn, silence,
 or the model's own judgment is never approval. During a real gateway turn,
 Hermes sends the exact current `user_task` as `approvalMessage`; a
-model-supplied `approval_message` cannot replace or rewrite it. The explicit
-argument exists only for non-gateway callers and replay-focused tests.
+model-supplied `approvalMessage` cannot replace or rewrite it.
 
 The current scoped `TurnOriginV1` is mandatory. Dev Hub verifies that its
 machine identity is attested by the runner token, its provider sender maps to
@@ -191,9 +194,9 @@ conversation/user scope and snapshot checksum, then streams the same bytes with
 the same idempotency key. A restart therefore cannot turn an unknown upload
 outcome into a request to reattach the file or into a duplicate artifact.
 
-If an approval response is lost after Dev Hub commits it, the tool returns an
-`approve_apply` recovery action with the same thread, preview id, both hashes,
-approval evidence, exact approval message, and idempotency key. Replaying it
+If an approval response is lost after Dev Hub commits it, the public facade
+returns a recovery path bound to the same thread, preview id, both hashes,
+approval evidence, exact approval message, and idempotency key. Resuming it
 from the same scoped provider event returns the existing apply binding and
 cannot enqueue a second Jira operation. Typed Hub rejections—including
 same-turn approval, ambiguous intent, an unbound provider, stale hashes, and

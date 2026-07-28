@@ -4995,3 +4995,395 @@ class TestThreadContextUnverifiedTagging:
         # Renders successfully without trust tag (exception → unknown trust).
         assert "U_X: hello" in content
         assert "[unverified]" not in content
+
+
+class _SemanticSlackResponse:
+    def __init__(
+        self,
+        payload=None,
+        *,
+        status=200,
+        headers=None,
+        json_error=None,
+        text="",
+    ):
+        self.payload = payload
+        self.status = status
+        self.headers = headers or {}
+        self.json_error = json_error
+        self.response_text = text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def json(self):
+        if self.json_error is not None:
+            raise self.json_error
+        return self.payload
+
+    async def text(self):
+        return self.response_text
+
+
+class _SemanticSlackSession:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.posts = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    def post(self, *args, **kwargs):
+        self.posts.append((args, kwargs))
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def _semantic_slack_metadata():
+    from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+    return {
+        "semantic_delivery_contract": SEMANTIC_DELIVERY_CONTRACT,
+        "semantic_delivery_id": "delivery-slack-live-exact",
+        "semantic_delivery_target": (
+            "slack:preview-target-v1:channel-c1"
+        ),
+        "semantic_delivery_unit": 0,
+    }
+
+
+class TestSlackLiveSemanticExactSend:
+    @pytest.mark.asyncio
+    async def test_success_is_one_direct_http_write(self, adapter, monkeypatch):
+        adapter._app.client.token = "xoxb-workspace-one"
+        response = _SemanticSlackResponse(
+            {"ok": True, "ts": "1712345678.001"}
+        )
+        session = _SemanticSlackSession(response=response)
+        monkeypatch.setattr(
+            _slack_mod.aiohttp,
+            "ClientSession",
+            lambda **_kwargs: session,
+        )
+
+        result = await adapter.send(
+            "C1",
+            "Exact preview",
+            metadata=_semantic_slack_metadata(),
+        )
+
+        assert result.success is True
+        assert result.message_id == "1712345678.001"
+        assert len(session.posts) == 1
+        assert (
+            session.posts[0][1]["headers"]["Authorization"]
+            == "Bearer xoxb-workspace-one"
+        )
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_permanent_rejection_is_one_write(
+        self,
+        adapter,
+        monkeypatch,
+    ):
+        adapter._app.client.token = "xoxb-workspace-one"
+        session = _SemanticSlackSession(
+            response=_SemanticSlackResponse(
+                {"ok": False, "error": "invalid_auth"},
+            )
+        )
+        monkeypatch.setattr(
+            _slack_mod.aiohttp,
+            "ClientSession",
+            lambda **_kwargs: session,
+        )
+
+        result = await adapter.send(
+            "C1",
+            "Exact preview",
+            metadata=_semantic_slack_metadata(),
+        )
+
+        assert result.success is False
+        assert result.raw_response["provider_write_attempted"] is False
+        assert result.raw_response["provider_retryable"] is False
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["provider"] == "Slack"
+        assert rejection["status"] == 200
+        assert rejection["body_preview"] == (
+            '{"error":"invalid_auth","ok":false}'
+        )
+        assert rejection["body_sha256"] in result.error
+        assert len(session.posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_malformed_success_preserves_redacted_bounded_body_evidence(
+        self,
+        adapter,
+        monkeypatch,
+    ):
+        adapter._app.client.token = "xoxb-workspace-one"
+        secret = "super-secret-provider-token-" + ("x" * 5_000)
+        body = f"Authorization: Bearer {secret}"
+        session = _SemanticSlackSession(
+            response=_SemanticSlackResponse(
+                status=200,
+                json_error=ValueError("invalid JSON"),
+                text=body,
+            )
+        )
+        monkeypatch.setattr(
+            _slack_mod.aiohttp,
+            "ClientSession",
+            lambda **_kwargs: session,
+        )
+
+        result = await adapter.send(
+            "C1",
+            "Exact preview",
+            metadata=_semantic_slack_metadata(),
+        )
+
+        assert result.success is False
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["provider"] == "Slack"
+        assert rejection["status"] == 200
+        assert rejection["body_sha256"] in result.error
+        assert rejection["truncated"] is True
+        assert rejection["redacted"] is True
+        assert secret not in rejection["body_preview"]
+        assert secret not in result.error
+        assert len(session.posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_is_one_write_and_retryable(
+        self,
+        adapter,
+        monkeypatch,
+    ):
+        adapter._app.client.token = "xoxb-workspace-one"
+        session = _SemanticSlackSession(
+            response=_SemanticSlackResponse(
+                {"ok": False, "error": "ratelimited"},
+                status=429,
+                headers={"Retry-After": "5"},
+            )
+        )
+        monkeypatch.setattr(
+            _slack_mod.aiohttp,
+            "ClientSession",
+            lambda **_kwargs: session,
+        )
+
+        result = await adapter.send(
+            "C1",
+            "Exact preview",
+            metadata=_semantic_slack_metadata(),
+        )
+
+        assert result.success is False
+        assert result.retry_after == 5
+        assert result.raw_response["provider_write_attempted"] is False
+        assert result.raw_response["provider_retryable"] is True
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["provider"] == "Slack"
+        assert rejection["status"] == 429
+        assert rejection["body_sha256"] in result.error
+        assert len(session.posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_transport_loss_is_one_write_and_ambiguous(
+        self,
+        adapter,
+        monkeypatch,
+    ):
+        adapter._app.client.token = "xoxb-workspace-one"
+        session = _SemanticSlackSession(
+            error=ConnectionResetError("lost after write")
+        )
+        monkeypatch.setattr(
+            _slack_mod.aiohttp,
+            "ClientSession",
+            lambda **_kwargs: session,
+        )
+
+        result = await adapter.send(
+            "C1",
+            "Exact preview",
+            metadata=_semantic_slack_metadata(),
+        )
+
+        assert result.success is False
+        assert result.raw_response == {}
+        assert len(session.posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_oversized_payload_is_zero_writes(
+        self,
+        adapter,
+        monkeypatch,
+    ):
+        adapter.MAX_MESSAGE_LENGTH = 20
+        session_factory = MagicMock()
+        monkeypatch.setattr(
+            _slack_mod.aiohttp,
+            "ClientSession",
+            session_factory,
+        )
+
+        result = await adapter.send(
+            "C1",
+            "A" * 200,
+            metadata=_semantic_slack_metadata(),
+        )
+
+        assert result.success is False
+        assert result.raw_response == {
+            "provider_write_attempted": False,
+            "provider_retryable": False,
+        }
+        session_factory.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("receipt_id", "accepted"),
+    [
+        ("  slack-" + ("訊" * 2_048) + "-receipt  ", True),
+        (7, False),
+        ("slack\tcontrol", False),
+        ("\ud800", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_slack_live_exact_receipt_boundary(
+    receipt_id,
+    accepted,
+    adapter,
+    monkeypatch,
+):
+    adapter._app.client.token = "xoxb-workspace-one"
+    session = _SemanticSlackSession(
+        response=_SemanticSlackResponse(
+            {"ok": True, "ts": receipt_id},
+        )
+    )
+    monkeypatch.setattr(
+        _slack_mod.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: session,
+    )
+
+    result = await adapter.send(
+        "C1",
+        "Exact preview",
+        metadata=_semantic_slack_metadata(),
+    )
+
+    assert result.success is accepted
+    if accepted:
+        assert result.message_id == receipt_id
+    else:
+        rejection = result.raw_response["provider_rejection"]
+        assert rejection["provider"] == "Slack"
+        assert rejection["status"] == 200
+        assert rejection["body_sha256"] in result.error
+    assert len(session.posts) == 1
+
+
+@pytest.mark.parametrize(
+    ("receipt_id", "accepted"),
+    [
+        ("  slack-" + ("訊" * 2_048) + "-receipt  ", True),
+        (7, False),
+        ("slack\tcontrol", False),
+        ("\ud800", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_slack_standalone_exact_receipt_boundary(
+    receipt_id,
+    accepted,
+    monkeypatch,
+):
+    from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+    session = _SemanticSlackSession(
+        response=_SemanticSlackResponse(
+            {"ok": True, "ts": receipt_id},
+        )
+    )
+    monkeypatch.setattr(
+        _slack_mod.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: session,
+    )
+
+    result = await _slack_mod._standalone_send(
+        PlatformConfig(enabled=True, token="xoxb-standalone"),
+        "C1",
+        "Exact preview",
+        delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+        delivery_id="delivery-slack-standalone",
+        delivery_target="slack:preview-target-v1:C1",
+        semantic_exact_attempt=True,
+    )
+
+    assert bool(result.get("success")) is accepted
+    if accepted:
+        assert result["message_id"] == receipt_id
+    else:
+        rejection = result["provider_rejection"]
+        assert rejection["provider"] == "Slack"
+        assert rejection["status"] == 200
+        assert rejection["body_sha256"] in result["error"]
+    assert len(session.posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_slack_standalone_malformed_success_has_bounded_evidence(
+    monkeypatch,
+):
+    from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+    secret = "super-secret-provider-token-" + ("x" * 5_000)
+    session = _SemanticSlackSession(
+        response=_SemanticSlackResponse(
+            status=200,
+            json_error=ValueError("invalid JSON"),
+            text=f"Authorization: Bearer {secret}",
+        )
+    )
+    monkeypatch.setattr(
+        _slack_mod.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: session,
+    )
+
+    result = await _slack_mod._standalone_send(
+        PlatformConfig(enabled=True, token="xoxb-standalone"),
+        "C1",
+        "Exact preview",
+        delivery_contract=SEMANTIC_DELIVERY_CONTRACT,
+        delivery_id="delivery-slack-standalone",
+        delivery_target="slack:preview-target-v1:C1",
+        semantic_exact_attempt=True,
+    )
+
+    rejection = result["provider_rejection"]
+    assert rejection["provider"] == "Slack"
+    assert rejection["status"] == 200
+    assert rejection["body_sha256"] in result["error"]
+    assert rejection["truncated"] is True
+    assert rejection["redacted"] is True
+    assert secret not in rejection["body_preview"]
+    assert secret not in result["error"]
+    assert len(session.posts) == 1

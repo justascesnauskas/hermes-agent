@@ -47,6 +47,20 @@ from gateway.platforms.base import (
     merge_pending_message_event,
 )
 from gateway.session import build_session_key
+from gateway.platform_registry import declare_semantic_exact_attempt
+
+
+declare_semantic_exact_attempt(
+    "raft",
+    standalone=False,
+    live=False,
+    # Plugin discovery can load this source under an isolated
+    # ``hermes_plugins.*`` module alias. Keep one stable declaration owner so
+    # those byte-identical loads remain idempotent instead of looking like
+    # two providers fighting over the same contract.
+    owner="hermes.raft",
+    planning_ineligible_reason="external_cli_without_response_receipt",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -835,6 +849,8 @@ def register(ctx) -> None:
         install_hint="Install the Raft CLI from https://raft.build",
         setup_fn=interactive_setup,
         env_enablement_fn=_env_enablement,
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=False,
         emoji="🔔",
         platform_hint=(
             "You are connected to Raft via an external-agent channel. "

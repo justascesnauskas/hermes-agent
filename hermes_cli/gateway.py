@@ -6269,32 +6269,31 @@ def _configure_platform(platform: dict) -> None:
 
     if entry is not None and entry.setup_fn is not None:
         entry.setup_fn()
-        return
-
-    fn = _builtin_setup_fn(platform["key"])
-    if fn is not None:
-        fn()
-        return
-
-    if platform.get("vars"):
-        _setup_standard_platform(platform)
-        return
-
-    # Plugin with no setup helper — show env-var instructions.
-    label = platform.get("label", platform["key"])
-    emoji = platform.get("emoji", "🔌")
-    print()
-    print(color(f"  ─── {emoji} {label} Setup ───", Colors.CYAN))
-    required = entry.required_env if entry else []
-    if required:
-        print_info(f"  Set these env vars in ~/.hermes/.env: {', '.join(required)}")
     else:
-        print_info(
-            f"  Configure {label} in config.yaml under gateway.platforms.{platform['key']}"
-        )
-    if platform.get("install_hint"):
-        print_info(f"  {platform['install_hint']}")
-
+        fn = _builtin_setup_fn(platform["key"])
+        if fn is not None:
+            fn()
+        elif platform.get("vars"):
+            _setup_standard_platform(platform)
+        else:
+            # Plugin with no setup helper — show env-var instructions.
+            label = platform.get("label", platform["key"])
+            emoji = platform.get("emoji", "🔌")
+            print()
+            print(color(f"  ─── {emoji} {label} Setup ───", Colors.CYAN))
+            required = entry.required_env if entry else []
+            if required:
+                print_info(
+                    f"  Set these env vars in ~/.hermes/.env: "
+                    f"{', '.join(required)}"
+                )
+            else:
+                print_info(
+                    f"  Configure {label} in config.yaml under "
+                    f"gateway.platforms.{platform['key']}"
+                )
+            if platform.get("install_hint"):
+                print_info(f"  {platform['install_hint']}")
 
 def gateway_setup():
     """Interactive setup for messaging platforms + gateway service."""
@@ -6398,6 +6397,15 @@ def gateway_setup():
             break
 
         _configure_platform(platforms[choice])
+
+    # The standalone ``hermes gateway setup`` surface shares the same
+    # one-scan provisioning boundary as ``hermes setup gateway``. Every
+    # selected platform has persisted its credentials before this point.
+    from hermes_cli.delivery_account_provisioning import (
+        run_lifecycle_provisioning,
+    )
+
+    run_lifecycle_provisioning(quiet=False)
 
     # ── Post-setup: offer to install/restart gateway ──
     # Consider any platform (built-in or plugin) where the user has made

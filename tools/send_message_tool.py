@@ -140,9 +140,22 @@ def _sanitize_error_text(text) -> str:
     return redacted
 
 
-def _error(message: str) -> dict:
+def _error(
+    message: str,
+    *,
+    provider_write_attempted: bool | None = None,
+    provider_retryable: bool | None = None,
+    provider_rejection: dict | None = None,
+) -> dict:
     """Build a standardized error payload with redacted content."""
-    return {"error": _sanitize_error_text(message)}
+    payload = {"error": _sanitize_error_text(message)}
+    if provider_write_attempted is not None:
+        payload["provider_write_attempted"] = provider_write_attempted
+    if provider_retryable is not None:
+        payload["provider_retryable"] = provider_retryable
+    if provider_rejection is not None:
+        payload["provider_rejection"] = provider_rejection
+    return payload
 
 
 def _display_chat_id(platform_name: str, chat_id: str) -> str:
@@ -356,6 +369,11 @@ def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
+    delivery_contract = str(args.get("delivery_contract") or "").strip() or None
+    delivery_id = str(args.get("delivery_id") or "").strip() or None
+    delivery_target = (
+        str(args.get("delivery_target") or target).strip() or None
+    )
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
@@ -380,30 +398,52 @@ def _handle_send(args):
             else:
                 return json.dumps({
                     "error": f"Could not resolve '{target_ref}' on {platform_name}. "
-                    f"Use send_message(action='list') to see available targets."
+                    f"Use send_message(action='list') to see available targets.",
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
                 })
         except Exception:
             return json.dumps({
                 "error": f"Could not resolve '{target_ref}' on {platform_name}. "
-                f"Try using a numeric channel ID instead."
+                f"Try using a numeric channel ID instead.",
+                "provider_write_attempted": False,
+                "provider_retryable": True,
             })
 
     from tools.interrupt import is_interrupted
     if is_interrupted():
-        return tool_error("Interrupted")
+        return json.dumps(
+            _error(
+                "Interrupted",
+                provider_write_attempted=False,
+                provider_retryable=True,
+            )
+        )
 
     try:
         from gateway.config import load_gateway_config, Platform
         config = load_gateway_config()
     except Exception as e:
-        return json.dumps(_error(f"Failed to load gateway config: {e}"))
+        return json.dumps(
+            _error(
+                f"Failed to load gateway config: {e}",
+                provider_write_attempted=False,
+                provider_retryable=True,
+            )
+        )
 
     # Accept any platform name — built-in names resolve to their enum
     # member, plugin platform names create dynamic members via _missing_().
     try:
         platform = Platform(platform_name)
     except (ValueError, KeyError):
-        return tool_error(f"Unknown platform: {platform_name}")
+        return json.dumps(
+            _error(
+                f"Unknown platform: {platform_name}",
+                provider_write_attempted=False,
+                provider_retryable=False,
+            )
+        )
 
     pconfig = config.platforms.get(platform)
     if not pconfig or not pconfig.enabled:
@@ -424,9 +464,25 @@ def _handle_send(args):
                     },
                 )
             else:
-                return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
+                return json.dumps(
+                    _error(
+                        f"Platform '{platform_name}' is not configured. "
+                        "Set up credentials in ~/.hermes/config.yaml or "
+                        "environment variables.",
+                        provider_write_attempted=False,
+                        provider_retryable=True,
+                    )
+                )
         else:
-            return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
+            return json.dumps(
+                _error(
+                    f"Platform '{platform_name}' is not configured. "
+                    "Set up credentials in ~/.hermes/config.yaml or "
+                    "environment variables.",
+                    provider_write_attempted=False,
+                    provider_retryable=True,
+                )
+            )
 
     from gateway.platforms.base import BasePlatformAdapter
 
@@ -458,11 +514,23 @@ def _handle_send(args):
             return json.dumps({
                 "error": f"No home channel set for {platform_name} to determine where to send the message. "
                 f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
-                f"or set a home channel via: hermes config set {home_env} <channel_id>"
+                f"or set a home channel via: hermes config set {home_env} <channel_id>",
+                "provider_write_attempted": False,
+                "provider_retryable": True,
             })
 
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
+        if delivery_contract:
+            return json.dumps(
+                {
+                    "error": (
+                        "semantic_delivery_cron_duplicate_suppressed"
+                    ),
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                }
+            )
         return json.dumps(duplicate_skip)
 
     # Slack: resolve user IDs (U...) to DM channel IDs via conversations.open
@@ -483,21 +551,47 @@ def _handle_send(args):
             if dm_channel:
                 chat_id = dm_channel
             else:
-                return json.dumps({"error": f"Could not open DM with Slack user {chat_id}. Check bot permissions (im:write)."})
+                return json.dumps(
+                    {
+                        "error": (
+                            f"Could not open DM with Slack user {chat_id}. "
+                            "Check bot permissions (im:write)."
+                        ),
+                        "provider_write_attempted": False,
+                        "provider_retryable": True,
+                    }
+                )
         except Exception as e:
-            return json.dumps({"error": f"Failed to open Slack DM: {e}"})
+            return json.dumps(
+                {
+                    "error": f"Failed to open Slack DM: {e}",
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                }
+            )
 
     try:
         from model_tools import _run_async
+        platform_send_kwargs = {
+            "thread_id": thread_id,
+            "media_files": media_files,
+            "force_document": force_document_attachments,
+        }
+        if delivery_contract:
+            platform_send_kwargs.update(
+                {
+                    "delivery_contract": delivery_contract,
+                    "delivery_id": delivery_id,
+                    "delivery_target": delivery_target,
+                }
+            )
         result = _run_async(
             _send_to_platform(
                 platform,
                 pconfig,
                 chat_id,
                 cleaned_message,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document_attachments,
+                **platform_send_kwargs,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -691,6 +785,10 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    delivery_contract=None,
+    delivery_id=None,
+    delivery_target=None,
+    delivery_unit=0,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -704,6 +802,59 @@ async def _send_via_adapter(
       3. A descriptive error explaining both options.
     """
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
+    entry = None
+    try:
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get(platform_name)
+    except Exception:
+        entry = None
+
+    if delivery_contract:
+        if (
+            entry is None
+            or not entry.semantic_exact_attempt
+            or entry.standalone_semantic_exact_attempt_fn is None
+        ):
+            return {
+                "error": "semantic_delivery_provider_capability_required",
+                "provider_write_attempted": False,
+                "provider_retryable": False,
+            }
+        try:
+            result = await entry.standalone_semantic_exact_attempt_fn(
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files,
+                force_document=force_document,
+                delivery_contract=delivery_contract,
+                delivery_id=delivery_id,
+                delivery_target=delivery_target,
+                delivery_unit=delivery_unit,
+                semantic_exact_attempt=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(
+                "Semantic plugin send for %s raised",
+                platform_name,
+                exc_info=True,
+            )
+            return {
+                "error": f"Semantic plugin send failed: {e}",
+                "provider_write_attempted": None,
+            }
+        if isinstance(result, dict) and (
+            result.get("success") or result.get("error")
+        ):
+            return result
+        return {
+            "error": "semantic_delivery_provider_receipt_invalid",
+            "provider_write_attempted": None,
+        }
+
     runner = None
     try:
         from gateway.run import _gateway_runner_ref
@@ -733,13 +884,6 @@ async def _send_via_adapter(
             if result.success:
                 return {"success": True, "message_id": result.message_id}
             return {"error": f"Adapter send failed: {result.error}"}
-
-    entry = None
-    try:
-        from gateway.platform_registry import platform_registry
-        entry = platform_registry.get(platform_name)
-    except Exception:
-        entry = None
 
     if entry is not None and entry.standalone_sender_fn is not None:
         try:
@@ -773,11 +917,24 @@ async def _send_via_adapter(
             f"running with this platform connected? For out-of-process delivery "
             f"(e.g. cron in a separate process), the platform plugin must "
             f"register a standalone_sender_fn on its PlatformEntry."
-        )
+        ),
+        "provider_write_attempted": False,
+        "provider_retryable": True,
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    delivery_contract=None,
+    delivery_id=None,
+    delivery_target=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -787,6 +944,35 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.config import Platform
 
     media_files = media_files or []
+    platform_name = (
+        platform.value if hasattr(platform, "value") else str(platform)
+    )
+
+    if delivery_contract:
+        try:
+            from gateway.platform_registry import (
+                supports_semantic_exact_attempt,
+            )
+        except Exception:
+            semantic_capable = False
+        else:
+            semantic_capable = supports_semantic_exact_attempt(platform_name)
+        if not semantic_capable:
+            return {
+                "error": "semantic_delivery_provider_capability_required",
+                "provider_write_attempted": False,
+                "provider_retryable": False,
+            }
+        if media_files and platform in {Platform.MATRIX, Platform.SLACK}:
+            # Matrix's native-media helper fans one logical payload out across
+            # text/upload provider writes, while the Slack text branch omits
+            # MEDIA entirely. Neither shape can settle a ledger row whose
+            # digest covers the original MEDIA-bearing content.
+            return {
+                "error": "semantic_delivery_media_shape_unsupported",
+                "provider_write_attempted": False,
+                "provider_retryable": False,
+            }
 
     # Weixin handles text/media delivery inside its native helper and does not
     # need the optional platform adapter imports below. Keep this branch early
@@ -819,6 +1005,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # migrated to plugins in #41112).
     _MAX_LENGTHS = {
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH if _telegram_available else 4096,
+        # Canonical built-in limit from gateway.platforms.signal.
+        Platform.SIGNAL: 8000,
     }
 
     # Check plugin registry for max_message_length
@@ -841,6 +1029,24 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     else:
         chunks = [message]
 
+    # Signal's exact semantic route must map one delivery identity to one
+    # JSON-RPC ``send`` call. Refuse any shape that would require multiple
+    # provider writes before entering the transport helper.
+    if delivery_contract and platform == Platform.SIGNAL:
+        if len(chunks) != 1:
+            return _error(
+                "semantic_delivery_message_requires_multiple_writes",
+                provider_write_attempted=False,
+                provider_retryable=False,
+            )
+        return await _send_signal(
+            pconfig.extra,
+            chat_id,
+            chunks[0],
+            media_files=media_files,
+            semantic_exact_attempt=True,
+        )
+
     # --- Telegram: special handling for media attachments ---
     # _send_telegram now owns text chunking internally — it formats the full
     # message (MarkdownV2/HTML) and then splits the *formatted* text on UTF-16
@@ -849,14 +1055,19 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # after all text chunks.
     if platform == Platform.TELEGRAM:
         disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
+        telegram_kwargs = {
+            "media_files": media_files,
+            "thread_id": thread_id,
+            "disable_link_previews": disable_link_previews,
+            "force_document": force_document,
+        }
+        if delivery_contract:
+            telegram_kwargs["semantic_exact_attempt"] = True
         return await _send_telegram(
             pconfig.token,
             chat_id,
             message,
-            media_files=media_files,
-            thread_id=thread_id,
-            disable_link_previews=disable_link_previews,
-            force_document=force_document,
+            **telegram_kwargs,
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -869,8 +1080,20 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform == Platform.DISCORD:
         from gateway.platform_registry import platform_registry
         entry = platform_registry.get("discord")
-        if entry is None or entry.standalone_sender_fn is None:
-            return {"error": "Discord plugin not registered or missing standalone_sender_fn"}
+        discord_sender = (
+            entry.standalone_semantic_exact_attempt_fn
+            if entry is not None and delivery_contract
+            else (entry.standalone_sender_fn if entry is not None else None)
+        )
+        if discord_sender is None:
+            return {
+                "error": (
+                    "Discord plugin not registered or missing "
+                    "standalone_sender_fn"
+                ),
+                "provider_write_attempted": False,
+                "provider_retryable": True,
+            }
         # MEDIA:<path> caption: single captionable file + short text rides as
         # the media message content instead of a separate message before the
         # attachment (single enforced decision in _media_caption_split). Cap on
@@ -880,30 +1103,83 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
         )
         if _dc_caption is not None:
-            result = await entry.standalone_sender_fn(
+            discord_kwargs = {
+                "thread_id": thread_id,
+                "media_files": media_files,
+                "caption": _dc_caption,
+            }
+            if delivery_contract:
+                discord_kwargs.update(
+                    {
+                        "delivery_contract": delivery_contract,
+                        "delivery_id": delivery_id,
+                        "delivery_target": delivery_target,
+                        "delivery_unit": 0,
+                        "semantic_exact_attempt": True,
+                    }
+                )
+            result = await discord_sender(
                 pconfig,
                 chat_id,
                 "",
-                thread_id=thread_id,
-                media_files=media_files,
-                caption=_dc_caption,
+                **discord_kwargs,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
             return result
         last_result = None
+        semantic_message_ids = []
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            result = await entry.standalone_sender_fn(
+            discord_kwargs = {
+                "thread_id": thread_id,
+                "media_files": media_files if is_last else [],
+            }
+            if delivery_contract:
+                discord_kwargs.update(
+                    {
+                        "delivery_contract": delivery_contract,
+                        "delivery_id": delivery_id,
+                        "delivery_target": delivery_target,
+                        "delivery_unit": i,
+                        "semantic_exact_attempt": True,
+                    }
+                )
+            result = await discord_sender(
                 pconfig,
                 chat_id,
                 chunk,
-                thread_id=thread_id,
-                media_files=media_files if is_last else [],
+                **discord_kwargs,
             )
             if isinstance(result, dict) and result.get("error"):
+                if delivery_contract and semantic_message_ids:
+                    result = dict(result)
+                    result.update(
+                        {
+                            "error": "semantic_delivery_partial_write",
+                            "message_ids": list(semantic_message_ids),
+                            "provider_write_attempted": True,
+                            "provider_retryable": False,
+                        }
+                    )
                 return result
+            if delivery_contract and isinstance(result, dict):
+                result_ids = result.get("message_ids")
+                if not isinstance(result_ids, (list, tuple)):
+                    result_ids = [result.get("message_id")]
+                for message_id in result_ids:
+                    if message_id and message_id not in semantic_message_ids:
+                        semantic_message_ids.append(message_id)
             last_result = result
+        if (
+            delivery_contract
+            and isinstance(last_result, dict)
+            and last_result.get("success")
+        ):
+            last_result = dict(last_result)
+            last_result["message_ids"] = semantic_message_ids
+            if semantic_message_ids:
+                last_result["message_id"] = semantic_message_ids[-1]
         return last_result
 
     # --- Matrix: route ALL sends through the native adapter so text is
@@ -913,18 +1189,57 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # back to an encryption-aware ephemeral adapter for standalone/cron. ---
     if platform == Platform.MATRIX:
         last_result = None
+        semantic_message_ids = []
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
+            matrix_kwargs = {
+                "media_files": media_files if is_last else [],
+                "thread_id": thread_id,
+            }
+            if delivery_contract:
+                matrix_kwargs.update(
+                    {
+                        "delivery_contract": delivery_contract,
+                        "delivery_id": delivery_id,
+                        "delivery_target": delivery_target,
+                        "delivery_unit": i,
+                    }
+                )
             result = await _send_matrix_via_adapter(
                 pconfig,
                 chat_id,
                 chunk,
-                media_files=media_files if is_last else [],
-                thread_id=thread_id,
+                **matrix_kwargs,
             )
             if isinstance(result, dict) and result.get("error"):
+                if delivery_contract and semantic_message_ids:
+                    result = dict(result)
+                    result.update(
+                        {
+                            "error": "semantic_delivery_partial_write",
+                            "message_ids": list(semantic_message_ids),
+                            "provider_write_attempted": True,
+                            "provider_retryable": False,
+                        }
+                    )
                 return result
+            if delivery_contract and isinstance(result, dict):
+                result_ids = result.get("message_ids")
+                if not isinstance(result_ids, (list, tuple)):
+                    result_ids = [result.get("message_id")]
+                for message_id in result_ids:
+                    if message_id and message_id not in semantic_message_ids:
+                        semantic_message_ids.append(message_id)
             last_result = result
+        if (
+            delivery_contract
+            and isinstance(last_result, dict)
+            and last_result.get("success")
+        ):
+            last_result = dict(last_result)
+            last_result["message_ids"] = semantic_message_ids
+            if semantic_message_ids:
+                last_result["message_id"] = semantic_message_ids[-1]
         return last_result
 
     # --- Signal: native attachment support via JSON-RPC attachments param ---
@@ -932,11 +1247,16 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
+            signal_kwargs = {
+                "media_files": media_files if is_last else [],
+            }
+            if delivery_contract:
+                signal_kwargs["semantic_exact_attempt"] = True
             result = await _send_signal(
                 pconfig.extra,
                 chat_id,
                 chunk,
-                media_files=media_files if is_last else [],
+                **signal_kwargs,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1048,23 +1368,62 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         )
 
     last_result = None
-    for chunk in chunks:
+    semantic_message_ids = []
+    for delivery_unit, chunk in enumerate(chunks):
         if platform == Platform.SLACK:
             # Slack migrated to a bundled plugin (#41112); delivery flows
             # through the registry's standalone_sender_fn, which applies
             # mrkdwn formatting and posts via the Slack Web API.
             from gateway.platform_registry import platform_registry
             _slack_entry = platform_registry.get("slack")
-            if _slack_entry is None or _slack_entry.standalone_sender_fn is None:
-                result = {"error": "Slack plugin not registered or missing standalone_sender_fn"}
+            slack_sender = (
+                _slack_entry.standalone_semantic_exact_attempt_fn
+                if _slack_entry is not None and delivery_contract
+                else (
+                    _slack_entry.standalone_sender_fn
+                    if _slack_entry is not None
+                    else None
+                )
+            )
+            if slack_sender is None:
+                result = {
+                    "error": (
+                        "Slack plugin not registered or missing "
+                        "standalone_sender_fn"
+                    ),
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                }
             else:
-                result = await _slack_entry.standalone_sender_fn(
-                    pconfig, chat_id, chunk, thread_id=thread_id
+                slack_kwargs = {"thread_id": thread_id}
+                if delivery_contract:
+                    slack_kwargs.update(
+                        {
+                            "delivery_contract": delivery_contract,
+                            "delivery_id": delivery_id,
+                            "delivery_target": delivery_target,
+                            "delivery_unit": delivery_unit,
+                            "semantic_exact_attempt": True,
+                        }
+                    )
+                result = await slack_sender(
+                    pconfig,
+                    chat_id,
+                    chunk,
+                    **slack_kwargs,
                 )
         elif platform == Platform.WHATSAPP:
             result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.SIGNAL:
-            result = await _send_signal(pconfig.extra, chat_id, chunk)
+            signal_kwargs = {}
+            if delivery_contract:
+                signal_kwargs["semantic_exact_attempt"] = True
+            result = await _send_signal(
+                pconfig.extra,
+                chat_id,
+                chunk,
+                **signal_kwargs,
+            )
         elif platform == Platform.EMAIL:
             result = await _registry_standalone_send("email", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.SMS:
@@ -1084,19 +1443,58 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         else:
             # Plugin platform: route through the gateway's live adapter if
             # available, otherwise the plugin's standalone_sender_fn.
+            adapter_kwargs = {
+                "thread_id": thread_id,
+                "media_files": media_files,
+                "force_document": force_document,
+            }
+            if delivery_contract:
+                adapter_kwargs.update(
+                    {
+                        "delivery_contract": delivery_contract,
+                        "delivery_id": delivery_id,
+                        "delivery_target": delivery_target,
+                        "delivery_unit": delivery_unit,
+                    }
+                )
             result = await _send_via_adapter(
                 platform,
                 pconfig,
                 chat_id,
                 chunk,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document,
+                **adapter_kwargs,
             )
 
         if isinstance(result, dict) and result.get("error"):
+            if delivery_contract and semantic_message_ids:
+                result = dict(result)
+                result.update(
+                    {
+                        "error": "semantic_delivery_partial_write",
+                        "message_ids": list(semantic_message_ids),
+                        "provider_write_attempted": True,
+                        "provider_retryable": False,
+                    }
+                )
             return result
+        if delivery_contract and isinstance(result, dict):
+            result_ids = result.get("message_ids")
+            if not isinstance(result_ids, (list, tuple)):
+                result_ids = [result.get("message_id")]
+            for message_id in result_ids:
+                if message_id and message_id not in semantic_message_ids:
+                    semantic_message_ids.append(message_id)
         last_result = result
+
+    if (
+        delivery_contract
+        and isinstance(last_result, dict)
+        and last_result.get("success")
+    ):
+        last_result = dict(last_result)
+        last_result["message_ids"] = semantic_message_ids
+        if semantic_message_ids:
+            last_result["message_id"] = semantic_message_ids[-1]
 
     if warning and isinstance(last_result, dict) and last_result.get("success"):
         warnings = list(last_result.get("warnings", []))
@@ -1114,7 +1512,16 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(
+    token,
+    chat_id,
+    message,
+    media_files=None,
+    thread_id=None,
+    disable_link_previews=False,
+    force_document=False,
+    semantic_exact_attempt=False,
+):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1243,9 +1650,13 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     last_msg = await _send_telegram_message_with_retry(
                         bot,
                         chat_id=int_chat_id, text=chunk,
-                        parse_mode=send_parse_mode, **text_kwargs
+                        parse_mode=send_parse_mode,
+                        attempts=1 if semantic_exact_attempt else 3,
+                        **text_kwargs,
                     )
                 except Exception as md_error:
+                    if semantic_exact_attempt:
+                        raise
                     # Thread not found — retry without message_thread_id so the
                     # message still delivers (matching the gateway adapter's
                     # fallback behaviour, issue #27012).
@@ -1258,7 +1669,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=chunk,
-                            parse_mode=send_parse_mode, **text_kwargs
+                            parse_mode=send_parse_mode,
+                            attempts=3,
+                            **text_kwargs,
                         )
                     elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
                         logger.warning(
@@ -1277,7 +1690,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=plain,
-                            parse_mode=None, **text_kwargs
+                            parse_mode=None,
+                            attempts=3,
+                            **text_kwargs,
                         )
                     else:
                         raise
@@ -1290,7 +1705,11 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 # Caption mode suppressed the separate text send; if the file
                 # it was meant to caption is gone, deliver the caption text on
                 # its own so the words aren't silently lost.
-                if _tg_caption is not None and last_msg is None:
+                if (
+                    not semantic_exact_attempt
+                    and _tg_caption is not None
+                    and last_msg is None
+                ):
                     try:
                         last_msg = await _send_telegram_message_with_retry(
                             bot, chat_id=int_chat_id, text=_tg_caption,
@@ -1345,6 +1764,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                                 chat_id=int_chat_id, document=f, **media_kwargs
                             )
                     except Exception as media_err:
+                        if semantic_exact_attempt:
+                            raise
                         if _is_telegram_thread_not_found(media_err) and media_kwargs.get("message_thread_id"):
                             # Thread not found for media — retry without
                             # message_thread_id (issue #27012).
@@ -1416,8 +1837,17 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         if last_msg is None:
             error = "No deliverable text or media remained after processing MEDIA tags"
             if warnings:
-                return {"error": error, "warnings": warnings}
-            return {"error": error}
+                result = {"error": error, "warnings": warnings}
+            else:
+                result = {"error": error}
+            if semantic_exact_attempt:
+                result.update(
+                    {
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                    }
+                )
+            return result
 
         result = {
             "success": True,
@@ -1429,7 +1859,14 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             result["warnings"] = warnings
         return result
     except ImportError:
-        return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}
+        return {
+            "error": (
+                "python-telegram-bot not installed. "
+                "Run: pip install python-telegram-bot"
+            ),
+            "provider_write_attempted": False,
+            "provider_retryable": True,
+        }
     except Exception as e:
         return _error(f"Telegram send failed: {e}")
 
@@ -1458,7 +1895,13 @@ async def _registry_standalone_send(platform_name, pconfig, chat_id, message, th
 # wired via standalone_sender_fn and reached through _registry_standalone_send. #41112.
 
 
-async def _send_signal(extra, chat_id, message, media_files=None):
+async def _send_signal(
+    extra,
+    chat_id,
+    message,
+    media_files=None,
+    semantic_exact_attempt=False,
+):
     """Send via signal-cli JSON-RPC API.
 
     Supports both text-only and text-with-attachments (images/audio/documents).
@@ -1470,7 +1913,13 @@ async def _send_signal(extra, chat_id, message, media_files=None):
     try:
         import httpx
     except ImportError:
-        return {"error": "httpx not installed"}
+        return _error(
+            "httpx not installed",
+            provider_write_attempted=False
+            if semantic_exact_attempt
+            else None,
+            provider_retryable=True if semantic_exact_attempt else None,
+        )
 
     from gateway.platforms.signal_rate_limit import (
         SIGNAL_BATCH_PACING_NOTICE_THRESHOLD,
@@ -1483,19 +1932,58 @@ async def _send_signal(extra, chat_id, message, media_files=None):
         get_scheduler,
     )
     from gateway.platforms.signal_format import markdown_to_signal
+    from gateway.platforms.signal_result import (
+        validate_signal_send_result,
+    )
+    if semantic_exact_attempt:
+        from gateway.semantic_exact_attempt import (
+            provider_protocol_rejection_evidence,
+            provider_rejection_evidence,
+            provider_rejection_error,
+        )
 
     try:
         http_url = extra.get("http_url", "http://127.0.0.1:8080").rstrip("/")
         account = extra.get("account", "")
         if not account:
-            return {"error": "Signal account not configured"}
+            return _error(
+                "Signal account not configured",
+                provider_write_attempted=False
+                if semantic_exact_attempt
+                else None,
+                provider_retryable=False
+                if semantic_exact_attempt
+                else None,
+            )
 
         valid_media = media_files or []
         attachment_paths = []
-        for media_path, _is_voice in valid_media:
+        for media_item in valid_media:
+            if (
+                not isinstance(media_item, (tuple, list))
+                or len(media_item) != 2
+            ):
+                if semantic_exact_attempt:
+                    return _error(
+                        "semantic_delivery_media_shape_invalid",
+                        provider_write_attempted=False,
+                        provider_retryable=False,
+                    )
+                logger.warning(
+                    "Signal media entry has an invalid shape, skipping: %r",
+                    media_item,
+                )
+                continue
+            media_path, _is_voice = media_item
             if os.path.exists(media_path):
                 attachment_paths.append(media_path)
             else:
+                if semantic_exact_attempt:
+                    return _error(
+                        "semantic_delivery_media_missing",
+                        provider_write_attempted=False,
+                        provider_retryable=False,
+                    )
                 logger.warning("Signal media file not found, skipping: %s", media_path)
 
         # Chunk attachments. With no attachments we still emit one batch
@@ -1510,6 +1998,18 @@ async def _send_signal(extra, chat_id, message, media_files=None):
             att_batches = [[]]
 
         plain_text, text_styles = markdown_to_signal(message)
+        if semantic_exact_attempt and len(att_batches) != 1:
+            return _error(
+                "semantic_delivery_attachments_require_multiple_writes",
+                provider_write_attempted=False,
+                provider_retryable=False,
+            )
+        if semantic_exact_attempt and not plain_text and not attachment_paths:
+            return _error(
+                "semantic_delivery_message_empty",
+                provider_write_attempted=False,
+                provider_retryable=False,
+            )
 
         async def _post(batch_attachments, batch_message):
             params = {"account": account, "message": batch_message}
@@ -1535,7 +2035,7 @@ async def _send_signal(extra, chat_id, message, media_files=None):
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(f"{http_url}/api/v1/rpc", json=payload)
                 resp.raise_for_status()
-                return resp.json()
+                return resp
 
         async def _send_inline_notice(text: str) -> None:
             """Best-effort one-shot RPC for a user-facing pacing notice."""
@@ -1566,7 +2066,7 @@ async def _send_signal(extra, chat_id, message, media_files=None):
         failed_batches: list[int] = []
         for idx, att_batch in enumerate(att_batches):
             n = len(att_batch)
-            if n > 0:
+            if n > 0 and not semantic_exact_attempt:
                 estimated = scheduler.estimate_wait(n)
                 if estimated >= SIGNAL_BATCH_PACING_NOTICE_THRESHOLD:
                     await _send_inline_notice(
@@ -1576,25 +2076,145 @@ async def _send_signal(extra, chat_id, message, media_files=None):
 
             batch_message = plain_text if idx == 0 else ""
 
-            for attempt in range(1, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS + 1):
+            max_attempts = (
+                1
+                if semantic_exact_attempt
+                else SIGNAL_RATE_LIMIT_MAX_ATTEMPTS
+            )
+            for attempt in range(1, max_attempts + 1):
+                rpc_started = False
                 try:
                     await scheduler.acquire(n)
                     _rpc_t0 = time.monotonic()
-                    data = await _post(att_batch, batch_message)
+                    rpc_started = True
+                    response = await _post(att_batch, batch_message)
+                    try:
+                        data = response.json()
+                    except Exception:
+                        if not semantic_exact_attempt:
+                            raise
+                        rejection = provider_protocol_rejection_evidence(
+                            provider="Signal",
+                            protocol="signal-json-rpc",
+                            response=getattr(response, "text", None),
+                        )
+                        return _error(
+                            provider_rejection_error(rejection),
+                            provider_write_attempted=True,
+                            provider_retryable=False,
+                            provider_rejection=rejection,
+                        )
                     _rpc_duration = time.monotonic() - _rpc_t0
+                    if not isinstance(data, dict):
+                        if semantic_exact_attempt:
+                            rejection = provider_protocol_rejection_evidence(
+                                provider="Signal",
+                                protocol="signal-json-rpc",
+                                response=data,
+                            )
+                            return _error(
+                                provider_rejection_error(rejection),
+                                provider_write_attempted=True,
+                                provider_retryable=False,
+                                provider_rejection=rejection,
+                            )
+                        raise TypeError("Signal JSON-RPC response must be an object")
                     if "error" not in data:
                         await scheduler.report_rpc_duration(_rpc_duration, n)
+                        if semantic_exact_attempt:
+                            result = data.get("result")
+                            success, _failure = (
+                                validate_signal_send_result(result)
+                            )
+                            if not success:
+                                rejection = (
+                                    provider_protocol_rejection_evidence(
+                                        provider="Signal",
+                                        protocol="signal-json-rpc",
+                                        response=data,
+                                    )
+                                )
+                                return _error(
+                                    provider_rejection_error(rejection),
+                                    provider_write_attempted=False,
+                                    provider_retryable=False,
+                                    provider_rejection=rejection,
+                                )
+                            timestamp = (
+                                result.get("timestamp")
+                                if isinstance(result, dict)
+                                else None
+                            )
+                            if (
+                                not isinstance(timestamp, int)
+                                or isinstance(timestamp, bool)
+                                or timestamp <= 0
+                            ):
+                                rejection = provider_protocol_rejection_evidence(
+                                    provider="Signal",
+                                    protocol="signal-json-rpc",
+                                    response=data,
+                                )
+                                return _error(
+                                    provider_rejection_error(rejection),
+                                    provider_write_attempted=True,
+                                    provider_retryable=False,
+                                    provider_rejection=rejection,
+                                )
+                            message_id = str(timestamp)
+                            return {
+                                "success": True,
+                                "platform": "signal",
+                                "chat_id": _display_chat_id(
+                                    "signal",
+                                    chat_id,
+                                ),
+                                "message_id": message_id,
+                                "message_ids": [message_id],
+                            }
                         break
 
                     err = data["error"]
+                    rejection = (
+                        provider_protocol_rejection_evidence(
+                            provider="Signal",
+                            protocol="signal-json-rpc",
+                            response=data,
+                        )
+                        if semantic_exact_attempt
+                        else None
+                    )
 
                     if not _is_signal_rate_limit_error(err):
-                        return _error(f"Signal RPC error on batch {idx + 1}/{len(att_batches)}: {err}")
+                        return _error(
+                            (
+                                provider_rejection_error(rejection)
+                                if semantic_exact_attempt
+                                else (
+                                    f"Signal RPC error on batch "
+                                    f"{idx + 1}/{len(att_batches)}: {err}"
+                                )
+                            ),
+                            provider_write_attempted=False
+                            if semantic_exact_attempt
+                            else None,
+                            provider_retryable=False
+                            if semantic_exact_attempt
+                            else None,
+                            provider_rejection=rejection,
+                        )
 
                     server_retry_after = _extract_retry_after_seconds(err)
                     scheduler.feedback(server_retry_after, n)
+                    if semantic_exact_attempt:
+                        return _error(
+                            "Signal RPC rate limited",
+                            provider_write_attempted=False,
+                            provider_retryable=True,
+                            provider_rejection=rejection,
+                        )
 
-                    if attempt >= SIGNAL_RATE_LIMIT_MAX_ATTEMPTS:
+                    if attempt >= max_attempts:
                         failed_batches.append(idx + 1)
                         logger.error(
                             "Signal: rate-limit retries exhausted on batch %d/%d "
@@ -1608,11 +2228,77 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                         "(attempt %d/%d, server retry_after=%s); "
                         "scheduler will pace the retry",
                         idx + 1, len(att_batches),
-                        attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
+                        attempt, max_attempts,
                         f"{server_retry_after:.0f}s" if server_retry_after else "unknown",
                     )
                 except Exception as e:
-                    if attempt >= SIGNAL_RATE_LIMIT_MAX_ATTEMPTS:
+                    if semantic_exact_attempt:
+                        error_response = getattr(e, "response", None)
+                        status_code = getattr(
+                            error_response,
+                            "status_code",
+                            None,
+                        )
+                        rejection = (
+                            provider_rejection_evidence(
+                                provider="Signal JSON-RPC HTTP",
+                                status=status_code,
+                                body=getattr(error_response, "text", ""),
+                            )
+                            if isinstance(status_code, int)
+                            else None
+                        )
+                        if status_code == 429:
+                            return _error(
+                                provider_rejection_error(rejection),
+                                provider_write_attempted=False,
+                                provider_retryable=True,
+                                provider_rejection=rejection,
+                            )
+                        if (
+                            isinstance(status_code, int)
+                            and 400 <= status_code < 500
+                        ):
+                            return _error(
+                                provider_rejection_error(rejection),
+                                provider_write_attempted=False,
+                                provider_retryable=False,
+                                provider_rejection=rejection,
+                            )
+                        if isinstance(status_code, int):
+                            # A provider-side 5xx arrives after the request was
+                            # written but cannot prove whether Signal accepted
+                            # it. Preserve the rejection without authorizing a
+                            # retry that could duplicate the message.
+                            return _error(
+                                provider_rejection_error(rejection),
+                                provider_rejection=rejection,
+                            )
+                        if isinstance(
+                            e,
+                            (
+                                httpx.ConnectError,
+                                httpx.ConnectTimeout,
+                                httpx.PoolTimeout,
+                            ),
+                        ):
+                            return _error(
+                                f"Signal send failed before provider write: {e}",
+                                provider_write_attempted=False,
+                                provider_retryable=True,
+                            )
+                        if not rpc_started:
+                            return _error(
+                                f"Signal send failed before provider write: {e}",
+                                provider_write_attempted=False,
+                                provider_retryable=True,
+                            )
+                        # Once the HTTP attempt starts, a disconnect/timeout
+                        # cannot prove whether signal-cli accepted the send.
+                        return _error(
+                            f"Signal send outcome is uncertain: {e}",
+                        )
+                    if attempt >= max_attempts:
                         failed_batches.append(idx + 1)
                         logger.error(
                             "Signal: send error on batch %d/%d after %d attempts: %s",
@@ -1621,8 +2307,10 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                         break
                     logger.warning(
                         "Signal: transient error on batch %d/%d (attempt %d/%d): %s; will retry",
-                        idx + 1, len(att_batches), attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS, str(e)
+                        idx + 1, len(att_batches), attempt, max_attempts, str(e)
                     )
+            if semantic_exact_attempt and idx + 1 in failed_batches:
+                break
 
         warnings = []
         if len(attachment_paths) < len(valid_media):
@@ -1633,10 +2321,13 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                 f"(#{', #'.join(str(b) for b in failed_batches)})"
             )
 
-        if failed_batches and len(failed_batches) == len(att_batches):
+        if failed_batches and (
+            semantic_exact_attempt
+            or len(failed_batches) == len(att_batches)
+        ):
             return _error(
-                f"Signal: every batch ({len(att_batches)}) hit rate limit; "
-                f"no attachments delivered"
+                f"Signal: {len(failed_batches)} of {len(att_batches)} "
+                "batch(es) were not delivered"
             )
 
         result = {"success": True, "platform": "signal", "chat_id": _display_chat_id("signal", chat_id)}
@@ -1657,7 +2348,17 @@ async def _send_signal(extra, chat_id, message, media_files=None):
 # (_send_matrix_via_adapter below stays — it's the native-media upload path.)
 
 
-async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, thread_id=None):
+async def _send_matrix_via_adapter(
+    pconfig,
+    chat_id,
+    message,
+    media_files=None,
+    thread_id=None,
+    delivery_contract=None,
+    delivery_id=None,
+    delivery_target=None,
+    delivery_unit=0,
+):
     """Send via the Matrix adapter so native Matrix media uploads are preserved.
 
     When a live gateway adapter is available (i.e. the tool runs inside a
@@ -1669,7 +2370,20 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
     is running (standalone cron, ``hermes send`` CLI).
     """
     media_files = media_files or []
-    metadata = {"thread_id": thread_id} if thread_id else None
+    metadata = {"thread_id": thread_id} if thread_id else {}
+    if delivery_contract or delivery_id:
+        metadata.update(
+            {
+                "semantic_delivery_contract": delivery_contract,
+                "semantic_delivery_id": delivery_id,
+                "semantic_delivery_target": (
+                    delivery_target or f"matrix:{chat_id}"
+                ),
+                "semantic_delivery_unit": delivery_unit,
+            }
+        )
+    if not metadata:
+        metadata = None
 
     # --- Try the live gateway adapter first (persistent E2EE session) ---
     # Reusing the running gateway's already-connected adapter is the whole
@@ -1712,13 +2426,24 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
     try:
         from plugins.platforms.matrix.adapter import MatrixAdapter
     except ImportError:
-        return {"error": "Matrix dependencies not installed. Run: pip install 'mautrix[encryption]'"}
+        return {
+            "error": (
+                "Matrix dependencies not installed. Run: "
+                "pip install 'mautrix[encryption]'"
+            ),
+            "provider_write_attempted": False,
+            "provider_retryable": True,
+        }
 
     adapter = MatrixAdapter(pconfig)
     try:
         connected = await adapter.connect()
         if not connected:
-            return _error("Matrix connect failed")
+            return _error(
+                "Matrix connect failed",
+                provider_write_attempted=False,
+                provider_retryable=True,
+            )
         return await _matrix_send_core(
             adapter, chat_id, message, media_files, metadata
         )
@@ -1762,12 +2487,22 @@ async def _matrix_send_core(adapter, chat_id, message, media_files, metadata):
     if last_result is None:
         return {"error": "No deliverable text or media remained after processing MEDIA tags"}
 
-    return {
+    message_ids = []
+    for value in (
+        *(getattr(last_result, "continuation_message_ids", ()) or ()),
+        getattr(last_result, "message_id", None),
+    ):
+        if value and value not in message_ids:
+            message_ids.append(value)
+    result = {
         "success": True,
         "platform": "matrix",
         "chat_id": chat_id,
         "message_id": last_result.message_id,
     }
+    if metadata and metadata.get("semantic_delivery_contract"):
+        result["message_ids"] = message_ids
+    return result
 
 
 # _send_dingtalk moved to plugins/platforms/dingtalk/adapter.py::_standalone_send,

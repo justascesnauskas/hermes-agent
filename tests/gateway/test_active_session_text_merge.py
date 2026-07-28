@@ -116,6 +116,35 @@ def _debounced_event(adapter: BasePlatformAdapter, session_key: str) -> MessageE
 
 
 @pytest.mark.asyncio
+async def test_runner_owned_busy_admission_never_falls_into_base_ram_merge():
+    """A handled durable admission is a terminal Base routing decision."""
+
+    adapter = _make_adapter()
+    admitted = AsyncMock(return_value=True)
+    adapter._busy_session_handler = admitted
+    event = _make_event("one exact follow-up")
+    session_key = build_session_key(event.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    with (
+        patch(
+            "gateway.platforms.base.merge_pending_message_event",
+            side_effect=AssertionError("Base RAM merge must be unreachable"),
+        ),
+        patch.object(
+            adapter,
+            "_queue_text_debounce",
+            side_effect=AssertionError("Base debounce must be unreachable"),
+        ),
+    ):
+        await adapter.handle_message(event)
+
+    admitted.assert_awaited_once_with(event, session_key)
+    assert adapter._pending_messages == {}
+    assert adapter._text_debounce == {}
+
+
+@pytest.mark.asyncio
 async def test_rapid_text_followups_accumulate_instead_of_replacing():
     """Rapid TEXT follow-ups must all survive in the pending event."""
     adapter = _make_adapter()

@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+from gateway.platforms.base import SendResult as _SendResult
 from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
@@ -126,6 +127,7 @@ class GatewayStreamConsumer:
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
+        delivery_hold: Optional[Callable[[], bool]] = None,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -209,6 +211,12 @@ class GatewayStreamConsumer:
         # /stop), the run() loop will abandon the stream early instead of
         # continuing to edit and deliver stale deltas.
         self._run_still_current = run_still_current or (lambda: True)
+        # A tool can register an exact, crash-safe delivery intent after this
+        # consumer has already started. From that instant onward all token
+        # frames remain buffered; the gateway's final semantic send is the
+        # only code path allowed to put those bytes on the provider.
+        self._delivery_hold = delivery_hold
+        self._delivery_held = False
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -298,6 +306,15 @@ class GatewayStreamConsumer:
         finalize: bool = False,
     ):
         """Edit via the adapter, passing routing metadata when supported."""
+        if self._delivery_is_held():
+            return _SendResult(
+                success=False,
+                error="semantic_delivery_held",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
         kwargs = {
             "chat_id": self.chat_id,
             "message_id": message_id,
@@ -318,6 +335,31 @@ class GatewayStreamConsumer:
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
+
+    def _delivery_is_held(self) -> bool:
+        if self._delivery_held:
+            return True
+        if self._delivery_hold is None:
+            return False
+        try:
+            self._delivery_held = bool(self._delivery_hold())
+        except Exception:
+            # A broken delivery gate must fail closed: streaming an exact
+            # preview outside its ledger is worse than buffering the turn.
+            self._delivery_held = True
+        return self._delivery_held
+
+    async def _send_message(self, **kwargs):
+        if self._delivery_is_held():
+            return _SendResult(
+                success=False,
+                error="semantic_delivery_held",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+        return await self.adapter.send(**kwargs)
 
     def has_delivered_text(self, text: str) -> bool:
         """Return True if *text* was already delivered as visible chat content."""
@@ -638,6 +680,17 @@ class GatewayStreamConsumer:
                         await self._suppress_silence_marker()
                         return
 
+                # A Planning preview intent can appear while the tool/model
+                # stream is already active. Once present, do not send, edit, or
+                # draft any later bytes. Keep draining so the agent finishes;
+                # the normal/queued final path will perform one ledger-backed
+                # semantic send and then acknowledge the exact page.
+                if self._delivery_is_held():
+                    if got_done:
+                        return
+                    await asyncio.sleep(0.05)
+                    continue
+
                 # Decide whether to flush an edit
                 now = time.monotonic()
                 elapsed = now - self._last_edit_time
@@ -944,7 +997,7 @@ class GatewayStreamConsumer:
         if not text.strip():
             return reply_to_id
         try:
-            result = await self.adapter.send(
+            result = await self._send_message(
                 chat_id=self.chat_id,
                 content=text,
                 reply_to=reply_to_id,
@@ -1094,7 +1147,7 @@ class GatewayStreamConsumer:
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
-                result = await self.adapter.send(
+                result = await self._send_message(
                     chat_id=self.chat_id,
                     content=chunk,
                     metadata=self._metadata_for_send(final=True),
@@ -1189,7 +1242,7 @@ class GatewayStreamConsumer:
         result = None
         for attempt in range(2):
             try:
-                result = await self.adapter.send(
+                result = await self._send_message(
                     chat_id=self.chat_id,
                     content=final_text,
                     metadata=self._metadata_for_send(final=True),
@@ -1333,6 +1386,8 @@ class GatewayStreamConsumer:
             self._use_draft_streaming = False
             return False
         try:
+            if self._delivery_is_held():
+                return False
             result = await self.adapter.send_draft(
                 chat_id=self.chat_id,
                 draft_id=self._draft_id,
@@ -1381,7 +1436,7 @@ class GatewayStreamConsumer:
         if not tail.strip():
             return
         try:
-            result = await self.adapter.send(
+            result = await self._send_message(
                 chat_id=self.chat_id,
                 content=tail,
                 metadata=self.metadata,
@@ -1418,7 +1473,7 @@ class GatewayStreamConsumer:
         if not text.strip():
             return False
         try:
-            result = await self.adapter.send(
+            result = await self._send_message(
                 chat_id=self.chat_id,
                 content=text,
                 metadata=self.metadata,
@@ -1557,7 +1612,7 @@ class GatewayStreamConsumer:
         if self._message_id and self._message_id != "__no_edit__":
             stale_ids.add(self._message_id)
         try:
-            result = await self.adapter.send(
+            result = await self._send_message(
                 chat_id=self.chat_id,
                 content=text,
                 metadata=self._metadata_for_send(final=True),
@@ -1938,7 +1993,7 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
-                result = await self.adapter.send(
+                result = await self._send_message(
                     chat_id=self.chat_id,
                     content=text,
                     reply_to=self._initial_reply_to_id,

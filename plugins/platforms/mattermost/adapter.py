@@ -29,6 +29,13 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    provider_rejection_error,
+    provider_rejection_evidence,
+    semantic_exact_attempt_encoding_contract,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +85,14 @@ class MattermostAdapter(BasePlatformAdapter):
     """Gateway adapter for Mattermost (self-hosted or cloud)."""
 
     splits_long_messages = True  # send() chunks via truncate_message(MAX_POST_LENGTH)
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="mattermost",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="mattermost-logical-v1",
+        max_logical_units=MAX_POST_LENGTH,
+        length_semantics="unicode_codepoints",
+        wire_encoding="mattermost-post-json-v1",
+    )
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.MATTERMOST)
@@ -376,6 +391,173 @@ class MattermostAdapter(BasePlatformAdapter):
             last_id = data["id"]
 
         return SendResult(success=True, message_id=last_id)
+
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Create one Mattermost post without root probes or flat fallback."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import (
+            SEMANTIC_DELIVERY_CONTRACT,
+            exact_provider_message_id,
+        )
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or not request.delivery_id
+            or not request.delivery_target
+            or not isinstance(request.chat_id, str)
+            or not request.chat_id
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in request.chat_id
+            )
+            or not isinstance(request.content, str)
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+            or not self._base_url
+            or not self._token
+            or self._session is None
+            or getattr(self._session, "closed", False)
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+
+        payload: Dict[str, Any] = {
+            "channel_id": request.chat_id,
+            "message": request.content,
+        }
+        root_id = request.thread_id or request.reply_to
+        if root_id:
+            if not isinstance(root_id, str) or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in root_id
+            ):
+                return SendResult(
+                    success=False,
+                    error="semantic_delivery_thread_invalid",
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                    },
+                )
+            payload["root_id"] = root_id
+
+        import aiohttp
+
+        url = f"{self._base_url}/api/v4/posts"
+        try:
+            async with self._session.post(
+                url,
+                headers=self._headers(),
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+                allow_redirects=False,
+            ) as resp:
+                status = int(resp.status)
+                if 200 <= status < 300:
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        data = None
+                    message_id = (
+                        exact_provider_message_id(data.get("id"))
+                        if isinstance(data, dict)
+                        else None
+                    )
+                    if message_id is None:
+                        rejection = provider_rejection_evidence(
+                            provider="Mattermost",
+                            status=status,
+                            body=await resp.text(),
+                        )
+                        return SendResult(
+                            success=False,
+                            error="semantic_delivery_provider_receipt_invalid",
+                            raw_response={
+                                "status": status,
+                                "provider_rejection": rejection,
+                            },
+                        )
+                    return SendResult(
+                        success=True,
+                        message_id=message_id,
+                        raw_response=data,
+                    )
+                body = await resp.text()
+                rejection = provider_rejection_evidence(
+                    provider="Mattermost",
+                    status=status,
+                    body=body,
+                )
+                if status == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    try:
+                        retry_after_value = float(retry_after)
+                    except (TypeError, ValueError):
+                        retry_after_value = None
+                    return SendResult(
+                        success=False,
+                        error="Mattermost rate limited semantic delivery",
+                        retryable=True,
+                        retry_after=retry_after_value,
+                        raw_response={
+                            "provider_write_attempted": False,
+                            "provider_retryable": True,
+                            "retry_after": retry_after_value,
+                            "status": status,
+                            "provider_rejection": rejection,
+                        },
+                    )
+                if status == 408 or status >= 500:
+                    return SendResult(
+                        success=False,
+                        error=provider_rejection_error(rejection),
+                        raw_response={
+                            "status": status,
+                            "provider_rejection": rejection,
+                        },
+                    )
+                return SendResult(
+                    success=False,
+                    error=provider_rejection_error(rejection),
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                        "status": status,
+                        "provider_rejection": rejection,
+                    },
+                )
+        except asyncio.CancelledError:
+            raise
+        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+            return SendResult(
+                success=False,
+                error=f"Mattermost semantic transport failed: {exc}",
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"Mattermost semantic transport failed: {exc}",
+            )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return channel name and type."""
@@ -1278,6 +1460,8 @@ def register(ctx) -> None:
         # adapter" when cron runs separately from the gateway.  Mirrors
         # the Discord / Teams pattern.
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=True,
         # Mattermost practical post-length limit (server default is 16383
         # but 4000 is the readable threshold the adapter has used since
         # day one).

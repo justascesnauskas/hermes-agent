@@ -28,6 +28,7 @@ Or via environment variables (overrides config.yaml):
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -50,6 +51,11 @@ from gateway.platforms.base import (
     MessageType,
 )
 from gateway.config import Platform
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    coerce_live_semantic_exact_attempt_request,
+    semantic_exact_attempt_encoding_contract,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +104,15 @@ class IRCAdapter(BasePlatformAdapter):
     This class is instantiated by the adapter_factory passed to
     register_platform().
     """
+
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="irc",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="irc-logical-v1",
+        max_logical_units=80,
+        length_semantics="unicode_codepoints",
+        wire_encoding="irc-lf-to-u2028-utf8-v1",
+    )
 
     def __init__(self, config, **kwargs):
         platform = Platform("irc")
@@ -254,6 +269,100 @@ class IRCAdapter(BasePlatformAdapter):
         self._registration_event.clear()
 
     # ── Sending ───────────────────────────────────────────────────────────
+
+    async def send_semantic_exact_attempt(self, request) -> SendResult:
+        """Write one IRC PRIVMSG line with a deterministic newline encoder."""
+
+        try:
+            request = coerce_live_semantic_exact_attempt_request(request)
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_request_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        from hermes_cli.semantic_delivery import SEMANTIC_DELIVERY_CONTRACT
+
+        capability = self.SEMANTIC_EXACT_ATTEMPT_CAPABILITY
+        target = request.chat_id
+        try:
+            target_bytes = target.encode("utf-8", errors="strict")
+            content_is_utf8 = bool(request.content.encode("utf-8", errors="strict"))
+        except (AttributeError, UnicodeEncodeError):
+            target_bytes = b""
+            content_is_utf8 = False
+        invalid_target = bool(
+            not isinstance(target, str)
+            or not target
+            or len(target_bytes) > 64
+            or any(
+                ord(character) < 33 or ord(character) == 127
+                for character in target
+            )
+        )
+        if (
+            request.delivery_contract != SEMANTIC_DELIVERY_CONTRACT
+            or request.encoding_contract
+            != semantic_exact_attempt_encoding_contract(capability)
+            or not request.delivery_id
+            or not request.delivery_target
+            or invalid_target
+            or not isinstance(request.content, str)
+            or not content_is_utf8
+            or not request.content.strip()
+            or len(request.content) > capability.max_logical_units
+            or "\x00" in request.content
+            or not self._writer
+            or self._writer.is_closing()
+        ):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_shape_invalid",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+
+        # IRC commands are CRLF-delimited. U+2028 preserves a visible logical
+        # line boundary without putting another IRC command on the wire.
+        wire_content = (
+            request.content.replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .replace("\n", "\u2028")
+        )
+        wire = f"PRIVMSG {target} :{wire_content}\r\n".encode("utf-8")
+        if len(wire) > 512:
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_requires_multiple_writes",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+
+        try:
+            self._writer.write(wire)
+            await self._writer.drain()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"IRC semantic transport failed: {exc}",
+            )
+        receipt = hashlib.sha256(
+            f"irc:{request.delivery_id}:{request.delivery_unit}".encode("utf-8")
+        ).hexdigest()[:24]
+        return SendResult(
+            success=True,
+            message_id=f"irc_{receipt}",
+            raw_response={"gateway_acceptance": True},
+        )
 
     async def send(
         self,
@@ -950,6 +1059,8 @@ def register(ctx):
         # cron jobs fail with "No live adapter" when cron runs separately
         # from the gateway.
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=True,
         # Auth env vars for _is_user_authorized() integration
         allowed_users_env="IRC_ALLOWED_USERS",
         allow_all_env="IRC_ALLOW_ALL_USERS",

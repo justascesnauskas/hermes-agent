@@ -65,4 +65,25 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
     # config migrate
     config_subparsers.add_parser("migrate", help="Update config with new options")
 
+    # config provision-delivery-accounts
+    delivery_accounts = config_subparsers.add_parser(
+        "provision-delivery-accounts",
+        help="Provision stable delivery account IDs across all profiles",
+        description=(
+            "Inspect the default profile and every valid named profile in "
+            "credential-isolated processes, then provision any missing stable "
+            "semantic-delivery account IDs."
+        ),
+    )
+    delivery_accounts.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the read-only plan without writing config or migration state",
+    )
+    delivery_accounts.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the credential-free result as JSON",
+    )
+
     config_parser.set_defaults(func=cmd_config)

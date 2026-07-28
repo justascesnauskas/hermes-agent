@@ -241,6 +241,11 @@ hermes profile export coder   # export to coder.tar.gz
 hermes profile import coder.tar.gz   # import from archive
 ```
 
+Exports are portable snapshots: credentials and live messaging-delivery
+authority are excluded. An imported profile receives fresh provider account
+identities, so it cannot replay or acknowledge the source profile's pending
+messages. Ordinary profile data and history in the archive are preserved.
+
 ## Deleting a profile
 
 ```bash

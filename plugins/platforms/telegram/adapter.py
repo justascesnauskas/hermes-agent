@@ -21,6 +21,7 @@ import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +252,11 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.semantic_exact_attempt import (
+    LiveSemanticExactAttemptCapability,
+    provider_rejection_error,
+    provider_rejection_evidence,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -607,6 +613,21 @@ class TelegramAdapter(BasePlatformAdapter):
     # edit and the final edit, skipping the plain-text → MarkdownV2 conversion.
     # Fixes #25710.
     REQUIRES_EDIT_FINALIZE: bool = True
+    SEMANTIC_EXACT_ATTEMPT_CAPABILITY = LiveSemanticExactAttemptCapability(
+        provider="telegram",
+        contract="hermes-live-semantic-exact-attempt/1",
+        segmentation_version="telegram-logical-v1",
+        max_logical_units=1_800,
+        length_semantics="utf16_code_units",
+        wire_encoding="telegram-markdown-v2-v1",
+    )
+
+    async def send_semantic_exact_attempt(self, request):
+        from gateway.semantic_exact_attempt import (
+            semantic_exact_attempt_via_send,
+        )
+
+        return await semantic_exact_attempt_via_send(self, request)
     # Retrying a turn-final edit consumes more of the same Telegram flood
     # budget while the completed answer remains undelivered. Move directly to
     # the final fallback path instead.
@@ -4016,6 +4037,293 @@ class TelegramAdapter(BasePlatformAdapter):
         else:  # "first" (default)
             return chunk_index == 0
 
+    async def _send_semantic_exact(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Perform one direct Bot API write without PTB retries/fallbacks."""
+
+        try:
+            formatted = self.format_message(content)
+            from gateway.platforms.base import utf16_len
+
+            chunks = self.truncate_message(
+                formatted,
+                self.MAX_MESSAGE_LENGTH,
+                len_fn=utf16_len,
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"semantic_delivery_format_failed: {exc}",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if not formatted.strip():
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_empty",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if len(chunks) != 1:
+            return SendResult(
+                success=False,
+                error="semantic_delivery_message_requires_multiple_writes",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+
+        thread_id = self._metadata_thread_id(metadata)
+        metadata_reply_to = self._metadata_reply_to_message_id(metadata)
+        private_dm_topic_send = self._is_private_dm_topic_send(
+            chat_id,
+            thread_id,
+            metadata,
+        )
+        reply_to_source = reply_to or (
+            str(metadata_reply_to)
+            if private_dm_topic_send and metadata_reply_to is not None
+            else None
+        )
+        should_thread = bool(
+            reply_to_source and self._reply_to_mode != "off"
+        )
+        reply_to_id = (
+            int(reply_to_source)
+            if should_thread and reply_to_source
+            else None
+        )
+        dm_topic_reply_to_off = bool(
+            private_dm_topic_send
+            and self._reply_to_mode == "off"
+            and metadata
+            and metadata.get("telegram_dm_topic_reply_fallback")
+        )
+        if (
+            private_dm_topic_send
+            and reply_to_id is None
+            and not dm_topic_reply_to_off
+        ):
+            return SendResult(
+                success=False,
+                error=self._dm_topic_missing_anchor_error(),
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        thread_kwargs = self._thread_kwargs_for_send(
+            chat_id,
+            thread_id,
+            metadata,
+            reply_to_message_id=reply_to_id,
+            reply_to_mode=self._reply_to_mode,
+        )
+
+        token = str(self.config.token or "").strip()
+        if not token:
+            return SendResult(
+                success=False,
+                error="semantic_delivery_credential_unavailable",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
+        try:
+            from plugins.platforms.telegram.telegram_ids import (
+                normalize_telegram_chat_id,
+            )
+
+            payload: Dict[str, Any] = {
+                "chat_id": normalize_telegram_chat_id(chat_id),
+                "text": chunks[0],
+                "parse_mode": "MarkdownV2",
+            }
+            if reply_to_id is not None:
+                payload["reply_to_message_id"] = reply_to_id
+            for key, value in thread_kwargs.items():
+                if value is not None:
+                    payload[key] = value
+            if getattr(self, "_disable_link_previews", False):
+                payload["disable_web_page_preview"] = True
+            payload.update(self._notification_kwargs(metadata))
+
+            base_url = str(
+                self.config.extra.get("base_url")
+                or "https://api.telegram.org/bot"
+            ).rstrip("/")
+            url = f"{base_url}{token}/sendMessage"
+            target_host = urlsplit(base_url).hostname or "api.telegram.org"
+
+            import aiohttp
+            from gateway.platforms.base import (
+                proxy_kwargs_for_aiohttp,
+                resolve_proxy_url,
+            )
+
+            proxy_url = resolve_proxy_url(
+                "TELEGRAM_PROXY",
+                target_hosts=[target_host],
+            )
+            session_kwargs, request_kwargs = proxy_kwargs_for_aiohttp(
+                proxy_url
+            )
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+                **session_kwargs,
+            ) as session:
+                async with session.post(
+                    url,
+                    json=payload,
+                    **request_kwargs,
+                ) as response:
+                    status = int(
+                        getattr(response, "status", 0) or 0
+                    )
+                    try:
+                        data = await response.json()
+                    except Exception as exc:
+                        try:
+                            response_body = await response.text()
+                        except Exception:
+                            response_body = {
+                                "json_error_type": type(exc).__name__,
+                                "json_error": str(exc),
+                            }
+                        rejection = provider_rejection_evidence(
+                            provider="Telegram",
+                            status=status,
+                            body=response_body,
+                        )
+                        if 200 <= status < 300:
+                            return SendResult(
+                                success=False,
+                                error=provider_rejection_error(rejection),
+                                raw_response={
+                                    "provider_write_attempted": True,
+                                    "provider_retryable": False,
+                                    "provider_rejection": rejection,
+                                },
+                            )
+                        retryable = status == 429 or status >= 500
+                        return SendResult(
+                            success=False,
+                            error=provider_rejection_error(rejection),
+                            retryable=retryable,
+                            raw_response={
+                                "provider_write_attempted": False,
+                                "provider_retryable": retryable,
+                                "provider_rejection": rejection,
+                            },
+                    )
+                    if isinstance(data, dict) and data.get("ok"):
+                        result = data.get("result")
+                        provider_message_id = (
+                            result.get("message_id")
+                            if isinstance(result, dict)
+                            else None
+                        )
+                        message_id = (
+                            str(provider_message_id)
+                            if isinstance(provider_message_id, int)
+                            and not isinstance(provider_message_id, bool)
+                            and provider_message_id > 0
+                            else None
+                        )
+                        if not message_id:
+                            rejection = provider_rejection_evidence(
+                                provider="Telegram",
+                                status=status,
+                                body=data,
+                            )
+                            return SendResult(
+                                success=False,
+                                error=provider_rejection_error(rejection),
+                                raw_response={
+                                    "provider_write_attempted": True,
+                                    "provider_retryable": False,
+                                    "provider_rejection": rejection,
+                                },
+                            )
+                        return SendResult(
+                            success=True,
+                            message_id=message_id,
+                            raw_response=data,
+                        )
+                    if not isinstance(data, dict):
+                        rejection = provider_rejection_evidence(
+                            provider="Telegram",
+                            status=status,
+                            body=data,
+                        )
+                        return SendResult(
+                            success=False,
+                            error=provider_rejection_error(rejection),
+                            raw_response={
+                                "provider_rejection": rejection,
+                            },
+                        )
+                    rejection = provider_rejection_evidence(
+                        provider="Telegram",
+                        status=status,
+                        body=data,
+                    )
+                    error_code = int(
+                        data.get("error_code") or status or 0
+                    )
+                    retryable = (
+                        error_code == 429 or error_code >= 500
+                    )
+                    retry_after = None
+                    parameters = data.get("parameters")
+                    if (
+                        error_code == 429
+                        and isinstance(parameters, dict)
+                    ):
+                        try:
+                            retry_after = float(
+                                parameters.get("retry_after", 0) or 0
+                            ) or None
+                        except (TypeError, ValueError):
+                            retry_after = None
+                    return SendResult(
+                        success=False,
+                        error=provider_rejection_error(rejection),
+                        retryable=retryable,
+                        retry_after=retry_after,
+                        raw_response={
+                            "provider_write_attempted": False,
+                            "provider_retryable": retryable,
+                            "provider_rejection": rejection,
+                        },
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The connection can fail after Telegram accepted the POST. Omit
+            # write flags so the ledger records an ambiguous outcome.
+            return SendResult(
+                success=False,
+                error=(
+                    "Telegram semantic send transport failed: "
+                    f"{_redact_telegram_error_text(exc)}"
+                ),
+                raw_response={},
+            )
+
     async def send(
         self,
         chat_id: str,
@@ -4024,16 +4332,77 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
         """Send a message to a Telegram chat."""
+        semantic_contract = str(
+            (metadata or {}).get("semantic_delivery_contract") or ""
+        ).strip()
+        semantic_delivery_id = str(
+            (metadata or {}).get("semantic_delivery_id") or ""
+        ).strip()
+        if bool(semantic_contract) != bool(semantic_delivery_id):
+            return SendResult(
+                success=False,
+                error="semantic_delivery_identity_incomplete",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": False,
+                },
+            )
+        if semantic_contract:
+            from hermes_cli.semantic_delivery import (
+                SEMANTIC_DELIVERY_CONTRACT,
+            )
+
+            if semantic_contract != SEMANTIC_DELIVERY_CONTRACT:
+                return SendResult(
+                    success=False,
+                    error="semantic_delivery_contract_unsupported",
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                    },
+                )
+        semantic_exact = bool(semantic_contract)
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            return SendResult(
+                success=False,
+                error="Not connected",
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
 
         # getattr() — tests build adapters via object.__new__() (no __init__).
         if getattr(self, "_send_path_degraded", False):
-            return SendResult(success=False, error="send_path_degraded", retryable=True)
+            return SendResult(
+                success=False,
+                error="send_path_degraded",
+                retryable=True,
+                raw_response={
+                    "provider_write_attempted": False,
+                    "provider_retryable": True,
+                },
+            )
 
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
+            if semantic_exact:
+                return SendResult(
+                    success=False,
+                    error="semantic_delivery_message_empty",
+                    raw_response={
+                        "provider_write_attempted": False,
+                        "provider_retryable": False,
+                    },
+                )
             return SendResult(success=True, message_id=None)
+        if semantic_exact:
+            return await self._send_semantic_exact(
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -4041,7 +4410,10 @@ class TelegramAdapter(BasePlatformAdapter):
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if (
+                not semantic_exact
+                and self._should_attempt_rich(content, metadata=metadata)
+            ):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -4138,7 +4510,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 effective_thread_id = thread_kwargs.get("message_thread_id")
 
                 msg = None
-                for _send_attempt in range(3):
+                max_send_attempts = 1 if semantic_exact else 3
+                for _send_attempt in range(max_send_attempts):
                     try:
                         # Try Markdown first, fall back to plain text if it fails
                         try:
@@ -4154,6 +4527,18 @@ class TelegramAdapter(BasePlatformAdapter):
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
                             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
+                                if semantic_exact:
+                                    return SendResult(
+                                        success=False,
+                                        error=_redact_telegram_error_text(
+                                            md_error
+                                        ),
+                                        retryable=False,
+                                        raw_response={
+                                            "provider_write_attempted": False,
+                                            "provider_retryable": False,
+                                        },
+                                    )
                                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
                                 plain_chunk = _strip_mdv2(chunk)
                                 msg = await self._bot.send_message(
@@ -4175,6 +4560,18 @@ class TelegramAdapter(BasePlatformAdapter):
                         # specific cases instead of blindly retrying.
                         if _BadReq and isinstance(send_err, _BadReq):
                             if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
+                                if semantic_exact:
+                                    return SendResult(
+                                        success=False,
+                                        error=_redact_telegram_error_text(
+                                            send_err
+                                        ),
+                                        retryable=False,
+                                        raw_response={
+                                            "provider_write_attempted": False,
+                                            "provider_retryable": False,
+                                        },
+                                    )
                                 if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
                                     return SendResult(
                                         success=False,
@@ -4213,6 +4610,18 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                             err_lower = str(send_err).lower()
                             if "message to be replied not found" in err_lower and reply_to_id is not None:
+                                if semantic_exact:
+                                    return SendResult(
+                                        success=False,
+                                        error=_redact_telegram_error_text(
+                                            send_err
+                                        ),
+                                        retryable=False,
+                                        raw_response={
+                                            "provider_write_attempted": False,
+                                            "provider_retryable": False,
+                                        },
+                                    )
                                 if private_dm_topic_send:
                                     safe_send_error = _redact_telegram_error_text(send_err)
                                     return SendResult(
@@ -4262,7 +4671,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             raise
                         if is_pool_timeout:
                             await self._drain_general_connections_after_pool_timeout()
-                        if _send_attempt < 2:
+                        if _send_attempt < max_send_attempts - 1:
                             wait = 2 ** _send_attempt
                             safe_send_error = _redact_telegram_error_text(send_err)
                             logger.warning("[%s] Network error on send (attempt %d/3), retrying in %ds: %s",
@@ -4273,7 +4682,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     except Exception as send_err:
                         retry_after = getattr(send_err, "retry_after", None)
                         if retry_after is not None or "retry after" in str(send_err).lower():
-                            if _send_attempt < 2:
+                            if _send_attempt < max_send_attempts - 1:
                                 wait = float(retry_after) if retry_after is not None else 1.0
                                 safe_send_error = _redact_telegram_error_text(send_err)
                                 logger.warning(
@@ -4336,11 +4745,27 @@ class TelegramAdapter(BasePlatformAdapter):
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
             is_connect_timeout = self._looks_like_connect_timeout(e)
             is_pool_timeout = self._looks_like_pool_timeout(e)
+            provider_write_attempted = None
+            provider_retryable = None
+            _bad_request_type = locals().get("_BadReq")
+            if _bad_request_type and isinstance(e, _bad_request_type):
+                provider_write_attempted = False
+                provider_retryable = False
+            elif is_connect_timeout or is_pool_timeout:
+                provider_write_attempted = False
+                provider_retryable = True
+            elif getattr(e, "retry_after", None) is not None:
+                provider_write_attempted = False
+                provider_retryable = True
             return SendResult(
                 success=False,
                 error=safe_error,
                 retryable=(is_connect_timeout or is_pool_timeout or not is_timeout),
                 error_kind=error_kind,
+                raw_response={
+                    "provider_write_attempted": provider_write_attempted,
+                    "provider_retryable": provider_retryable,
+                },
             )
 
     async def send_or_update_status(
@@ -9442,6 +9867,8 @@ def register(ctx) -> None:
         allow_all_env="TELEGRAM_ALLOW_ALL_USERS",
         cron_deliver_env_var="TELEGRAM_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
+        semantic_exact_attempt=False,
+        live_semantic_exact_attempt=True,
         max_message_length=4096,
         emoji="✈️",
         allow_update_command=True,

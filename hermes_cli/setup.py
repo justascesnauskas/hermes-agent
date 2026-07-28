@@ -1973,6 +1973,16 @@ def setup_gateway(config: dict):
     for idx in selected:
         _configure_platform(platforms[idx])
 
+    # Each platform flow persists credentials before returning. Provision once
+    # after the full selection (rather than rescanning every profile after each
+    # item) so first semantic use never depends on a hidden send/discovery
+    # write.
+    from hermes_cli.delivery_account_provisioning import (
+        run_lifecycle_provisioning,
+    )
+
+    run_lifecycle_provisioning(quiet=False)
+
     # ── Gateway Service Setup ──
     # Count any platform (built-in or plugin) the user configured during this
     # setup pass — reuses ``_platform_status`` so plugin platforms like IRC

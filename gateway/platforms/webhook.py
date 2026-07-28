@@ -59,6 +59,16 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.platform_registry import declare_semantic_exact_attempt
+
+
+declare_semantic_exact_attempt(
+    "webhook",
+    standalone=False,
+    live=False,
+    owner=__name__,
+    planning_ineligible_reason="delegated_destination_not_frozen",
+)
 from gateway.platforms.webhook_filters import (
     DEFAULT_SCRIPT_TIMEOUT_SECONDS,
     WebhookRouteProcessor,

@@ -61,6 +61,8 @@ MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
+_ERROR_PREVIEW_CHARACTERS = 200
+_ERROR_REDACTION_WINDOW_CHARACTERS = 8_192
 
 # Visible prefix for redeliveries that might duplicate an already-received
 # message (crash mid-send / post-rejection retry). Honest at-least-once.
@@ -190,13 +192,58 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
+def _bounded_error(value: Any) -> Optional[str]:
+    text = str(value or "")
+    if not text:
+        return None
+    raw = text.encode("utf-8", errors="replace")
+    window = text[:_ERROR_REDACTION_WINDOW_CHARACTERS]
+    try:
+        from agent.redact import redact_sensitive_text
+
+        redacted = redact_sensitive_text(
+            window,
+            force=True,
+            redact_url_credentials=True,
+        )
+    except Exception:
+        redacted = "<delivery error redacted>"
+    preview = redacted[:_ERROR_PREVIEW_CHARACTERS]
+    truncated = (
+        len(text) > _ERROR_PREVIEW_CHARACTERS
+        or len(redacted) > _ERROR_PREVIEW_CHARACTERS
+    )
+    was_redacted = redacted != window
+    if not truncated and not was_redacted and "\x00" not in text:
+        return text
+    return json.dumps(
+        {
+            "schema_version": "hermes.delivery-error-evidence/1",
+            "text_sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
+            "text_bytes": len(raw),
+            "text_characters": len(text),
+            "text_preview": preview,
+            "preview_characters": len(preview),
+            "redaction_window_characters": min(
+                len(text),
+                _ERROR_REDACTION_WINDOW_CHARACTERS,
+            ),
+            "truncated": truncated,
+            "redacted": was_redacted,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
     with _DB_LOCK, _connect() as conn:
         conn.execute(
             """UPDATE delivery_obligations
                SET state=?, updated_at=?, last_error=?
                WHERE obligation_id=?""",
-            (state, time.time(), error[:500] if error else None, obligation_id),
+            (state, time.time(), _bounded_error(error), obligation_id),
         )
 
 

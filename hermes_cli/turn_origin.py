@@ -389,6 +389,10 @@ _CURRENT_TURN_USER_TEXT: ContextVar[Optional[str]] = ContextVar(
     "hermes_current_turn_user_text",
     default=None,
 )
+_CURRENT_TURN_DELIVERY_ADAPTER: ContextVar[Any | None] = ContextVar(
+    "hermes_current_turn_delivery_adapter",
+    default=None,
+)
 
 
 def get_current_turn_origin() -> Optional[TurnOriginV1]:
@@ -423,6 +427,17 @@ def get_current_turn_user_text() -> Optional[str]:
     return _CURRENT_TURN_USER_TEXT.get()
 
 
+def get_current_turn_delivery_adapter() -> Any | None:
+    """Return the live adapter bound to this gateway turn.
+
+    The adapter is runtime-only authority used for provider capability checks.
+    It is never serialized into turn origin, model input, or conversation
+    history.
+    """
+
+    return _CURRENT_TURN_DELIVERY_ADAPTER.get()
+
+
 @contextmanager
 def scoped_turn_origin(value: Any) -> Iterator[Optional[TurnOriginV1]]:
     """Bind an origin for exactly one conversation turn."""
@@ -445,6 +460,17 @@ def scoped_turn_user_text(value: Any) -> Iterator[Optional[str]]:
         yield text
     finally:
         _CURRENT_TURN_USER_TEXT.reset(token)
+
+
+@contextmanager
+def scoped_turn_delivery_adapter(value: Any) -> Iterator[Any | None]:
+    """Bind the exact live adapter for one gateway conversation execution."""
+
+    token = _CURRENT_TURN_DELIVERY_ADAPTER.set(value)
+    try:
+        yield value
+    finally:
+        _CURRENT_TURN_DELIVERY_ADAPTER.reset(token)
 
 
 def inject_current_turn_origin(payload: MutableMapping[str, Any]) -> None:

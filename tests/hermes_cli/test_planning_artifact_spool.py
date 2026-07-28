@@ -15,6 +15,7 @@ from hermes_cli.planning_artifact_spool import (
     acknowledge_artifact_recovery,
     list_artifact_recoveries,
     load_artifact_recovery,
+    load_artifact_recovery_completion,
     register_artifact_recovery,
 )
 
@@ -56,6 +57,35 @@ def _register(
         ingress_ordinal=position,
         hermes_home=home,
     )
+
+
+def _completion() -> dict[str, object]:
+    artifact = {
+        "schemaVersion": "1.0",
+        "artifactId": "blob-artifact-1",
+        "artifactRef": "planning-artifact-v1:blob-artifact-1",
+        "sourceReference": "planning-artifact-v1:blob-artifact-1",
+        "referenceId": "reference-artifact-1",
+        "checksum": "sha256:" + ("a" * 64),
+        "sizeBytes": 2048,
+        "contentType": "image/png",
+        "role": "design_reference",
+        "position": 1,
+        "required": True,
+        "filename": "dashboard.png",
+    }
+    return {
+        "ok": True,
+        "action": "upload_artifact",
+        "threadId": "planning-thread-1",
+        "artifact": artifact,
+        "storageMode": "local",
+        "uploadDisposition": "committed",
+        "uploadReplayed": False,
+        "inputStored": True,
+        "inputReplayed": False,
+        "previewInvalidated": False,
+    }
 
 
 def test_recovery_survives_fresh_process_without_original_source(
@@ -252,3 +282,183 @@ def test_corrupt_live_snapshot_is_never_silently_replaced(
 
     assert corrupt.value.code == "planning.artifact_recovery_corrupt"
     assert Path(record.snapshot_path).read_bytes() == b"tampered bytes"
+
+
+def test_ack_tombstone_prevents_identical_source_resurrection(
+    tmp_path,
+) -> None:
+    home = tmp_path / "hermes-home"
+    source = tmp_path / "reference.png"
+    source.write_bytes(b"still-present provider cache bytes")
+
+    token = _register(home=home, source=source)
+    record = load_artifact_recovery(
+        token,
+        current_origin=_origin(),
+        hermes_home=home,
+    )
+    digest = token.removeprefix("artrec_v2_")
+    spool_root = home / "planning-v2" / "artifact-ingress"
+
+    assert acknowledge_artifact_recovery(token, hermes_home=home) is True
+    assert source.exists()
+    assert not Path(record.snapshot_path).exists()
+    assert not (spool_root / digest).exists()
+    assert (
+        spool_root / ".acknowledged-tombstones" / digest
+    ).is_dir()
+
+    # A provider redelivery can retain the exact same cached local source.
+    # Its immutable idempotency identity has already converged, so registration
+    # returns the stable token without reopening or copying that source.
+    assert _register(home=home, source=source) == token
+    assert not (spool_root / digest).exists()
+    assert list_artifact_recoveries(
+        current_origin=_origin(),
+        thread_id="planning-thread-1",
+        hermes_home=home,
+    ) == ()
+
+
+def test_fresh_process_converges_crash_after_ack_rename_without_resurrection(
+    tmp_path,
+) -> None:
+    home = tmp_path / "hermes-home"
+    source = tmp_path / "reference.pdf"
+    source.write_bytes(b"%PDF bytes retained by provider cache")
+    token = _register(home=home, source=source)
+    digest = token.removeprefix("artrec_v2_")
+    spool_root = home / "planning-v2" / "artifact-ingress"
+    live_path = spool_root / digest
+    interrupted_ack_path = (
+        spool_root / f".acknowledged-{digest}-4242-deadbeef"
+    )
+
+    # Crash seam: the live journal was durably retired, but the process died
+    # before the ACK tombstone and private byte cleanup were materialized.
+    os.rename(live_path, interrupted_ack_path)
+
+    repository = Path(__file__).resolve().parents[2]
+    script = """
+import json
+import os
+from hermes_cli.planning_artifact_spool import register_artifact_recovery
+
+token = register_artifact_recovery(
+    thread_id="planning-thread-1",
+    local_path=os.environ["TEST_RECOVERY_SOURCE"],
+    origin=json.loads(os.environ["TEST_RECOVERY_ORIGIN"]),
+    role="design_reference",
+    position=1,
+    required=True,
+    idempotency_key="hermes-planning-artifact-v1:stable",
+    content_type="image/png",
+    retain_until=None,
+    attachment_identity="attachment-1",
+    ingress_ordinal=1,
+)
+print(token)
+"""
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "HERMES_HOME": str(home),
+            "PYTHONPATH": str(repository),
+            "TEST_RECOVERY_SOURCE": str(source),
+            "TEST_RECOVERY_ORIGIN": json.dumps(_origin()),
+        }
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == token
+    assert not interrupted_ack_path.exists()
+    assert not live_path.exists()
+    assert (
+        spool_root / ".acknowledged-tombstones" / digest
+    ).is_dir()
+    assert list_artifact_recoveries(
+        current_origin=_origin(),
+        thread_id="planning-thread-1",
+        hermes_home=home,
+    ) == ()
+
+
+def test_ack_completion_replays_in_fresh_process_without_bytes_or_path(
+    tmp_path,
+) -> None:
+    home = tmp_path / "hermes-home"
+    source = tmp_path / "private-dashboard.png"
+    private_bytes = b"private bytes must be retired"
+    source.write_bytes(private_bytes)
+    token = _register(home=home, source=source)
+    digest = token.removeprefix("artrec_v2_")
+    spool_root = home / "planning-v2" / "artifact-ingress"
+
+    assert acknowledge_artifact_recovery(
+        token,
+        completion=_completion(),
+        hermes_home=home,
+    )
+    receipt_path = (
+        spool_root
+        / ".acknowledged-tombstones"
+        / digest
+        / "completion.json"
+    )
+    receipt_bytes = receipt_path.read_bytes()
+    assert str(source).encode() not in receipt_bytes
+    assert private_bytes not in receipt_bytes
+    assert token.encode() not in receipt_bytes
+    assert not (spool_root / digest).exists()
+
+    repository = Path(__file__).resolve().parents[2]
+    script = """
+import json
+import os
+from hermes_cli.planning_artifact_spool import (
+    load_artifact_recovery_completion,
+)
+
+completion = load_artifact_recovery_completion(
+    os.environ["TEST_RECOVERY_TOKEN"],
+    current_origin=json.loads(os.environ["TEST_RECOVERY_ORIGIN"]),
+)
+print(json.dumps(completion, sort_keys=True))
+"""
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "HERMES_HOME": str(home),
+            "PYTHONPATH": str(repository),
+            "TEST_RECOVERY_TOKEN": token,
+            "TEST_RECOVERY_ORIGIN": json.dumps(_origin()),
+        }
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == _completion()
+    with pytest.raises(PlanningV2ConfigError) as scoped:
+        load_artifact_recovery_completion(
+            token,
+            current_origin=_origin(sender_id="another-user"),
+            hermes_home=home,
+        )
+    assert scoped.value.code == "planning.artifact_recovery_scope_mismatch"

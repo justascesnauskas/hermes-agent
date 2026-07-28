@@ -111,6 +111,9 @@ _CLONE_ALL_DEFAULT_EXCLUDE_ROOT: frozenset[str] = frozenset({
 #
 # Rationale per item:
 #   state.db (+wal/shm) — SQLite session store (can reach many GB)
+#   state               — durable delivery/ACK authority owned by the source
+#   gateway-turn-queue  — admitted origins, attachments, and qturn receipts
+#   planning-v2/artifact-ingress — private snapshots and ACK fences
 #   sessions            — per-session transcript/data dirs
 #   backups             — `hermes backup` archives
 #   state-snapshots     — quick-backup snapshot trees
@@ -119,10 +122,15 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
     "state.db",
     "state.db-wal",
     "state.db-shm",
+    "state",
+    "gateway-turn-queue",
     "sessions",
     "backups",
     "state-snapshots",
     "checkpoints",
+})
+_CLONE_ALL_HISTORY_EXCLUDE_RELATIVE: frozenset[str] = frozenset({
+    "planning-v2/artifact-ingress",
 })
 
 # Marker file written by `hermes profile create --no-skills`.  When present in
@@ -168,6 +176,12 @@ def _clone_all_copytree_ignore(source_dir: Path):
 
     def _ignore(directory: str, names: List[str]) -> List[str]:
         ignored: list[str] = []
+        try:
+            relative_directory = Path(directory).resolve().relative_to(
+                source_resolved
+            )
+        except (OSError, ValueError):
+            relative_directory = None
         for entry in names:
             # Universal exclusions at any depth.
             if (
@@ -191,6 +205,12 @@ def _clone_all_copytree_ignore(source_dir: Path):
                 # Infrastructure: only the default profile contains these.
                 if is_default_source and entry in _CLONE_ALL_DEFAULT_EXCLUDE_ROOT:
                     ignored.append(entry)
+                    continue
+            if relative_directory is not None and (
+                (relative_directory / entry).as_posix()
+                in _CLONE_ALL_HISTORY_EXCLUDE_RELATIVE
+            ):
+                ignored.append(entry)
         return ignored
 
     return _ignore
@@ -505,7 +525,7 @@ def remove_wrapper_script(name: str) -> bool:
     return False
 
 
-def _migrate_profile_config_if_outdated(profile_dir: Path) -> None:
+def _migrate_profile_config_if_outdated(profile_dir: Path) -> bool:
     """Bring a copied profile config.yaml up to the current schema.
 
     Profile creation can clone a config file that predates schema tracking (no
@@ -516,7 +536,7 @@ def _migrate_profile_config_if_outdated(profile_dir: Path) -> None:
     """
     config_path = profile_dir / "config.yaml"
     if not config_path.exists():
-        return
+        return False
 
     try:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -527,6 +547,7 @@ def _migrate_profile_config_if_outdated(profile_dir: Path) -> None:
             current_ver, latest_ver = check_config_version()
             if current_ver < latest_ver:
                 migrate_config(interactive=False, quiet=True)
+                return True
         finally:
             reset_hermes_home_override(token)
     except Exception:
@@ -534,6 +555,101 @@ def _migrate_profile_config_if_outdated(profile_dir: Path) -> None:
         # not be migrated. The next `hermes doctor --fix` can still surface the
         # detailed error in the target profile.
         pass
+    return False
+
+
+def _strip_cloned_delivery_authority(profile_dir: Path) -> int:
+    """Remove source-owned semantic account IDs from a copied config.
+
+    A ``gateway_account_id`` identifies one local provider/profile authority;
+    it is not portable configuration. This applies to clones, exports, and
+    imports. Both platform-map spellings are handled because the gateway
+    merges ``platforms`` and ``gateway.platforms``.
+    """
+
+    config_path = profile_dir / "config.yaml"
+    if not config_path.exists():
+        return 0
+
+    import yaml
+
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        return 0
+
+    removed = 0
+
+    def _strip_platform_map(platforms: object) -> None:
+        nonlocal removed
+        if not isinstance(platforms, dict):
+            return
+        for platform in platforms.values():
+            if not isinstance(platform, dict):
+                continue
+            extra = platform.get("extra")
+            if (
+                isinstance(extra, dict)
+                and "gateway_account_id" in extra
+            ):
+                extra.pop("gateway_account_id", None)
+                removed += 1
+
+    _strip_platform_map(raw.get("platforms"))
+    gateway = raw.get("gateway")
+    if isinstance(gateway, dict):
+        _strip_platform_map(gateway.get("platforms"))
+
+    if not removed:
+        return 0
+
+    # ``clone-all`` preserves ordinary symlinks. Writing through a cloned
+    # config symlink would mutate the source profile, so detach this newly
+    # created clone before replacing its config.
+    if config_path.is_symlink():
+        config_path.unlink()
+
+    from hermes_cli.config import atomic_config_write
+
+    atomic_config_write(config_path, raw, sort_keys=False)
+    return removed
+
+
+def _discard_copied_delivery_state(profile_dir: Path) -> bool:
+    """Discard durable delivery/ACK authority copied from another profile."""
+
+    removed = False
+
+    def _discard(path: Path) -> bool:
+        if path.is_symlink() or (
+            path.exists() and not path.is_dir()
+        ):
+            path.unlink(missing_ok=True)
+            return True
+        if path.is_dir():
+            shutil.rmtree(path)
+            return True
+        return False
+
+    for root_name in ("state", "gateway-turn-queue"):
+        removed = _discard(profile_dir / root_name) or removed
+
+    planning_root = profile_dir / "planning-v2"
+    if planning_root.is_symlink() or (
+        planning_root.exists() and not planning_root.is_dir()
+    ):
+        # Never traverse a copied symlink into the source profile while
+        # retiring source-owned attachment ingress authority.
+        removed = _discard(planning_root) or removed
+    elif planning_root.is_dir():
+        removed = (
+            _discard(planning_root / "artifact-ingress")
+            or removed
+        )
+        try:
+            planning_root.rmdir()
+        except OSError:
+            pass
+    return removed
 
 
 def find_alias_for_profile(profile_name: str) -> Optional[str]:
@@ -1148,13 +1264,37 @@ def create_profile(
         except OSError:
             pass  # best-effort — the feature still works via the empty skills/ dir
 
+    # Provider account and durable effect authority belong to the source
+    # profile even when the user requests a full clone. ``state/`` is excluded
+    # by the clone-all policy above; remove copied account IDs before any
+    # config migration.
+    removed_delivery_authorities = 0
+    if source_dir is not None:
+        removed_delivery_authorities = _strip_cloned_delivery_authority(
+            profile_dir
+        )
+
     # Cloned configs can be older than the running Hermes (or predate schema
     # tracking entirely). Migrate config-only clones immediately so
     # desktop/status surfaces don't warn that a just-created profile is
     # v0/outdated. Leave --clone-all snapshots byte-for-byte apart from the
-    # explicit runtime/history stripping above.
+    # explicit runtime/history and authority stripping above.
+    migration_provisioned = False
     if not clone_all:
-        _migrate_profile_config_if_outdated(profile_dir)
+        migration_provisioned = _migrate_profile_config_if_outdated(
+            profile_dir
+        )
+
+    if removed_delivery_authorities and not migration_provisioned:
+        # Profile creation is an explicit configuration lifecycle surface.
+        # Provision now so the clone is immediately usable without a hidden
+        # first-send write. The global root lock and durable journal provide
+        # the same crash/concurrency guarantees as setup and update.
+        from hermes_cli.delivery_account_provisioning import (
+            run_lifecycle_provisioning,
+        )
+
+        run_lifecycle_provisioning(quiet=False)
 
     # Persist description if the caller provided one. Done last so a
     # partial-create failure doesn't strand a description file in an
@@ -1926,10 +2066,17 @@ def export_profile(name: str, output_path: str) -> Path:
                 symlinks=True,
                 ignore=_default_export_ignore(profile_dir),
             )
+            # Account IDs are local effect authority, not portable settings.
+            # The default allow-list already omits state/, but sanitize config
+            # too so an imported copy cannot impersonate the source profile.
+            _discard_copied_delivery_state(staged)
+            _strip_cloned_delivery_authority(staged)
             result = shutil.make_archive(base, "gztar", tmpdir, "default")
             return Path(result)
 
-    # Named profiles — stage a filtered copy to exclude credentials
+    # Named profiles — stage a filtered portable copy. Delivery ledgers and
+    # account IDs belong to the source instance just like runtime PID state;
+    # they must never cross an export/import boundary.
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / canon
         _CREDENTIAL_FILES = {"auth.json", ".env"}
@@ -1939,6 +2086,8 @@ def export_profile(name: str, output_path: str) -> Path:
             symlinks=True,
             ignore=lambda d, contents: _CREDENTIAL_FILES & set(contents),
         )
+        _discard_copied_delivery_state(staged)
+        _strip_cloned_delivery_authority(staged)
         result = shutil.make_archive(base, "gztar", tmpdir, canon)
         return Path(result)
 
@@ -2078,7 +2227,27 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
             final_source = staging_root / canon
             extracted.rename(final_source)
 
+        # Import always creates a new local profile instance. Never restore
+        # another instance's delivery ledger, ACK outbox, process markers, or
+        # provider account authority—even from legacy or hand-built archives.
+        _discard_copied_delivery_state(final_source)
+        for stale in _CLONE_ALL_STRIP:
+            (final_source / stale).unlink(missing_ok=True)
+        _strip_cloned_delivery_authority(final_source)
+
         shutil.move(str(final_source), str(profile_dir))
+
+    # Preserve the portable configuration exactly apart from source-owned
+    # authority stripping. Import historically restores old config versions
+    # byte-for-byte; schema migration remains an explicit lifecycle action.
+    # Provisioning can inspect the restored config without rewriting unrelated
+    # settings and gives configured semantic-capable providers fresh authority
+    # before the imported profile is first used.
+    from hermes_cli.delivery_account_provisioning import (
+        run_lifecycle_provisioning,
+    )
+
+    run_lifecycle_provisioning(quiet=False)
 
     return profile_dir
 
