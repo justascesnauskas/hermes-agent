@@ -3245,6 +3245,10 @@ class GatewayRunner(
         # synthesize a new provider event identity.
         self._active_turn_origins: Dict[str, Dict[str, Any]] = {}
         self._active_session_leases: Dict[str, Any] = {}
+        # Different-session messages that arrive at the global concurrency cap
+        # are persisted by hermes_cli.admission_queue.  This task drains that
+        # FIFO whenever a foreground slot is released.
+        self._admission_drain_task: Optional[asyncio.Task] = None
         # Per-SESSION_ID turn lease (#64934): serializes the
         # [load history → run → flush] region when two ROUTING KEYS resolve
         # to one session_id (switch_session's many-to-one mapping). The
@@ -5266,7 +5270,7 @@ class GatewayRunner(
             return
         self._external_drain_active = True
         logger.info(
-            "External drain ENGAGED (.drain_request.json present) — refusing "
+            "External drain ENGAGED (.drain_request.json present) — queueing "
             "new turns; %d in-flight turn(s) will finish. Process stays up.",
             self._active_work_count(),
         )
@@ -5298,6 +5302,11 @@ class GatewayRunner(
             "re-accepting new turns; gateway_state -> running."
         )
         self._update_runtime_status("running")
+        schedule_admission_drain = getattr(
+            self, "_schedule_global_admission_drain", None
+        )
+        if callable(schedule_admission_drain):
+            schedule_admission_drain()
 
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
         """Background task: reconcile gateway accept-state with the drain marker.
@@ -5895,6 +5904,145 @@ class GatewayRunner(
             "Try again when another session finishes."
         )
 
+    def _enqueue_at_active_session_limit(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        fallback_message: str,
+    ) -> Optional[str]:
+        """Persist a different-session arrival and return its immediate ACK."""
+        try:
+            from hermes_cli.admission_queue import enqueue_message_event
+
+            receipt = enqueue_message_event(event, session_key=session_key)
+        except Exception:
+            logger.exception(
+                "Failed to persist message at active-session limit for %s",
+                session_key,
+            )
+            return fallback_message
+        logger.info(
+            "Queued session %s at global admission position %d (depth=%d%s)",
+            session_key,
+            receipt.position,
+            receipt.depth,
+            ", coalesced" if receipt.coalesced else "",
+        )
+        if getattr(event, "_hermes_admission_replay", False) or bool(
+            getattr(event, "internal", False)
+        ):
+            return None
+        if getattr(self, "_draining", False):
+            return (
+                f"⏳ Gateway is {self._status_action_gerund()}. Your message is "
+                f"queued ({receipt.position}/{receipt.depth}). Hermes will start "
+                "it automatically after the gateway returns."
+            )
+        return (
+            f"⏳ Your message is queued ({receipt.position}/{receipt.depth}). "
+            "Hermes will start it automatically when a session slot is free."
+        )
+
+    def _schedule_global_admission_drain(self) -> None:
+        """Start at most one FIFO drainer on the runner's event loop."""
+        if getattr(self, "_draining", False) or getattr(
+            self, "_external_drain_active", False
+        ):
+            return
+        current = getattr(self, "_admission_drain_task", None)
+        if current is not None and not current.done():
+            return
+        try:
+            from hermes_cli.admission_queue import admission_queue_depth
+
+            if admission_queue_depth() <= 0:
+                return
+            loop = asyncio.get_running_loop()
+        except (RuntimeError, OSError):
+            return
+        task = loop.create_task(self._drain_global_admission_queue())
+        self._admission_drain_task = task
+        background = getattr(self, "_background_tasks", None)
+        if isinstance(background, set):
+            background.add(task)
+            task.add_done_callback(background.discard)
+
+    async def _drain_global_admission_queue(self) -> int:
+        """Replay queued messages through their normal platform ingress."""
+        from hermes_cli.admission_queue import (
+            acknowledge_message_event,
+            pop_next_message_event,
+            release_message_event_claim,
+        )
+
+        drained = 0
+        while not getattr(self, "_draining", False) and not getattr(
+            self, "_external_drain_active", False
+        ):
+            max_sessions = self._get_max_concurrent_sessions()
+            active_count = len(getattr(self, "_running_agents", {}))
+            if max_sessions is not None and active_count >= max_sessions:
+                break
+            item = await asyncio.to_thread(pop_next_message_event)
+            if item is None:
+                break
+            item_id, event = item
+            source = getattr(event, "source", None)
+            adapter = self._adapter_for_source(source) if source is not None else None
+            if adapter is None or not hasattr(adapter, "handle_message"):
+                logger.warning(
+                    "Admission item %s has no connected adapter; returning it to FIFO",
+                    item_id,
+                )
+                await asyncio.to_thread(release_message_event_claim, item_id)
+                break
+            try:
+                await adapter.handle_message(event)
+            except Exception:
+                await asyncio.to_thread(release_message_event_claim, item_id)
+                logger.exception("Admission replay failed before ingress accepted it")
+                break
+            # BasePlatformAdapter.handle_message schedules its processing task.
+            # Yield until that task has had a chance to claim the runner slot
+            # before deciding whether another capacity unit remains.
+            ingress_accepted = False
+            for _ in range(10):
+                await asyncio.sleep(0)
+                adapter_config = getattr(adapter, "config", None)
+                adapter_extra = getattr(adapter_config, "extra", {}) or {}
+                replay_key = build_session_key(
+                    source,
+                    group_sessions_per_user=adapter_extra.get(
+                        "group_sessions_per_user", True
+                    ),
+                    thread_sessions_per_user=adapter_extra.get(
+                        "thread_sessions_per_user", False
+                    ),
+                )
+                if (
+                    replay_key in getattr(self, "_running_agents", {})
+                    or replay_key in getattr(adapter, "_session_tasks", {})
+                ):
+                    ingress_accepted = True
+                    break
+            if not ingress_accepted:
+                await asyncio.to_thread(release_message_event_claim, item_id)
+                logger.warning(
+                    "Admission item %s was not accepted by adapter ingress; claim released",
+                    item_id,
+                )
+                break
+            if not await asyncio.to_thread(acknowledge_message_event, item_id):
+                logger.error(
+                    "Admission item %s entered processing but its durable claim could not be acknowledged",
+                    item_id,
+                )
+                break
+            drained += 1
+        if drained:
+            logger.info("Drained %d global admission queue message(s)", drained)
+        return drained
+
     def _claim_active_session_slot(
         self,
         session_key: str,
@@ -6088,24 +6236,28 @@ class GatewayRunner(
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if self._queue_during_drain_enabled():
-                self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-            else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
-
-            await adapter._send_with_retry(
-                chat_id=event.source.chat_id,
-                content=message,
-                reply_to=(
-                    reply_anchor
-                    if event.source.platform == Platform.TELEGRAM
-                    and event.source.chat_type == "dm"
-                    and event.source.thread_id
-                    else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+            message = self._enqueue_at_active_session_limit(
+                event,
+                session_key,
+                (
+                    f"⏳ Gateway is {self._status_action_gerund()}. "
+                    "Your message could not be queued; please resend shortly."
                 ),
-                metadata=thread_meta,
             )
+
+            if message:
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=message,
+                    reply_to=(
+                        reply_anchor
+                        if event.source.platform == Platform.TELEGRAM
+                        and event.source.chat_type == "dm"
+                        and event.source.thread_id
+                        else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                    ),
+                    metadata=thread_meta,
+                )
             return True
 
         # --- Approval response routing (#46866) ---
@@ -8534,6 +8686,10 @@ class GatewayRunner(
         self._schedule_durable_queued_turns()
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
+        # Messages admitted while every global session slot was occupied
+        # survive restarts.  Resume them only after interrupted foreground
+        # sessions have been restored, through normal adapter ingress.
+        await self._drain_global_admission_queue()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -11267,12 +11423,13 @@ class GatewayRunner(
                     self._enqueue_fifo(_quick_key, event, adapter)
                 return None
             if self._draining:
-                if self._queue_during_drain_enabled():
-                    self._queue_or_replace_pending_event(_quick_key, event)
-                return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if self._queue_during_drain_enabled()
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                return self._enqueue_at_active_session_limit(
+                    event,
+                    _quick_key,
+                    (
+                        f"⏳ Gateway is {self._status_action_gerund()}. "
+                        "Your message could not be queued; please resend shortly."
+                    ),
                 )
             if self._busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
@@ -11743,7 +11900,14 @@ class GatewayRunner(
             return await self._handle_voice_command(event)
 
         if self._draining:
-            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
+            return self._enqueue_at_active_session_limit(
+                event,
+                _quick_key,
+                (
+                    f"⏳ Gateway is {self._status_action_gerund()}. "
+                    "Your message could not be queued; please resend shortly."
+                ),
+            )
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -11994,13 +12158,16 @@ class GatewayRunner(
         # Reversible: once the marker is removed the gate opens again.
         if self._external_drain_active and not is_internal:
             logger.info(
-                "Refusing new turn for session %s — external drain active.",
+                "Queueing new turn for session %s — external drain active.",
                 _quick_key,
             )
-            return (
-                "⏳ This agent is draining for a maintenance action and isn't "
-                "accepting new turns right now. It'll be back in a moment — "
-                "please resend shortly."
+            return self._enqueue_at_active_session_limit(
+                event,
+                _quick_key,
+                (
+                    "⏳ This agent is draining for maintenance. Your message "
+                    "could not be queued; please resend shortly."
+                ),
             )
 
         # ── Claim this session before any await ───────────────────────
@@ -12016,10 +12183,14 @@ class GatewayRunner(
         )
         if _limit_message is not None:
             logger.info(
-                "Rejecting new active session %s: max_concurrent_sessions reached",
+                "Queueing new active session %s: max_concurrent_sessions reached",
                 _quick_key,
             )
-            return _limit_message
+            return self._enqueue_at_active_session_limit(
+                event,
+                _quick_key,
+                _limit_message,
+            )
         if _active_session_lease is not None:
             if not hasattr(self, "_active_session_leases"):
                 self._active_session_leases = {}
@@ -18533,6 +18704,7 @@ class GatewayRunner(
         # between lifecycle transitions.  Preserves gateway_state (see
         # _persist_active_agents).
         self._persist_active_agents()
+        self._schedule_global_admission_drain()
         return True
 
     def _release_turn_lease(self, session_key: str, run_generation: int) -> bool:
@@ -22925,8 +23097,18 @@ class GatewayRunner(
                         pass
 
             if self._draining and (pending_event or pending):
+                durable_event = pending_event
+                if durable_event is None and pending:
+                    durable_event = dataclasses.replace(event, text=pending)
+                if durable_event is not None:
+                    self._enqueue_at_active_session_limit(
+                        durable_event,
+                        session_key,
+                        "",
+                    )
                 logger.info(
-                    "Discarding pending follow-up for session %s during gateway %s",
+                    "Moved pending follow-up for session %s to the durable admission "
+                    "queue during gateway %s",
                     session_key or "?",
                     self._status_action_label(),
                 )
