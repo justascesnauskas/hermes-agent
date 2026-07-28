@@ -762,6 +762,12 @@ class SessionEntry:
     # opaque attachment fingerprints); private cached attachment paths are
     # deliberately excluded by TurnOriginV1.to_dict().
     resume_turn_origin: Optional[Dict[str, Any]] = None
+    # ``resume_turn_origin is None`` is ambiguous: it can mean either a
+    # legacy/originless turn that still needs crash recovery, or an exact
+    # origin whose provider delivery was already confirmed and cleared.
+    # Persist the latter state explicitly so crash recovery keeps its
+    # backward-compatible behavior without replaying a delivered turn.
+    turn_delivery_confirmed: bool = False
 
     # Session-scoped /model override (model/provider/base_url ONLY — never
     # credentials).  ``_session_model_overrides`` in the gateway runner is
@@ -799,6 +805,7 @@ class SessionEntry:
                 else None
             ),
             "resume_turn_origin": self.resume_turn_origin,
+            "turn_delivery_confirmed": self.turn_delivery_confirmed,
             "is_fresh_reset": self.is_fresh_reset,
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
@@ -890,6 +897,9 @@ class SessionEntry:
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
             resume_turn_origin=resume_turn_origin,
+            turn_delivery_confirmed=bool(
+                data.get("turn_delivery_confirmed", False)
+            ),
             is_fresh_reset=data.get("is_fresh_reset", False),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
@@ -2259,6 +2269,7 @@ class SessionStore:
                 entry.resume_pending = True
                 entry.resume_reason = reason
                 entry.last_resume_marked_at = _now()
+                entry.turn_delivery_confirmed = False
                 if turn_origin is None:
                     # Never carry a prior turn's identity into a newer
                     # originless/internal resume marker.
@@ -2302,6 +2313,7 @@ class SessionStore:
                 if normalized_origin is not None
                 else None
             )
+            entry.turn_delivery_confirmed = False
             self._save()
             return True
 
@@ -2330,6 +2342,7 @@ class SessionStore:
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
+            entry.turn_delivery_confirmed = True
             self._save()
             return True
 
@@ -2433,7 +2446,10 @@ class SessionStore:
                 if (
                     not entry.suspended
                     and entry.updated_at >= cutoff
-                    and entry.resume_turn_origin is not None
+                    and (
+                        entry.resume_turn_origin is not None
+                        or not entry.turn_delivery_confirmed
+                    )
                 ):
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"

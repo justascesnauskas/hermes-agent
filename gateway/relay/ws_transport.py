@@ -204,6 +204,9 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
     source_timestamp = raw.get("source_timestamp", raw.get("timestamp"))
     if source_timestamp is not None:
         event_kwargs["timestamp"] = source_timestamp
+        event_kwargs["metadata"] = {
+            "provider_source_timestamp": source_timestamp,
+        }
     return MessageEvent(**event_kwargs)
 
 

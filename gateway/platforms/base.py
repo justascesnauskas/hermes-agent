@@ -6156,7 +6156,7 @@ class BasePlatformAdapter(ABC):
         # operators/adapters may provide an opaque account id explicitly or
         # through ``platforms.<provider>.extra.gateway_account_id``.
         if not gateway_account_id:
-            extra = getattr(self.config, "extra", None)
+            extra = getattr(getattr(self, "config", None), "extra", None)
             if isinstance(extra, dict):
                 gateway_account_id = extra.get("gateway_account_id")
 
