@@ -21,6 +21,12 @@ import gateway.drain_control as dc
 from gateway.run import GatewayRunner
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
+from gateway.session import build_session_key
+from hermes_cli.admission_queue import (
+    acknowledge_message_event,
+    admission_queue_depth,
+    pop_next_message_event,
+)
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
@@ -350,7 +356,7 @@ class TestDrainWatcher:
 
 class TestNewTurnGate:
     @pytest.mark.asyncio
-    async def test_new_turn_refused_during_external_drain(self):
+    async def test_new_turn_durably_queued_during_external_drain(self, home):
         runner, _ = _drain_runner()
         runner._external_drain_active = True
         event = MessageEvent(
@@ -360,8 +366,17 @@ class TestNewTurnGate:
             message_id="m1",
         )
         result = await runner._handle_message(event)
-        assert result is not None
-        assert "draining" in result.lower()
+        assert result == (
+            "⏳ Your message is queued (1/1). "
+            "Hermes will start it automatically when a session slot is free."
+        )
+        assert admission_queue_depth() == 1
+        queued = pop_next_message_event()
+        assert queued is not None
+        item_id, replay = queued
+        assert replay.text == "hello"
+        assert build_session_key(replay.source) == build_session_key(event.source)
+        assert acknowledge_message_event(item_id) is True
 
     @pytest.mark.asyncio
     async def test_in_flight_turn_not_interrupted_by_drain(self):
