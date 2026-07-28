@@ -95,8 +95,8 @@ async def test_draining_durably_queues_new_session_messages():
     result = await runner._handle_message(event)
 
     assert result == (
-        "⏳ Your message is queued (1/1). "
-        "Hermes will start it automatically when a session slot is free."
+        "⏳ Gateway is restarting. Your message is queued (1/1). "
+        "Hermes will start it automatically after the gateway returns."
     )
 
 

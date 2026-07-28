@@ -5675,6 +5675,18 @@ class GatewayRunner(
             getattr(event, "internal", False)
         ):
             return None
+        if getattr(self, "_draining", False):
+            return (
+                f"⏳ Gateway is {self._status_action_gerund()}. Your message is "
+                f"queued ({receipt.position}/{receipt.depth}). Hermes will start "
+                "it automatically after the gateway returns."
+            )
+        if getattr(self, "_external_drain_active", False):
+            return (
+                "⏳ This agent is draining for maintenance. Your message is "
+                f"queued ({receipt.position}/{receipt.depth}) and will start "
+                "automatically when maintenance finishes."
+            )
         return (
             f"⏳ Your message is queued ({receipt.position}/{receipt.depth}). "
             "Hermes will start it automatically when a session slot is free."
